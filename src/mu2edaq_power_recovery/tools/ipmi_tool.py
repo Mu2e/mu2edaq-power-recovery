@@ -15,7 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from typing import List, Optional, Sequence
+from typing import Any, List, Optional, Sequence
 
 from .. import console
 from ..creds import VaultCredentials, VaultError
@@ -62,6 +62,10 @@ notes
                         help="override the BMC username from Vault. The "
                              "upstream mu2e_ipmi.sh hard-codes MU2E; use this "
                              "to test whether the Vault username differs.")
+    parser.add_argument("--diagnose", action="store_true",
+                        help="find a working username and cipher suite against "
+                             "one BMC by trying the plausible combinations, "
+                             "read-only, stopping at the first that works")
     parser.add_argument("--show-command", action="store_true",
                         help="print the exact ipmitool invocation and exit, "
                              "for comparison against a known-working one. It "
@@ -149,6 +153,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         extra_args=settings.get("ipmi.extra_args", []),
     )
 
+    if args.diagnose:
+        return diagnose(settings, topology, factory, gateway_host, creds,
+                        nodes[0], username)
+
     if args.show_command:
         print("  the invocation run on the gateway. It carries no password --\n"
               "  ipmitool reads IPMI_PASSWORD from the environment:\n")
@@ -206,6 +214,116 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                       f"chassis power status")
                 break
     return 1 if failures else 0
+
+
+def candidate_usernames(configured: str) -> List[str]:
+    """Usernames worth trying, most likely first, without duplicates.
+
+    IPMI usernames are case sensitive. The working upstream invocation
+    hard-codes ``MU2E`` while the Vault secret has been seen holding ``mu2e``,
+    so the case variants of whatever is configured are the first thing to try.
+    """
+    ordered = [configured, "MU2E", configured.upper(), configured.lower()]
+    seen: List[str] = []
+    for name in ordered:
+        if name and name not in seen:
+            seen.append(name)
+    return seen
+
+
+#: Cipher suites worth trying. 3 is what the upstream script uses; 17 is the
+#: default on newer Supermicro BMCs; 0 disables authentication of the payload
+#: and is a last resort that tells us the rest of the path works.
+CANDIDATE_CIPHERS = (3, 17, 0)
+
+#: Hard cap on authentication attempts. BMCs lock an account after a handful
+#: of failures, and an exhaustive sweep would be a good way to lock out the
+#: account in the middle of a recovery.
+MAX_ATTEMPTS = 9
+
+
+def diagnose(settings: Any, topology: Any, factory: Any, gateway_host: str,
+             creds: Any, node: Any, configured_username: str) -> int:
+    """Try plausible username and cipher-suite combinations against one BMC.
+
+    Read-only: every attempt is ``chassis power status``. Stops at the first
+    combination that works, and at :data:`MAX_ATTEMPTS` regardless, because
+    each failure counts towards the BMC's account lockout.
+    """
+    if not node.ipmi_host:
+        print(f"error: {node.short} has no BMC in the topology", file=sys.stderr)
+        return 2
+
+    usernames = candidate_usernames(configured_username)
+    print(f"  diagnosing {node.ipmi_host} via {gateway_host}")
+    print(f"  password from {creds.source}")
+    print(f"  usernames to try : {', '.join(usernames)}")
+    print(f"  cipher suites    : {', '.join(str(c) for c in CANDIDATE_CIPHERS)}")
+    print(f"\n  read-only ('chassis power status'), stopping at the first that "
+          f"works.\n  Capped at {MAX_ATTEMPTS} attempts: BMCs lock an account "
+          f"after repeated failures.\n")
+
+    gateway = factory.for_host(gateway_host, direct=True)
+    rows: List[List[str]] = []
+    attempts = 0
+    winner = None
+
+    for cipher in CANDIDATE_CIPHERS:
+        for username in usernames:
+            if attempts >= MAX_ATTEMPTS:
+                break
+            attempts += 1
+            client = IPMIClient(
+                gateway=gateway, username=username, password=creds.password,
+                tool=settings.get("ipmi.tool", "ipmitool"),
+                interface=settings.get("ipmi.interface", "lanplus"),
+                privilege=settings.get("ipmi.privilege", "Operator"),
+                cipher_suite=cipher,
+                timeout=settings.get("ipmi.timeout", 10),
+                retries=0,          # one shot per combination
+                dry_run=True,       # read-only anyway, but be explicit
+                protected=topology.is_protected,
+                extra_args=settings.get("ipmi.extra_args", []),
+            )
+            try:
+                res = client._run(node.ipmi_host, ["chassis", "power", "status"])
+                ok, detail = res.ok, (res.output.strip().splitlines() or [""])[0]
+            except TransportError as exc:
+                ok, detail = False, str(exc)[:60]
+            rows.append([username, str(cipher), "OK" if ok else "refused",
+                         detail[:60]])
+            if ok:
+                winner = (username, cipher)
+                break
+        if winner:
+            break
+
+    print(console.table(rows, ["USERNAME", "CIPHER", "RESULT", "OUTPUT"]))
+
+    if not winner:
+        print(f"\n  No combination worked in {attempts} attempt(s).")
+        print("  The password is the remaining likely cause -- check it with"
+              "\n    mu2e-vault-ipmi")
+        print("  If the BMC has locked the account, wait for its lockout window"
+              "\n  to expire before trying again.")
+        return 1
+
+    username, cipher = winner
+    print(f"\n  Works: username '{username}', cipher suite {cipher}.")
+    changes = []
+    if username != configured_username:
+        changes.append(f"  ipmi:\n    username: {username}")
+    if cipher != settings.get("ipmi.cipher_suite", 3):
+        changes.append(f"  ipmi:\n    cipher_suite: {cipher}")
+    if changes:
+        print("\n  Put this in config/power-recovery.yaml:\n")
+        print("\n".join(changes))
+        print("\n  (Vault is the source of the username by default; setting it"
+              "\n  here overrides that without touching the secret.)")
+    else:
+        print("  That is what is already configured -- the earlier failure was "
+              "transient.")
+    return 0
 
 
 if __name__ == "__main__":

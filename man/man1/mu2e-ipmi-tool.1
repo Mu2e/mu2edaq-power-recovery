@@ -63,6 +63,14 @@ hard-codes
 use this to test whether the username in Vault differs, which is the most
 common cause of a refused session.
 .TP
+.B \-\-diagnose
+Find a working username and cipher suite against one BMC by trying the
+plausible combinations, read-only
+.RB ( "chassis power status" ),
+stopping at the first that works. Capped at nine attempts, because BMCs lock an
+account after repeated authentication failures. Prints the configuration change
+to make.
+.TP
 .B \-\-show\-command
 Print the exact
 .B ipmitool
@@ -97,6 +105,13 @@ and
 do not override this. Powering any of them down would cut off access to the
 cluster being recovered, or stop the NFS server the rest of it mounts from.
 .SH EXAMPLES
+Work out why a BMC refuses the session:
+.RS
+.EX
+mu2e-ipmi-tool \-\-diagnose \-n mu2e-trk-03 chassis power status
+.EE
+.RE
+.PP
 Power state of every tracker node:
 .RS
 .EX
@@ -130,14 +145,29 @@ is the same message for a wrong username, a wrong password and an unsupported
 cipher suite, so the raw output does not say what to change. This tool adds a
 plain-language cause and prints the invocation it used. Check, in order of
 likelihood:
+.PP
+The quickest route is to let the tool find it:
+.RS
+.EX
+mu2e-ipmi-tool \-\-diagnose \-n mu2e-trk-03 chassis power status
+.EE
+.RE
+.PP
+Checked by hand, in order of likelihood:
 .IP 1. 4
-the username \(em compare
-.B \-\-show\-command
-against the upstream form, which hard-codes
+the username. IPMI usernames are
+.IR "case sensitive" ,
+the working upstream invocation hard-codes
 .BR MU2E ,
-and try
-.BI \-\-user " MU2E"
-if Vault holds something else;
+and the Vault secret has been seen holding
+.BR mu2e .
+Compare with
+.B \-\-show\-command
+and test with
+.BI \-\-user " MU2E" ;
+set
+.I ipmi.username
+to make it permanent, which overrides Vault without touching the secret.
 .IP 2. 4
 the password, with
 .BR mu2e-vault-ipmi (1);

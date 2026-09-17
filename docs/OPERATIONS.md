@@ -23,6 +23,7 @@ kinit you@FNAL.GOV
 kinit -c /tmp/krb5cc_root you/root@FNAL.GOV     # if you use a separate root principal
 vault login -method=ldap -address=https://ssivault.fnal.gov:8200
 mu2e-vault-ipmi                                 # BMC credentials readable?
+mu2e-ipmi-tool --diagnose -n mu2e-trk-03 chassis power status   # does a BMC accept them?
 mu2e-ssh-probe mu2egateway01 --run true         # gateway answers?
 mu2e-ssh-probe mu2e-mgr-01 --root --run 'id -u' # root works through the jump host?
 ```
@@ -30,6 +31,13 @@ mu2e-ssh-probe mu2e-mgr-01 --root --run 'id -u' # root works through the jump ho
 If `mu2e-vault-ipmi` reports that the configured field names are not in the
 secret, fix `vault.ipmi_user_field` / `vault.ipmi_password_field` in
 `config/power-recovery.yaml` now, not during the recovery.
+
+If a BMC refuses the session, `--diagnose` tries the plausible usernames and
+cipher suites and prints the configuration change to make. IPMI usernames are
+**case sensitive**, and the Vault secret and the BMC account have been seen
+disagreeing on case — `ipmi.username` overrides Vault without touching the
+secret. Sort this out in daylight: every failed attempt counts towards the
+BMC's account lockout, which is not something to discover at 3 a.m.
 
 ---
 
@@ -110,6 +118,7 @@ mu2e-power-on --execute --continue-on-error
 | `net.data` reports 1000 Mb/s | The link renegotiated after a switch reboot | Bounce the port; this is the quiet failure that makes the DAQ ten times too slow |
 | `pcie.devices` finds nothing | Cold-boot PCIe training failure | Needs a full AC power cycle of that chassis, not a warm reboot |
 | `power.status` says unreachable | The BMC has no standby power | Physical check at the rack |
+| `Unable to establish IPMI v2 / RMCP+ session` | Username, password or cipher suite | `mu2e-ipmi-tool --diagnose -n <node> chassis power status`; usernames are case sensitive |
 
 ---
 

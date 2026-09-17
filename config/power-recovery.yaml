@@ -79,6 +79,15 @@ ipmi:
   # ipmitool is executed *on the gateway*, not locally: the IPMI subnets
   # (192.168.157.0/24, 192.168.150.0/24) are not routable from off-site.
   execute_on: gateway
+
+  # BMC username. Null takes it from the Vault secret's username field.
+  #
+  # Set it here when Vault and the BMC disagree: IPMI usernames are case
+  # sensitive, the working upstream mu2e_ipmi.sh hard-codes 'MU2E', and the
+  # Vault secret has been seen holding 'mu2e'. `mu2e-ipmi-tool --diagnose`
+  # finds the combination that works.
+  username: null
+
   tool: ipmitool
   interface: lanplus
   privilege: Operator

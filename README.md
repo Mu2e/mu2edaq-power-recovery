@@ -145,6 +145,18 @@ mu2e-vault-ipmi            # path, fields and whether the credentials work
 mu2e-vault-ipmi --list     # browse the KV tree, if the path has moved
 ```
 
+If a BMC answers `Unable to establish IPMI v2 / RMCP+ session`, that one
+message covers a wrong username, a wrong password and an unsupported cipher
+suite alike. Let the tool work out which:
+
+```sh
+mu2e-ipmi-tool --diagnose -n mu2e-trk-03 chassis power status
+```
+
+IPMI usernames are **case sensitive**, and that is the usual culprit — the
+Vault secret and the BMC account have been seen disagreeing on case. Set
+`ipmi.username` to override Vault without touching the secret.
+
 If Vault is unreachable — plausible during a site-wide power event — the tools
 fall back to `~/.ipmipasswd`, the file the existing `mu2edaq-operations`
 scripts already read, and record in the run which source was used.
@@ -230,7 +242,7 @@ between two runs has an explanation. See `man 3 libmu2eprobe`.
 ## Testing
 
 ```sh
-pytest                                              # 256 tests, no cluster needed
+pytest                                              # 259 tests, no cluster needed
 mu2e-power-recovery --phase all --simulate          # end-to-end rehearsal
 ctest --test-dir build --output-on-failure          # C++ and Python
 ```

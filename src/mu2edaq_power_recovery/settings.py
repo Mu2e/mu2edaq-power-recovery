@@ -87,6 +87,9 @@ DEFAULTS: Dict[str, Any] = {
     },
     "ipmi": {
         "execute_on": "gateway",
+        # Overrides the username from Vault. IPMI usernames are case
+        # sensitive, and the two have been known to disagree.
+        "username": None,
         "tool": "ipmitool",
         "interface": "lanplus",
         "privilege": "Operator",

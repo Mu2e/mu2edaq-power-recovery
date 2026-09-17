@@ -278,3 +278,42 @@ def test_a_successful_call_is_not_annotated(gateway):
     client = make_client(gateway)
     result = client._run("bmc", ["chassis", "power", "status"])
     assert result.ok and "diagnosis" not in result.meta
+
+
+# ---------------------------------------------------------------------------
+# username resolution and the diagnose sweep
+# ---------------------------------------------------------------------------
+
+
+def test_candidate_usernames_tries_case_variants_most_likely_first():
+    """IPMI usernames are case sensitive.
+
+    The live Vault secret held 'mu2e' while the working upstream invocation
+    hard-codes 'MU2E', which is exactly the failure this ordering targets.
+    """
+    from mu2edaq_power_recovery.tools.ipmi_tool import candidate_usernames
+
+    assert candidate_usernames("mu2e") == ["mu2e", "MU2E"]
+    # The configured value is always tried first, whatever it is.
+    assert candidate_usernames("admin")[0] == "admin"
+    assert "MU2E" in candidate_usernames("admin")
+    # No duplicates, however the cases collide.
+    assert len(candidate_usernames("MU2E")) == len(set(candidate_usernames("MU2E")))
+
+
+def test_the_diagnose_sweep_is_capped():
+    # Every failed attempt counts towards the BMC's account lockout, so an
+    # exhaustive sweep is a good way to lock the account mid-recovery.
+    from mu2edaq_power_recovery.tools.ipmi_tool import (CANDIDATE_CIPHERS,
+                                                        MAX_ATTEMPTS)
+
+    assert MAX_ATTEMPTS <= 9
+    assert CANDIDATE_CIPHERS[0] == 3      # what upstream uses, tried first
+
+
+def test_the_configured_username_overrides_vault(settings):
+    # Vault is the source by default, but the two can disagree and the secret
+    # is maintained elsewhere -- so there has to be a local override.
+    assert settings.get("ipmi.username") is None      # default: use Vault
+    settings.set("ipmi.username", "MU2E")
+    assert settings.get("ipmi.username") == "MU2E"

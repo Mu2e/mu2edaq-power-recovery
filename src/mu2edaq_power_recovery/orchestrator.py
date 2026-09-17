@@ -270,7 +270,7 @@ class Orchestrator:
         log.info("IPMI commands will be issued from %s", gateway_host)
         return IPMIClient(
             gateway=gateway,
-            username=creds.username,
+            username=self.settings.get("ipmi.username") or creds.username,
             password=creds.password,
             tool=self.settings.get("ipmi.tool", "ipmitool"),
             interface=self.settings.get("ipmi.interface", "lanplus"),

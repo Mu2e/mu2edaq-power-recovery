@@ -127,9 +127,23 @@ runs.
 is the only supported value, and is required: the IPMI subnets are not routable
 from off site.
 .TP
+.I username
+BMC username. Null takes it from the Vault secret's
+.I username
+field. Set it here when the two disagree: IPMI usernames are case sensitive,
+the working upstream invocation hard-codes
+.BR MU2E ,
+and the Vault secret has been seen holding
+.BR mu2e .
+.BR "mu2e-ipmi-tool \-\-diagnose"
+finds the combination that works.
+.TP
 .IR tool ", " interface ", " privilege ", " cipher_suite
 Passed to
 .BR ipmitool .
+Some BMCs need
+.I cipher_suite: 17
+rather than 3.
 .TP
 .IR timeout ", " retries
 Per-command budget, and how many times this tool re-runs the whole invocation.
