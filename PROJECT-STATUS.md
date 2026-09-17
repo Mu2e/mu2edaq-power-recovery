@@ -1,7 +1,9 @@
 # Project status — mu2edaq-power-recovery
 
-**Version** 0.1.0 · **Status** feature-complete, not yet exercised against the
-live cluster · **Last updated** 2026-09-17
+**Version** 0.1.0 (tagged) · **Status** feature-complete, not yet exercised
+against the live cluster · **Repository**
+<https://github.com/Mu2e/mu2edaq-power-recovery> (public, per the Mu2e-org
+convention) · **Last updated** 2026-09-17
 
 ---
 
@@ -245,7 +247,7 @@ Recorded here in brief; the reasoning is in [docs/DESIGN.md](docs/DESIGN.md).
 
 | Phase | Implementation | Tests | Docs | Live |
 |---|---|---|---|---|
-| 0 — self-update | ✅ | ✅ 13 | ✅ | ⬜ |
+| 0 — self-update | ✅ | ✅ 13 | ✅ | ✅ fetch/up-to-date verified against origin |
 | 1 — assess | ✅ | ✅ 6 + 36 check tests | ✅ | ⬜ |
 | 2 — power on | ✅ | ✅ 8 + 25 IPMI tests | ✅ | ⬜ |
 | 3 — network | ✅ | ✅ 4 | ✅ | ⬜ |
