@@ -110,8 +110,12 @@ vault:
   addr: https://ssivault.fnal.gov:8200
   kv_mount: td
   base_path: scd/experiments/mu2e
-  # KV v2 secret holding the BMC credentials.
-  ipmi_path: ipmi
+  # KV v2 secret holding the BMC credentials, relative to base_path.
+  # Note that 'ipmi' is a folder in the KV tree, not the secret -- the secret
+  # itself is 'config' inside it. Reading the folder returns nothing at all,
+  # which looks identical to an empty secret, so `mu2e-vault-ipmi` lists the
+  # tree and says which it was.
+  ipmi_path: ipmi/config
   # Field names inside that secret.  *** Verify against the live secret. ***
   # The upstream shell tooling hard-codes the user MU2E and reads the
   # password from ~/.ipmipasswd, so the field naming in Vault could not be

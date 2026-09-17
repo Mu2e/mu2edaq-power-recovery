@@ -1,7 +1,7 @@
 """IPMI (and ECL) credentials from HashiCorp Vault.
 
 Secrets live at ``td/scd/experiments/mu2e/`` on https://ssivault.fnal.gov:8200,
-with the BMC credentials at ``td/scd/experiments/mu2e/ipmi``
+with the BMC credentials at ``td/scd/experiments/mu2e/ipmi/config``
 (Project-Description.md).  The access pattern -- KV v2, a token cached at
 ~/.vault-token by ``vault login -method=ldap``, auto-login when the cached
 token has gone -- is the same one mu2edaq-kerberos already uses, deliberately:
@@ -23,7 +23,7 @@ import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from ..transport.local import LocalTransport
 
@@ -153,7 +153,16 @@ class VaultCredentials:
             resp = client.secrets.kv.v2.read_secret_version(
                 path=path, mount_point=self.kv_mount)
         except InvalidPath as exc:
-            raise VaultError(f"no secret at {self.kv_mount}/{path}") from exc
+            # Say what is actually under the path. A KV v2 folder read this way
+            # is indistinguishable from a missing secret, and the difference is
+            # exactly what the operator needs to know.
+            nearby = self.find_secrets(relative_path)
+            hint = ""
+            if nearby:
+                hint = ("; secrets under that path: "
+                        + ", ".join(sorted(nearby)[:10]))
+            raise VaultError(
+                f"no secret at {self.kv_mount}/{path}{hint}") from exc
         except Forbidden as exc:
             raise VaultError(
                 f"permission denied reading {self.kv_mount}/{path}; "
@@ -162,13 +171,58 @@ class VaultCredentials:
             raise VaultError(f"error reading {self.kv_mount}/{path}: {exc}") from exc
         return (resp or {}).get("data", {}).get("data", {})
 
+    def list(self, relative_path: str = "") -> List[str]:
+        """List the keys directly under a path in the KV tree.
+
+        KV v2 paths look like directories: ``ipmi`` can be a folder holding
+        ``config`` rather than a secret in its own right, and reading the
+        folder returns nothing at all. That is an easy misconfiguration to
+        make and a confusing one to diagnose -- "no fields" looks identical to
+        "wrong path" -- so the tools list the tree and say which it was.
+
+        Keys ending in ``/`` are sub-folders. An unreadable or non-existent
+        path returns an empty list rather than raising: this is only ever used
+        to explain a failure, and it must not become a second failure.
+        """
+        path = f"{self.base_path.strip('/')}/{relative_path.strip('/')}".rstrip("/")
+        try:
+            resp = self.client().secrets.kv.v2.list_secrets(
+                path=path, mount_point=self.kv_mount)
+        except Exception:  # noqa: BLE001 - absent, forbidden or unreachable
+            return []
+        return list((resp or {}).get("data", {}).get("keys", []) or [])
+
+    def find_secrets(self, relative_path: str = "", depth: int = 2) -> List[str]:
+        """Secret paths at or below *relative_path*, relative to the base path.
+
+        Walks sub-folders to *depth* levels so that a mistaken folder path can
+        be answered with the actual secret underneath it, rather than with an
+        empty listing the operator then has to explore by hand.
+        """
+        found: List[str] = []
+        for key in self.list(relative_path):
+            child = f"{relative_path.strip('/')}/{key}".lstrip("/")
+            if key.endswith("/"):
+                if depth > 1:
+                    found.extend(self.find_secrets(child.rstrip("/"), depth - 1))
+                else:
+                    # Keep the trailing slash: a folder we did not descend into
+                    # must not be printed as though it were a secret path, or
+                    # the operator will point ipmi_path straight back at a
+                    # folder -- which is the mistake this whole method exists
+                    # to diagnose.
+                    found.append(child)
+            else:
+                found.append(child)
+        return found
+
     # -- specific credentials ---------------------------------------------
 
     def ipmi(self) -> IPMICredentials:
         """BMC credentials, from Vault or (if permitted) the local fallback."""
         user_field = self.settings.get("vault.ipmi_user_field", "username")
         pass_field = self.settings.get("vault.ipmi_password_field", "password")
-        rel = self.settings.get("vault.ipmi_path", "ipmi")
+        rel = self.settings.get("vault.ipmi_path", "ipmi/config")
 
         try:
             data = self.read(rel)

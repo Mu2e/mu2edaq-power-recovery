@@ -22,7 +22,7 @@ mu2e-power-on --execute                      # phase 2, actually switches on
 mu2e-power-netcheck                          # phase 3
 mu2e-power-report --post-ecl                 # phase 4
 
-pytest                                       # 201 tests, no cluster needed
+pytest                                       # 212 tests, no cluster needed
 cmake -S . -B build && cmake --build build   # optional C/C++ library
 ctest --test-dir build --output-on-failure
 ```
@@ -73,7 +73,7 @@ selfupdate: {enabled, remote, branch, rebuild_globs, allow_dirty, timeout}
 ssh:      {user, root_user, proxy: auto, connect_timeout, options, max_sessions}
 ipmi:     {execute_on: gateway, tool, interface, privilege, cipher_suite, retries}
 kerberos: {principal, root_principal, min_lifetime, prompt, verify_users}
-vault:    {addr, kv_mount: td, base_path, ipmi_path, ipmi_*_field,
+vault:    {addr, kv_mount: td, base_path, ipmi_path: ipmi/config, ipmi_*_field,
            allow_file_fallback, fallback_password_file, auto_login}
 database: {url, path}          # url set => Postgres
 report:   {output_dir, title, keep_runs, publish: {enabled, method, target}}

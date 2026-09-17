@@ -1,6 +1,7 @@
 """mu2e-vault-ipmi -- verify the Vault path that holds the BMC credentials.
 
-The IPMI secret lives at ``td/scd/experiments/mu2e/ipmi``.  Its exact field
+The IPMI secret lives at ``td/scd/experiments/mu2e/ipmi/config`` -- note
+that ``ipmi`` is a folder in the KV tree, not the secret.  Its exact field
 names could not be confirmed from the repositories, so
 ``vault.ipmi_user_field`` / ``vault.ipmi_password_field`` are configurable and
 this tool exists to check what is actually there -- before an outage, not
@@ -31,8 +32,14 @@ examples
   mu2e-vault-ipmi                  # check the configured ipmi path
   mu2e-vault-ipmi --path ecl       # check another secret under the base path
   mu2e-vault-ipmi --fields         # list the field names only
+  mu2e-vault-ipmi --list           # browse the KV tree under the path
 
 notes
+  KV v2 paths look like directories. 'ipmi' is a folder holding 'config',
+  so the secret is at ipmi/config -- reading the folder returns nothing,
+  which looks identical to an empty secret. When a path holds no secret
+  this tool lists what is under it and says so.
+
   No secret value is ever printed. If Vault is unreachable and
   vault.allow_file_fallback is set, the fallback file is reported instead.
   To obtain a token:  vault login -method=ldap -address=<vault.addr>
@@ -45,6 +52,10 @@ notes
     parser.add_argument("--addr", metavar="URL", help="override vault.addr")
     parser.add_argument("--fields", action="store_true",
                         help="print only the field names present in the secret")
+    parser.add_argument("--list", dest="list_tree", action="store_true",
+                        help="list the secrets under the path instead of "
+                             "reading it -- use this when a path turns out to "
+                             "be a folder rather than a secret")
     parser.add_argument("--no-fallback", action="store_true",
                         help="fail rather than falling back to the local "
                              "password file")
@@ -60,7 +71,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     local = LocalTransport(default_timeout=60)
     vault = VaultCredentials(settings, local=local)
-    relative = args.path or settings.get("vault.ipmi_path", "ipmi")
+    relative = args.path or settings.get("vault.ipmi_path", "ipmi/config")
     full_path = f"{settings.get('vault.kv_mount')}/{vault.base_path}/{relative}"
 
     report = {
@@ -72,19 +83,59 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "source": None,
     }
 
+    if args.list_tree:
+        # Browse mode: what is actually under this path?
+        found = vault.find_secrets(relative)
+        siblings = vault.find_secrets("")
+        if args.json:
+            print(json.dumps({"path": full_path, "secrets": sorted(found),
+                              "base_path_tree": sorted(siblings)}, indent=2))
+            return 0 if found else 1
+        if found:
+            print(f"  secrets under {full_path}:")
+            for entry in sorted(found):
+                print(f"    {entry}")
+        else:
+            print(f"  nothing under {full_path}")
+            if siblings:
+                print(f"\n  under {settings.get('vault.kv_mount')}/"
+                      f"{vault.base_path} there are:")
+                for entry in sorted(siblings):
+                    print(f"    {entry}")
+        return 0 if found else 1
+
     try:
         data = vault.read(relative)
         report["reachable"] = True
         report["fields"] = sorted(data)
     except VaultError as exc:
         report["error"] = str(exc)
+        # A path with no secret is most often a folder. Say what is in it
+        # rather than leaving the operator to guess -- an empty result and a
+        # wrong path look identical otherwise.
+        report["secrets_under_path"] = sorted(vault.find_secrets(relative))
+        report["secrets_under_base"] = sorted(vault.find_secrets(""))
 
     if args.fields:
         if args.json:
             print(json.dumps(report, indent=2))
+        elif report["fields"]:
+            print("\n".join(report["fields"]))
         else:
-            print("\n".join(report["fields"]) if report["fields"]
-                  else f"(no fields: {report.get('error', 'unknown error')})")
+            print(f"no fields at {full_path}")
+            print(f"  {report.get('error', 'unknown error')}")
+            under = report.get("secrets_under_path") or []
+            if under:
+                print(f"\n  that path is a folder. Secrets inside it:")
+                for entry in under:
+                    print(f"    {entry}")
+                print(f"\n  set vault.ipmi_path to one of those, e.g.:")
+                print(f"    mu2e-vault-ipmi --path {under[0]}")
+            elif report.get("secrets_under_base"):
+                print(f"\n  secrets under {settings.get('vault.kv_mount')}/"
+                      f"{vault.base_path}:")
+                for entry in report["secrets_under_base"]:
+                    print(f"    {entry}")
         return 0 if report["fields"] else 1
 
     # Resolve the credentials the way a run would, including the fallback.
@@ -125,6 +176,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 0
     print(f"  Credentials       : NOT usable")
     print(f"  Error             : {report.get('error', 'unknown')}")
+    under = report.get("secrets_under_path") or []
+    if under:
+        print(f"\n  ** {report['path']} is a folder, not a secret.")
+        print(f"     Secrets inside it: {', '.join(under)}")
+        print(f"     Set vault.ipmi_path accordingly, e.g. "
+              f"'{under[0]}' in config/power-recovery.yaml.")
+    elif report.get("secrets_under_base"):
+        print(f"\n  Secrets under {settings.get('vault.kv_mount')}/"
+              f"{vault.base_path}: {', '.join(report['secrets_under_base'])}")
     return 1
 
 

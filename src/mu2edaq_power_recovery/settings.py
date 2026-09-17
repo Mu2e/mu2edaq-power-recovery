@@ -106,7 +106,7 @@ DEFAULTS: Dict[str, Any] = {
         "addr": "https://ssivault.fnal.gov:8200",
         "kv_mount": "td",
         "base_path": "scd/experiments/mu2e",
-        "ipmi_path": "ipmi",
+        "ipmi_path": "ipmi/config",
         "ipmi_user_field": "username",
         "ipmi_password_field": "password",
         "allow_file_fallback": True,

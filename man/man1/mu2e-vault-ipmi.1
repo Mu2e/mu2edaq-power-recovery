@@ -12,7 +12,7 @@ mu2e-vault-ipmi \- verify the Vault secret holding the Mu2e DAQ BMC credentials
 .SH DESCRIPTION
 Checks that the recovery tools will be able to read the BMC credentials, which
 live at
-.I td/scd/experiments/mu2e/ipmi
+.I td/scd/experiments/mu2e/ipmi/config
 on
 .IR https://ssivault.fnal.gov:8200 .
 .PP
@@ -36,7 +36,13 @@ protecting.
 Secret path relative to
 .IR vault.base_path .
 Default:
-.IR vault.ipmi_path ", normally " ipmi .
+.IR vault.ipmi_path ", normally " ipmi/config .
+Note that
+.I ipmi
+is a folder in the KV tree, not the secret; reading the folder returns
+nothing, which looks identical to an empty secret. When a path holds no
+secret this tool lists what is under it, so the two cases are
+distinguishable.
 .TP
 .BI \-\-addr " URL"
 Override

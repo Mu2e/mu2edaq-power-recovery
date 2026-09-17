@@ -112,7 +112,7 @@ mu2e-power-recovery --phase all --execute \
     --root-principal anorman/root@FNAL.GOV
 ```
 
-**Vault.** BMC credentials come from `td/scd/experiments/mu2e/ipmi` on
+**Vault.** BMC credentials come from `td/scd/experiments/mu2e/ipmi/config` on
 `https://ssivault.fnal.gov:8200`. Get a token with:
 
 ```sh
@@ -211,7 +211,7 @@ between two runs has an explanation. See `man 3 libmu2eprobe`.
 ## Testing
 
 ```sh
-pytest                                              # 201 tests, no cluster needed
+pytest                                              # 212 tests, no cluster needed
 mu2e-power-recovery --phase all --simulate          # end-to-end rehearsal
 ctest --test-dir build --output-on-failure          # C++ and Python
 ```

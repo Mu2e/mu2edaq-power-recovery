@@ -169,7 +169,12 @@ base path
 Secret holding the BMC credentials, relative to
 .IR base_path .
 Default
-.IR ipmi .
+.IR ipmi/config .
+.I ipmi
+is a folder in the KV tree, not the secret; pointing this at the folder returns
+no fields at all, which looks the same as an empty secret.
+.BR mu2e-vault-ipmi (1)
+lists the tree when a path holds no secret, so the two are distinguishable.
 .TP
 .IR ipmi_user_field ", " ipmi_password_field
 Field names inside that secret. Configurable because the live secret's field

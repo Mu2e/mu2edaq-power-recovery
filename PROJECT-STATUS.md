@@ -14,7 +14,7 @@ with the phase-0 self-update, the static report site, the logbook integration,
 the diagnostics utilities, the optional C/C++ probe library and its Python
 bindings, and the documentation set.
 
-201 automated tests pass, plus 7 C++ test groups and an end-to-end simulated
+212 automated tests pass, plus 7 C++ test groups and an end-to-end simulated
 four-phase run. **Nothing has yet been run against the real cluster** — the
 tests and the rehearsal deliberately contact nothing, so what is verified is
 the logic, not the environment. See §6.
@@ -80,7 +80,7 @@ Every requirement from `Project-Description.md`, and where it is met.
 | SSH transport | ✅ Complete | via checks | ProxyJump, GSSAPI, no ControlMaster |
 | IPMI client | ✅ Complete | 25 | Runs on the gateway; secrets on stdin |
 | Kerberos | ✅ Complete | — | Needs a live KDC to test; see §6.3 |
-| Vault | ✅ Complete | — | Needs a live Vault; see §6.3 |
+| Vault | ✅ Complete | 11 | Path corrected to `ipmi/config`; folder-vs-secret diagnosed |
 | Check framework | ✅ Complete | 36 | 25 checks; registry; failure containment |
 | Output parsers | ✅ Complete | 19 | Real command output as fixtures |
 | Phase 1 assess | ✅ Complete | 6 | Read-only asserted by test |
@@ -103,7 +103,7 @@ Every requirement from `Project-Description.md`, and where it is met.
 
 ## 4. Test matrix
 
-`pytest` — **201 passed**, no cluster, no credentials, no network.
+`pytest` — **212 passed**, no cluster, no credentials, no network.
 
 | Suite | Tests | Covers |
 |---|---|---|
@@ -113,6 +113,7 @@ Every requirement from `Project-Description.md`, and where it is met.
 | `unit/test_checks.py` | 36 | Every check's pass and fail path; framework containment |
 | `unit/test_ipmi.py` | 25 | **Safety gates**, credential handling, state reading, retries |
 | `unit/test_state.py` | 8 | Round-trip, refusal auditing, append-not-overwrite |
+| `unit/test_vault.py` | 11 | KV path resolution, folder-vs-secret, synonyms, file fallback |
 | `unit/test_sweep.py` | 8 | Both backends, identical semantics |
 | `unit/test_selfupdate.py` | 13 | Dirty tree, divergence, fast-forward, re-exec guard |
 | `integration/test_phases.py` | 22 | All four phases end to end |
@@ -188,12 +189,21 @@ config edit; no code change is needed. Until then the tools report MC-1 as
 "no nodes configured" rather than as healthy.
 
 ### 6.2 Vault IPMI field names — **needs verification**
-The secret at `td/scd/experiments/mu2e/ipmi` is read with
+**Path resolved (2026-09-17):** the secret is at
+`td/scd/experiments/mu2e/ipmi/config` — `ipmi` is a *folder* in the KV tree,
+not the secret. `vault.ipmi_path` now defaults to `ipmi/config`. A KV v2 folder
+read returns nothing at all, which is indistinguishable from an empty secret,
+so `mu2e-vault-ipmi` now lists the tree when a path holds no secret and names
+what is inside it; `--list` browses deliberately.
+
+**Still open:** the field names inside that secret. They are read with
 `vault.ipmi_user_field` / `ipmi_password_field`, defaulting to
-`username` / `password`, with fallback to the obvious synonyms. The live
-field naming could not be confirmed from the repositories (the existing shell
-tooling hard-codes user `MU2E` and reads the password from `~/.ipmipasswd`).
-Run `mu2e-vault-ipmi --fields` and correct the config if needed.
+`username` / `password`, with fallback to the obvious synonyms (`user`,
+`pass`, `passwd`, `ipmi_password`, `value`). The existing shell tooling
+hard-codes user `MU2E` and reads the password from `~/.ipmipasswd`, so the
+live naming could not be confirmed from the repositories. Run
+`mu2e-vault-ipmi --fields` against the corrected path and set the two config
+keys if the defaults do not match.
 
 ### 6.3 Live-cluster verification — **not yet done**
 Untested against real infrastructure, by design of the test suite:
