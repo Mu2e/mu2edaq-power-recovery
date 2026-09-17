@@ -128,9 +128,13 @@ kerberos:
     - mu2eshift
 
   # --- service identities -------------------------------------------------
-  # No single identity can log in to every DAQ node. When the operator's own
-  # ticket is refused by a host, the tools try the Mu2e service identities in
-  # turn until one gets in or the list is exhausted. Tickets for these come
+  # The operator's own principal is ALWAYS tried first, on every machine, for
+  # root sessions as much as for ordinary ones. It is the identity the run
+  # belongs to, and no service credential is used where a personal one would
+  # have done. The service identities below are only ever fallbacks, tried in
+  # turn when the personal ticket is refused by a host, and the run returns to
+  # the personal ticket afterwards -- nothing here ever touches the default
+  # credential cache or the process environment. Tickets for these come
   # from the mu2edaq-kerberos package, which owns the keytab-in-Vault layout
   # at td/scd/experiments/mu2e/kerberos/<identity> -- this project never
   # handles a keytab itself.
@@ -139,6 +143,10 @@ kerberos:
   # or a timeout stops it, because a host that is down will refuse every
   # identity equally and each attempt costs a full connect timeout.
   use_service_keytabs: true
+  # Fall back to the service identities for root sessions too. The login stays
+  # 'root' and only the ticket changes: authenticating as mu2edaq and logging
+  # in to the root account is something a node's root/.k5login can authorise.
+  root_fallback: true
   # Tried first, in this order -- between them these two cover most of the
   # cluster, so the common case is one extra attempt rather than seven.
   service_identities:

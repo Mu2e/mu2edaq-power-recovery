@@ -97,3 +97,38 @@ def make_context(settings, topology, factory, checks_config):
                             checks_config=checks_config,
                             local=factory.transport, baseline=baseline or {})
     return _make
+
+
+@pytest.fixture(autouse=True)
+def no_real_network(monkeypatch, request):
+    """Fail any test that tries to shell out to ssh, ipmitool or kinit.
+
+    The suite claims to contact nothing -- no DAQ network, no Kerberos ticket,
+    no Vault -- and that claim is the reason it can be run before an outage.
+    It is easy to break by accident: a test that builds a transport through
+    SSHFactory.for_node() resolves a gateway, and resolving a gateway probes
+    it for real. This turns that into a failure instead of a slow test and a
+    stray connection to the cluster.
+
+    Mark a test with @pytest.mark.allow_network to opt out.
+    """
+    if request.node.get_closest_marker("allow_network"):
+        return
+
+    from mu2edaq_power_recovery.transport import local as local_module
+
+    blocked = ("ssh", "scp", "rsync", "ipmitool", "kinit", "klist", "kdestroy",
+               "vault", "get-kerberos-ticket", "vault-client")
+    original = local_module.LocalTransport.run
+
+    def guarded(self, command, *args, **kwargs):
+        rendered = command if isinstance(command, str) else " ".join(
+            str(part) for part in command)
+        first = rendered.strip().split()[0].rsplit("/", 1)[-1] if rendered.strip() else ""
+        if first in blocked:
+            raise AssertionError(
+                f"test tried to run {first!r} for real: {rendered[:120]}\n"
+                f"Stub the transport, or mark the test @pytest.mark.allow_network.")
+        return original(self, command, *args, **kwargs)
+
+    monkeypatch.setattr(local_module.LocalTransport, "run", guarded)

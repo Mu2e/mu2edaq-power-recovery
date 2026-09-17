@@ -390,18 +390,23 @@ class SSHFactory:
     def credentials_for(self, host: str, root: bool = False) -> List[Any]:
         """The ordered credential chain to try for *host*.
 
-        A credential already known to work for this host is put first; the rest
-        follow in the manager's order, which itself promotes identities that
-        have worked elsewhere in this run.
+        The operator's own principal stays at the front. A service identity
+        known to work for this host is promoted ahead of the *other* fallbacks,
+        never ahead of the personal ticket: the run belongs to that identity,
+        and one node having needed a service account is no reason to stop
+        offering it everywhere else.
         """
         if self.kerberos is None:
             return []
         chain = self.kerberos.chain(root=root)
         known = self._working.get(host)
-        if known is not None:
-            chain = [known] + [c for c in chain
-                               if getattr(c, "name", None) != getattr(known, "name", None)]
-        return chain
+        if known is None or getattr(known, "primary", False):
+            return chain
+
+        primary = [c for c in chain if getattr(c, "primary", False)]
+        rest = [c for c in chain if not getattr(c, "primary", False)
+                and getattr(c, "name", None) != getattr(known, "name", None)]
+        return primary + [known] + rest
 
     def _note_success(self, host: str, credential: Any) -> None:
         self._working[host] = credential

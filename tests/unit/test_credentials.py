@@ -237,11 +237,23 @@ def test_the_chain_starts_with_the_operator(manager):
     assert [c.name for c in chain[1:3]] == ["mu2edaq", "mu2eshift"]
 
 
-def test_root_does_not_fall_back_to_service_identities(manager):
-    # Service accounts are ordinary users; trying them for root would add an
-    # authentication round trip per identity and could not succeed.
+def test_root_tries_the_personal_principal_first_then_falls_back(manager):
+    """The operator's own principal leads the root chain, and root does fall back.
+
+    The fallbacks keep the root login and change only the ticket:
+    authenticating as mu2edaq and logging in to the root account is something
+    a node's root/.k5login can authorise, which is why root has fallbacks.
+    """
     chain = manager.chain(root=True)
-    assert [c.name for c in chain] == ["root"]
+    assert chain[0].name == "root" and chain[0].primary
+    assert [c.name for c in chain[1:3]] == ["mu2edaq", "mu2eshift"]
+    # Same login throughout; only the credential cache differs.
+    assert {c.login for c in chain} == {"root"}
+
+
+def test_root_fallback_can_be_turned_off(manager):
+    manager.settings.set("kerberos.root_fallback", False)
+    assert [c.name for c in manager.chain(root=True)] == ["root"]
 
 
 def test_an_unusable_identity_is_skipped_and_not_retried(manager):
@@ -294,6 +306,17 @@ def test_no_kerberos_package_means_no_service_identities(settings, tmp_path):
 # ---------------------------------------------------------------------------
 
 
+def test_the_personal_principal_always_leads_the_chain(settings, topology, manager):
+    for root in (False, True):
+        chain = manager.chain(root=root)
+        assert chain[0].primary, f"root={root}: personal ticket must be first"
+        assert not any(c.primary for c in chain[1:])
+
+
+def test_restore_primary_returns_the_personal_credential(manager):
+    assert manager.restore_primary().primary
+
+
 def test_the_factory_passes_the_chain_to_the_transport(settings, topology, manager):
     factory = SSHFactory(settings, topology, kerberos=manager)
     transport = factory.for_host("mu2e-trk-01.fnal.gov", direct=True)
@@ -301,20 +324,44 @@ def test_the_factory_passes_the_chain_to_the_transport(settings, topology, manag
         ["general", "mu2edaq", "mu2eshift"]
 
 
-def test_the_factory_remembers_what_worked_for_a_host(settings, topology, manager):
+def test_the_memo_promotes_a_fallback_but_never_past_the_personal_ticket(
+        settings, topology, manager):
+    """A host that needed a service identity still gets the personal one first.
+
+    The run belongs to the operator's principal. One node having needed
+    mu2eshift is no reason to stop offering the personal ticket everywhere --
+    including on that node, the next time a transport for it is built.
+    """
     factory = SSHFactory(settings, topology, kerberos=manager)
     factory._note_success("mu2e-trk-01.fnal.gov",
                           Credential(name="mu2eshift", login="mu2eshift"))
     chain = factory.credentials_for("mu2e-trk-01.fnal.gov")
-    assert chain[0].name == "mu2eshift"
+
+    assert chain[0].primary, "the personal ticket must stay first"
+    assert chain[1].name == "mu2eshift", "the known-good fallback comes next"
     assert [c.name for c in chain].count("mu2eshift") == 1
 
 
-def test_root_transports_get_the_root_chain(settings, topology, manager):
+def test_a_successful_service_identity_does_not_lead_other_hosts_chains(manager):
+    # Promotion orders the fallbacks among themselves, never ahead of the
+    # personal principal.
+    manager.note_success(Credential(name="mu2eraw", login="mu2eraw"))
+    chain = manager.chain()
+    assert chain[0].primary
+    assert chain[1].name == "mu2eraw"
+
+
+def test_root_transports_get_the_root_chain(settings, topology, manager,
+                                            monkeypatch):
     factory = SSHFactory(settings, topology, kerberos=manager)
+    # Resolving a gateway probes it for real; the chain is what is under test.
+    monkeypatch.setattr(factory, "gateway_for", lambda location: "gw.fnal.gov")
     node = topology.node("mu2e-trk-01")
     transport = factory.for_node(node, root=True)
-    assert [c.name for c in transport.credentials] == ["root"]
+    names = [c.name for c in transport.credentials]
+    assert names[0] == "root" and transport.credentials[0].primary
+    assert "mu2edaq" in names        # root falls back too
+    assert all(c.login == "root" for c in transport.credentials)
 
 
 def test_without_a_kerberos_manager_there_is_no_chain(settings, topology):

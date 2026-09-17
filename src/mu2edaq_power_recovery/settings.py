@@ -111,6 +111,7 @@ DEFAULTS: Dict[str, Any] = {
         "prompt": True,
         "verify_users": ["mu2edaq", "mu2eshift"],
         "use_service_keytabs": True,
+        "root_fallback": True,
         "service_identities": ["mu2edaq", "mu2eshift"],
         "discover_identities": True,
         "get_kerberos_ticket_command": None,

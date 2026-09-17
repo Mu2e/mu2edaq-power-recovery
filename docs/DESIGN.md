@@ -47,6 +47,23 @@ Root access uses a *separate* Kerberos principal in a *separate* credential
 cache, because acquiring the root ticket must not displace the ordinary one,
 and an SSH command should select its identity by which environment it is given.
 
+**Credential chains.** No single identity can log in to every node, so each host
+is tried against an ordered chain. Three rules govern it:
+
+1. *The operator's own principal is always first*, for root as well as ordinary
+   sessions. The run belongs to that identity, and a service credential must
+   never be used where a personal one would have done. Nothing displaces it —
+   not the per-host memo, not the promotion of a fallback that worked elsewhere.
+2. *Service identities are fallbacks, and the run returns to the personal
+   ticket.* Nothing mutates the ambient environment or the default credential
+   cache: each ssh invocation is handed its own `KRB5CCNAME`, and service
+   tickets are minted into private caches via `get-kerberos-ticket --cache`.
+3. *Root falls back too, by changing the ticket rather than the login.*
+   Authenticating as `mu2edaq` and logging in to the `root` account is something
+   a node's `root/.k5login` can authorise. An earlier version refused root any
+   fallback on the reasoning that service accounts are ordinary users — true of
+   the account, irrelevant to the principal, and wrong.
+
 ### IPMI, executed on the gateway
 
 `ipmitool` is never run locally. The IPMI subnets — 192.168.157.0/24 at MC-2,

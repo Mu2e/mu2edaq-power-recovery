@@ -14,7 +14,7 @@ with the phase-0 self-update, the static report site, the logbook integration,
 the diagnostics utilities, the optional C/C++ probe library and its Python
 bindings, and the documentation set.
 
-259 automated tests pass, plus 7 C++ test groups and an end-to-end simulated
+264 automated tests pass, plus 7 C++ test groups and an end-to-end simulated
 four-phase run. **Nothing has yet been run against the real cluster** — the
 tests and the rehearsal deliberately contact nothing, so what is verified is
 the logic, not the environment. Two items remain open (§6): the MC-1 node list,
@@ -107,7 +107,7 @@ Every requirement from `Project-Description.md`, and where it is met.
 
 ## 4. Test matrix
 
-`pytest` — **259 passed**, no cluster, no credentials, no network.
+`pytest` — **264 passed**, no cluster, no credentials, no network.
 
 | Suite | Tests | Covers |
 |---|---|---|
@@ -118,7 +118,8 @@ Every requirement from `Project-Description.md`, and where it is met.
 | `unit/test_ipmi.py` | 39 | **Safety gates**, credentials, invocation shape, failure diagnosis |
 | `unit/test_state.py` | 8 | Round-trip, refusal auditing, append-not-overwrite |
 | `unit/test_vault.py` | 11 | KV path resolution, folder-vs-secret, synonyms, file fallback |
-| `unit/test_credentials.py` | 33 | Credential chains, ssh-failure classification, KRB5CCNAME wiring |
+| `unit/test_credentials.py` | 37 | Primary-first chains, root fallback, ssh-failure classification, KRB5CCNAME |
+| `unit/test_network_guard.py` | 1 | The suite's "contacts nothing" claim is enforced, not just asserted |
 | `unit/test_sweep.py` | 8 | Both backends, identical semantics |
 | `unit/test_selfupdate.py` | 13 | Dirty tree, divergence, fast-forward, re-exec guard |
 | `integration/test_phases.py` | 22 | All four phases end to end |
@@ -235,6 +236,20 @@ mu2egateway01 --run true` → `mu2e-ipmi-tool -n <one node> chassis power status
 --execute --until manager` on a maintenance day.
 
 ### 6.4 Fixed during development, worth knowing
+- **The credential chain demoted the operator's own principal.** A service
+  identity that had worked for a host was promoted to the front of that host's
+  chain, so a later transport tried it before the personal ticket; and root
+  sessions were given no fallback at all, on the reasoning that service
+  accounts are ordinary users — true of the account, irrelevant to the
+  principal. Both corrected: the personal principal is now position 0 in every
+  chain, promotion reorders only the fallbacks among themselves, and root falls
+  back by changing the ticket while keeping the `root` login.
+- **The test suite made real ssh connections to the gateways.** Any test
+  building a transport through `SSHFactory.for_node()` resolved a gateway, and
+  resolving a gateway probes it. The suite's central claim is that it contacts
+  nothing, so that is now enforced by an autouse fixture that fails a test which
+  shells out to ssh, kinit, ipmitool or vault, with an `allow_network` marker to
+  opt out.
 - **IPMI sessions were refused on the real cluster.** The invocation carried
   `-N 5 -R 1`, added as "tuning", which cuts ipmitool to a single attempt; a
   BMC that needs a retry then fails with "Unable to establish IPMI v2 / RMCP+

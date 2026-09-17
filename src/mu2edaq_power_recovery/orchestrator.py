@@ -352,6 +352,14 @@ class Orchestrator:
                     log.info("%s is unreachable; skipping its remaining checks",
                              node.hostname)
 
+        if self.kerberos is not None:
+            # Back to the operator's own principal. Nothing here mutates the
+            # ambient environment or the default credential cache, so this
+            # asserts the invariant rather than repairing anything -- but it
+            # makes "a service identity never becomes the run's identity"
+            # something the code states, not something you have to infer.
+            self.kerberos.restore_primary()
+
         assessment.duration = time.monotonic() - started
         return assessment
 

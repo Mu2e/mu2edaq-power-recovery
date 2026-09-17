@@ -28,7 +28,7 @@ import re
 import shutil
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -65,9 +65,23 @@ class Credential:
     #: 'operator ticket' or 'vault keytab' -- shown in the report.
     source: str = "operator ticket"
 
+    #: True for the operator's own principal. It is always tried first, and
+    #: the run returns to it; the service identities are only ever fallbacks.
+    primary: bool = False
+
     def environ(self) -> Dict[str, str]:
         """Environment additions selecting this credential's cache."""
         return {"KRB5CCNAME": f"FILE:{self.cache}"} if self.cache else {}
+
+    def for_login(self, login: Optional[str]) -> "Credential":
+        """This credential's ticket, used to log in as a different account.
+
+        Which ticket authenticates and which account is logged into are
+        separate things. Root access through a service identity is exactly
+        this: authenticate as, say, ``mu2edaq``, and log in to the ``root``
+        account, which the node's ``root/.k5login`` may authorise.
+        """
+        return replace(self, login=login)
 
     def as_dict(self) -> Dict[str, Any]:
         return {"name": self.name, "login": self.login,
@@ -334,37 +348,64 @@ class KerberosManager:
             self.settings.get("ssh.user")
         return Credential(name=role, login=login,
                           cache=self._caches.get(role), principal=principal,
-                          source="operator ticket")
+                          source="operator ticket", primary=True)
 
     def chain(self, root: bool = False) -> List[Credential]:
         """Credentials to try for a node, in order.
 
-        Root sessions do not fall back: the service identities are ordinary
-        accounts, so trying them for a root login would add several
-        authentication round trips per node and could not succeed.
+        **The operator's own principal is always first**, for root sessions as
+        much as for ordinary ones. It is the identity the run belongs to: when
+        it works, which is the normal case, nothing else is touched, and no
+        service credential is used where a personal one would have done. The
+        service identities are only ever fallbacks, and the run returns to the
+        personal ticket afterwards -- see :meth:`restore_primary`.
 
-        For an ordinary session the operator's own ticket is tried first --
-        when it works, which is the normal case, nothing else is touched --
-        followed by the service identities.
+        For a root session the fallbacks keep the ``root`` login and change
+        only the *ticket*: authenticating as ``mu2edaq`` and logging in to the
+        root account is a thing a node's ``root/.k5login`` can authorise, and
+        it is the reason root has fallbacks at all.
         """
-        chain = [self.operator_credential(root=root)]
-        if root:
+        primary = self.operator_credential(root=root)
+        chain = [primary]
+        if root and not self.settings.get("kerberos.root_fallback", True):
             return chain
+
         for identity in self.order_chain(self.available_identities()):
             credential = self.service_credential(identity)
-            if credential is not None:
-                chain.append(credential)
+            if credential is None:
+                continue
+            # Root: same login, different ticket. Ordinary: the identity's own
+            # account.
+            chain.append(credential.for_login(primary.login) if root else credential)
         return chain
 
     def order_chain(self, identities: List[str]) -> List[str]:
-        """Put identities that already worked in this run first.
+        """Order the *fallback* identities, best guess first.
 
-        On a fifty-node cluster the identity that opened node 1 very probably
-        opens node 2, and trying it first turns a walk down the whole list into
-        a single attempt. Purely an ordering; nothing is skipped.
+        On a fifty-node cluster the service identity that opened node 1 very
+        probably opens node 2, so trying it before the others turns a walk down
+        the whole list into a single attempt.
+
+        This reorders the fallbacks among themselves only. The operator's own
+        principal is prepended by :meth:`chain` afterwards and is never
+        displaced -- a service identity having worked somewhere is not a reason
+        to stop offering the personal ticket first.
         """
         promoted = [i for i in self._successful if i in identities]
         return promoted + [i for i in identities if i not in promoted]
+
+    def restore_primary(self) -> Credential:
+        """Return to the operator's own principal.
+
+        Nothing in this project ever mutates the process environment or the
+        default credential cache -- each ssh invocation is given its own
+        KRB5CCNAME, and tickets are minted into private caches with
+        ``get-kerberos-ticket --cache`` -- so the personal ticket is never
+        displaced in the first place. This makes that explicit, and is called
+        after each node so a service identity cannot become the run's working
+        identity by accident.
+        """
+        return self.operator_credential()
 
     def note_success(self, credential: Credential) -> None:
         """Record that *credential* logged in somewhere."""

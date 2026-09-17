@@ -22,7 +22,7 @@ mu2e-power-on --execute                      # phase 2, actually switches on
 mu2e-power-netcheck                          # phase 3
 mu2e-power-report --post-ecl                 # phase 4
 
-pytest                                       # 259 tests, no cluster needed
+pytest                                       # 264 tests, no cluster needed
 cmake -S . -B build && cmake --build build   # optional C/C++ library
 ctest --test-dir build --output-on-failure
 ```
@@ -124,6 +124,12 @@ the healthy baseline.
 - **Only an auth failure advances the credential chain.** `classify_ssh_failure`
   makes that call; getting it wrong means either cycling seven identities
   against a dead host, or giving up on a node one of them could have opened.
+- **The operator's own principal is always chain position 0**, for root as well
+  as ordinary sessions, and nothing may displace it — not the per-host memo, not
+  promotion. Service identities are fallbacks; the run returns to the personal
+  ticket after each node (`KerberosManager.restore_primary`). Never mutate the
+  ambient environment or the default ccache: `get-kerberos-ticket` is always
+  called with `--cache`.
 - **Never weaken the protected-host refusal.** It is the one place the tool
   declines to do what it is told, and it is deliberate.
 - **Keep FAIL and UNKNOWN distinct.** "It is broken" and "we could not look"

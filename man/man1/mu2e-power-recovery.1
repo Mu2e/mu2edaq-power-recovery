@@ -118,11 +118,17 @@ Never prompt for a password; fail with instructions instead. For unattended
 runs.
 .TP
 .B service identities
-No single identity can log in to every DAQ node. When the operator's own ticket
-is refused by a host, the tools try the Mu2e service identities in turn \(em
+The operator's own principal is
+.I always
+tried first, on every machine, for root sessions as much as for ordinary ones.
+It is the identity the run belongs to, and no service credential is used where
+a personal one would have done.
+.IP
+Only when a host refuses it do the tools try the Mu2e service identities \(em
 .IR mu2edaq " and " mu2eshift
 first, then every other identity in Vault \(em until one gets in or the list is
-exhausted. Tickets for these come from the
+exhausted, returning to the personal principal for the next machine. Tickets
+for these come from the
 .B mu2edaq-kerberos
 package, which owns the keytab-in-Vault layout; this project never handles a
 keytab. See
@@ -130,11 +136,21 @@ keytab. See
 in
 .BR mu2edaq-power-recovery.yaml (5).
 .IP
+For a root session the fallbacks keep the
+.B root
+login and change only the ticket: authenticating as
+.I mu2edaq
+and logging in to the root account is something a node's
+.I root/.k5login
+can authorise.
+.I kerberos.root_fallback
+turns that off.
+.IP
 Only an authentication failure advances the chain: a refused connection or a
 timeout stops it, because a host that is down refuses every identity equally
-and each attempt costs a full connect timeout. Root sessions never fall back,
-the service accounts being ordinary users. The report records which identity
-opened each node.
+and each attempt costs a full connect timeout. The report records which
+identity opened each node. Nothing mutates the default credential cache or the
+process environment.
 .TP
 .BI \-\-vault\-addr " URL"
 HashiCorp Vault address. Default:

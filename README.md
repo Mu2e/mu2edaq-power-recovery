@@ -112,12 +112,26 @@ mu2e-power-recovery --phase all --execute \
     --root-principal anorman/root@FNAL.GOV
 ```
 
-**Service identities.** No single identity can log in to every DAQ node. When
-your own ticket is refused by a host, the tools try the Mu2e service
-identities in turn — `mu2edaq` and `mu2eshift` first, then every other
-identity in Vault (`mu2edcs`, `mu2edqm`, `mu2eraw`, `mu2e-controlroom`,
-`mu2e-teststand`) — until one gets in or the list is exhausted. The report
-records which identity worked for each node.
+**Your own principal always goes first.** On every machine, for root sessions
+as much as for ordinary ones. It is the identity the run belongs to, and no
+service credential is used where a personal one would have done.
+
+**Service identities are fallbacks only.** When your ticket is refused by a
+host, the tools try `mu2edaq` and `mu2eshift`, then every other identity in
+Vault (`mu2edcs`, `mu2edqm`, `mu2eraw`, `mu2e-controlroom`, `mu2e-teststand`),
+until one gets in or the list is exhausted — then go back to your principal for
+the next machine. A service identity that worked somewhere is ordered ahead of
+the *other fallbacks*, never ahead of your own ticket. The report records which
+identity opened each node.
+
+For a **root** session the fallbacks keep the `root` login and change only the
+ticket: authenticating as `mu2edaq` and logging in to the root account is
+something a node's `root/.k5login` can authorise, and is why root has fallbacks
+at all. Turn it off with `kerberos.root_fallback: false`.
+
+Nothing here touches your default credential cache or the process environment:
+each `ssh` gets its own `KRB5CCNAME`, and service tickets are minted into
+private caches with `get-kerberos-ticket --cache`.
 
 Tickets for these come from [`mu2edaq-kerberos`](../mu2edaq-kerberos), which
 owns the keytab-in-Vault layout; this project never handles a keytab. Its
@@ -242,7 +256,7 @@ between two runs has an explanation. See `man 3 libmu2eprobe`.
 ## Testing
 
 ```sh
-pytest                                              # 259 tests, no cluster needed
+pytest                                              # 264 tests, no cluster needed
 mu2e-power-recovery --phase all --simulate          # end-to-end rehearsal
 ctest --test-dir build --output-on-failure          # C++ and Python
 ```

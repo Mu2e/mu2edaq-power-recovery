@@ -187,6 +187,17 @@ Accounts whose ability to log in is itself a check
 Fall back to the Mu2e service identities when the operator's own ticket is
 refused by a host. Default
 .BR true .
+The operator's own principal is always tried first regardless; these are only
+ever fallbacks, and the run returns to the personal ticket after each node.
+.TP
+.I root_fallback
+Apply the same fallback to root sessions. Default
+.BR true .
+The login stays
+.B root
+and only the ticket changes, which a node's
+.I root/.k5login
+can authorise.
 Tickets come from the
 .B mu2edaq-kerberos
 package, which owns the keytab-in-Vault layout at

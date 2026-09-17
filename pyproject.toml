@@ -69,3 +69,6 @@ mu2edaq_power_recovery = ["report/templates/*.html", "report/assets/*"]
 testpaths = ["tests"]
 addopts = "-q"
 filterwarnings = ["ignore::DeprecationWarning"]
+markers = [
+    "allow_network: test may shell out to ssh/kinit/ipmitool for real",
+]
