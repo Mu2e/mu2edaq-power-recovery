@@ -117,6 +117,25 @@ cache from the general one, so acquiring it cannot displace the other.
 Never prompt for a password; fail with instructions instead. For unattended
 runs.
 .TP
+.B service identities
+No single identity can log in to every DAQ node. When the operator's own ticket
+is refused by a host, the tools try the Mu2e service identities in turn \(em
+.IR mu2edaq " and " mu2eshift
+first, then every other identity in Vault \(em until one gets in or the list is
+exhausted. Tickets for these come from the
+.B mu2edaq-kerberos
+package, which owns the keytab-in-Vault layout; this project never handles a
+keytab. See
+.I kerberos.use_service_keytabs
+in
+.BR mu2edaq-power-recovery.yaml (5).
+.IP
+Only an authentication failure advances the chain: a refused connection or a
+timeout stops it, because a host that is down refuses every identity equally
+and each attempt costs a full connect timeout. Root sessions never fall back,
+the service accounts being ordinary users. The report records which identity
+opened each node.
+.TP
 .BI \-\-vault\-addr " URL"
 HashiCorp Vault address. Default:
 .IR https://ssivault.fnal.gov:8200 .

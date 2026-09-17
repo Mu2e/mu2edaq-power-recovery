@@ -1,4 +1,8 @@
-"""IPMI (and ECL) credentials from HashiCorp Vault.
+"""IPMI and ECL credentials from HashiCorp Vault.
+
+Service keytabs are NOT handled here: mu2edaq-kerberos already turns a keytab
+in Vault into a ticket, and is the single place that knows how those secrets
+are laid out. See creds/ticketsource.py.
 
 Secrets live at ``td/scd/experiments/mu2e/`` on https://ssivault.fnal.gov:8200,
 with the BMC credentials at ``td/scd/experiments/mu2e/ipmi/config``

@@ -94,6 +94,12 @@ DEFAULTS: Dict[str, Any] = {
         "timeout": 10,
         "retries": 2,
         "power_on_delay": 20,
+        # ipmitool's own -N/-R. None means "do not pass the flag", leaving
+        # ipmitool's defaults (4 retries) in force -- forcing a single attempt
+        # made BMCs that need a retry fail to establish a session at all.
+        "message_timeout": None,
+        "tool_retries": None,
+        "extra_args": [],
     },
     "kerberos": {
         "principal": None,
@@ -101,6 +107,12 @@ DEFAULTS: Dict[str, Any] = {
         "min_lifetime": 3600,
         "prompt": True,
         "verify_users": ["mu2edaq", "mu2eshift"],
+        "use_service_keytabs": True,
+        "service_identities": ["mu2edaq", "mu2eshift"],
+        "discover_identities": True,
+        "get_kerberos_ticket_command": None,
+        "vault_client_command": None,
+        "vault_client_args": [],
     },
     "vault": {
         "addr": "https://ssivault.fnal.gov:8200",

@@ -30,16 +30,51 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 from ..transport.base import TransportError
 from ..transport.local import LocalTransport
+from .ticketsource import TicketSource, TicketSourceError
 
 log = logging.getLogger(__name__)
 
 
 class KerberosError(RuntimeError):
     """No usable ticket could be obtained for a required principal."""
+
+
+@dataclass
+class Credential:
+    """One identity an SSH session can be attempted under.
+
+    A recovery has several to choose from: the operator's own principal, their
+    root principal, and the Mu2e service identities whose keytabs live in
+    Vault. Which of them can log in to a given node varies -- that is the
+    point of trying them in turn -- so a credential carries both the ssh login
+    to use and the credential cache that authenticates it.
+    """
+
+    #: Short name for logs and the report: 'operator', 'root', or the identity.
+    name: str
+    #: SSH login. None means "whatever ssh would use by default".
+    login: Optional[str] = None
+    #: KRB5CCNAME target. None means the ambient credential cache.
+    cache: Optional[Path] = None
+    #: Kerberos principal, when known.
+    principal: Optional[str] = None
+    #: 'operator ticket' or 'vault keytab' -- shown in the report.
+    source: str = "operator ticket"
+
+    def environ(self) -> Dict[str, str]:
+        """Environment additions selecting this credential's cache."""
+        return {"KRB5CCNAME": f"FILE:{self.cache}"} if self.cache else {}
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {"name": self.name, "login": self.login,
+                "principal": self.principal, "source": self.source}
+
+    def __str__(self) -> str:
+        return f"{self.name} ({self.principal or self.login or 'ambient'})"
 
 
 @dataclass
@@ -87,6 +122,16 @@ class KerberosManager:
             tempfile.mkdtemp(prefix="mu2e-recovery-krb5-"))
         self._caches: Dict[str, Path] = {}
         self._acquired: List[str] = []
+        #: Service tickets come from the mu2edaq-kerberos package, which owns
+        #: the keytab-in-Vault layout; this project never handles a keytab.
+        self.tickets = TicketSource(settings)
+        #: identity -> Credential, or None once an identity is known to be
+        #: unusable. Cached so that forty nodes do not each re-fetch a keytab
+        #: from Vault and re-run kinit for the same identity.
+        self._service: Dict[str, Optional[Credential]] = {}
+        #: Identities that have successfully logged in somewhere, most recent
+        #: first. Used to reorder the chain -- see order_chain().
+        self._successful: List[str] = []
 
     # -- inspection --------------------------------------------------------
 
@@ -216,6 +261,119 @@ class KerberosManager:
             raise KerberosError(f"kinit failed for {principal}: "
                                 f"{detail[-1] if detail else 'unknown error'}")
         log.info("acquired %s ticket for %s", role, principal)
+
+    # -- service identities, via mu2edaq-kerberos -----------------------------
+
+    def available_identities(self) -> List[str]:
+        """Service identities to try, in the order they should be tried.
+
+        The configured preferences come first -- mu2edaq and mu2eshift by
+        default, because between them they cover most of the cluster -- and
+        every other identity mu2edaq-kerberos knows about follows, so an
+        identity added to Vault becomes usable here with no change to this
+        project. Identities that have already worked in this run are promoted
+        to the front by :meth:`order_chain`.
+        """
+        if not self.settings.get("kerberos.use_service_keytabs", True):
+            return []
+        preferred = list(self.settings.get("kerberos.service_identities",
+                                           ["mu2edaq", "mu2eshift"]) or [])
+        discovered: List[str] = []
+        if self.settings.get("kerberos.discover_identities", True):
+            discovered = self.tickets.identities()
+        if not discovered:
+            return preferred
+        ordered = [i for i in preferred if i in discovered]
+        ordered += [i for i in discovered if i not in ordered]
+        return ordered
+
+    def service_credential(self, identity: str) -> Optional[Credential]:
+        """A credential for one service identity, or None if unusable.
+
+        The keytab never passes through this process: ``get-kerberos-ticket``
+        reads it from Vault, uses it, and removes it, and all we receive is the
+        path of a credential cache.
+
+        A failure is cached as None. An identity whose keytab is missing, or
+        whose kinit fails, will fail identically for every other node, and
+        rediscovering that once per node would dominate a fifty-node run.
+        """
+        if identity in self._service:
+            return self._service[identity]
+
+        credential: Optional[Credential] = None
+        if not self.tickets.available:
+            log.debug("%s", self.tickets.unavailable_reason())
+        else:
+            cache = self.cache_for(f"svc-{identity}")
+            try:
+                ticket = self.tickets.ticket(identity, cache)
+            except TicketSourceError as exc:
+                log.warning("cannot use the %s service identity: %s", identity, exc)
+            else:
+                credential = Credential(
+                    name=identity, login=identity, cache=ticket.cache,
+                    principal=ticket.principal,
+                    source="mu2edaq-kerberos (Vault keytab)")
+                self._caches[f"svc-{identity}"] = ticket.cache
+                self._acquired.append(ticket.principal or identity)
+                log.info("acquired a ticket for the %s service identity (%s)",
+                         identity, ticket.principal or "principal unknown")
+
+        self._service[identity] = credential
+        return credential
+
+    # -- credential chains ----------------------------------------------------
+
+    def operator_credential(self, root: bool = False) -> Credential:
+        """The operator's own credential, for the general or root role."""
+        role = "root" if root else "general"
+        principal = self.settings.get(
+            "kerberos.root_principal" if root else "kerberos.principal")
+        login = self.settings.get("ssh.root_user", "root") if root else \
+            self.settings.get("ssh.user")
+        return Credential(name=role, login=login,
+                          cache=self._caches.get(role), principal=principal,
+                          source="operator ticket")
+
+    def chain(self, root: bool = False) -> List[Credential]:
+        """Credentials to try for a node, in order.
+
+        Root sessions do not fall back: the service identities are ordinary
+        accounts, so trying them for a root login would add several
+        authentication round trips per node and could not succeed.
+
+        For an ordinary session the operator's own ticket is tried first --
+        when it works, which is the normal case, nothing else is touched --
+        followed by the service identities.
+        """
+        chain = [self.operator_credential(root=root)]
+        if root:
+            return chain
+        for identity in self.order_chain(self.available_identities()):
+            credential = self.service_credential(identity)
+            if credential is not None:
+                chain.append(credential)
+        return chain
+
+    def order_chain(self, identities: List[str]) -> List[str]:
+        """Put identities that already worked in this run first.
+
+        On a fifty-node cluster the identity that opened node 1 very probably
+        opens node 2, and trying it first turns a walk down the whole list into
+        a single attempt. Purely an ordering; nothing is skipped.
+        """
+        promoted = [i for i in self._successful if i in identities]
+        return promoted + [i for i in identities if i not in promoted]
+
+    def note_success(self, credential: Credential) -> None:
+        """Record that *credential* logged in somewhere."""
+        name = credential.name
+        if name in ("general", "root"):
+            return
+        if name in self._successful:
+            self._successful.remove(name)
+        self._successful.insert(0, name)
 
     # -- use ---------------------------------------------------------------
 

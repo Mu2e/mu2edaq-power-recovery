@@ -14,7 +14,7 @@ with the phase-0 self-update, the static report site, the logbook integration,
 the diagnostics utilities, the optional C/C++ probe library and its Python
 bindings, and the documentation set.
 
-212 automated tests pass, plus 7 C++ test groups and an end-to-end simulated
+256 automated tests pass, plus 7 C++ test groups and an end-to-end simulated
 four-phase run. **Nothing has yet been run against the real cluster** — the
 tests and the rehearsal deliberately contact nothing, so what is verified is
 the logic, not the environment. Two items remain open (§6): the MC-1 node list,
@@ -45,6 +45,7 @@ Every requirement from `Project-Description.md`, and where it is met.
 | 15 | Gateways responding | ✅ | `ping.lab` |
 | 16 | Gateway login with a root-capable ticket | ✅ | `ssh.login`, `ssh.login_root` |
 | 17 | Designate general and root principals | ✅ | `--principal`, `--root-principal` |
+| 17a | Fall back to service keytabs when a login fails | ✅ | `creds/ticketsource.py`; cycles all identities |
 | 18 | Prompt for a password when needed | ✅ | `KerberosManager._kinit` |
 | 19 | Gateway disk mounts match normal config | ✅ | `disk.mounts` |
 | 20 | From the gateways, check other machines respond | ✅ | `CheckContext.prober` |
@@ -80,7 +81,8 @@ Every requirement from `Project-Description.md`, and where it is met.
 | Topology / inventory | ✅ Complete | 14 | Upstream-compatible entry syntax |
 | SSH transport | ✅ Complete | via checks | ProxyJump, GSSAPI, no ControlMaster |
 | IPMI client | ✅ Complete | 25 | Runs on the gateway; secrets on stdin |
-| Kerberos | ✅ Complete | — | Needs a live KDC to test; see §6.3 |
+| Kerberos | ✅ Complete | 33 | Credential chains over the Mu2e service identities |
+| Service identities | ✅ Complete | 33 | Via `mu2edaq-kerberos`; no keytab handled here |
 | Vault | ✅ Complete | 11 | Path and fields confirmed against the live Vault |
 | Check framework | ✅ Complete | 36 | 25 checks; registry; failure containment |
 | Output parsers | ✅ Complete | 19 | Real command output as fixtures |
@@ -94,6 +96,7 @@ Every requirement from `Project-Description.md`, and where it is met.
 | ECL posting | ⚠️ Untested | 3 | Body and subject tested; posting needs the package (§6.2) |
 | Self-update | ✅ Complete | 13 | Against real throwaway git repos |
 | `libmu2eprobe` (C++) | ✅ Complete | 7 groups | C++ / C / Python surfaces |
+| ssh credential chain | ✅ Complete | 33 | Per-host memo, promotion, auth-vs-unreachable |
 | Python sweep fallback | ✅ Complete | 8 | Semantics identical to the native path |
 | CLI | ✅ Complete | 14 | Driver + 4 single-phase entry points |
 | Diagnostics (4 tools) | ✅ Complete | — | Exercised manually; see §6.4 |
@@ -104,7 +107,7 @@ Every requirement from `Project-Description.md`, and where it is met.
 
 ## 4. Test matrix
 
-`pytest` — **212 passed**, no cluster, no credentials, no network.
+`pytest` — **256 passed**, no cluster, no credentials, no network.
 
 | Suite | Tests | Covers |
 |---|---|---|
@@ -112,9 +115,10 @@ Every requirement from `Project-Description.md`, and where it is met.
 | `unit/test_settings.py` | 23 | All five precedence layers, coercion, redaction, malformed YAML |
 | `unit/test_parsers.py` | 19 | `df`, `ip`, `ping` (iputils + BSD), `mdstat`, SMART, kernel errors |
 | `unit/test_checks.py` | 36 | Every check's pass and fail path; framework containment |
-| `unit/test_ipmi.py` | 25 | **Safety gates**, credential handling, state reading, retries |
+| `unit/test_ipmi.py` | 36 | **Safety gates**, credentials, invocation shape, failure diagnosis |
 | `unit/test_state.py` | 8 | Round-trip, refusal auditing, append-not-overwrite |
 | `unit/test_vault.py` | 11 | KV path resolution, folder-vs-secret, synonyms, file fallback |
+| `unit/test_credentials.py` | 33 | Credential chains, ssh-failure classification, KRB5CCNAME wiring |
 | `unit/test_sweep.py` | 8 | Both backends, identical semantics |
 | `unit/test_selfupdate.py` | 13 | Dirty tree, divergence, fast-forward, re-exec guard |
 | `integration/test_phases.py` | 22 | All four phases end to end |
@@ -215,7 +219,23 @@ mu2egateway01 --run true` → `mu2e-ipmi-tool -n <one node> chassis power status
 → `mu2e-power-state` → a dry-run `mu2e-power-on` → a real `mu2e-power-on
 --execute --until manager` on a maintenance day.
 
-### 6.4 Smaller items
+### 6.4 Fixed during development, worth knowing
+- **IPMI sessions were refused on the real cluster.** The invocation carried
+  `-N 5 -R 1`, added as "tuning", which cuts ipmitool to a single attempt; a
+  BMC that needs a retry then fails with "Unable to establish IPMI v2 / RMCP+
+  session". The upstream `mu2e_ipmi.sh` passes neither flag and relies on
+  ipmitool's default of four retries. Both are now unset by default and the
+  invocation otherwise matches upstream exactly, apart from `-E` in place of
+  `-P`. Covered by `test_the_invocation_matches_the_known_working_upstream_form`
+  and `test_ipmitool_retry_flags_are_not_sent_by_default`.
+- **Designated principals had no effect.** `KerberosManager` minted tickets
+  into private credential caches, but nothing put `KRB5CCNAME` into the `ssh`
+  environment, so `--principal` / `--root-principal` were silently ignored and
+  the ambient ticket was used. Found while adding the credential chain; the
+  chain work required wiring it properly. Covered by
+  `test_the_credential_cache_is_put_into_the_ssh_environment`.
+
+### 6.5 Smaller items
 - The gateway `ssh.proxy: auto` choice is cached for the life of a run; a
   gateway that dies mid-run surfaces as an SSH error on the next command rather
   than as an automatic failover.
@@ -239,6 +259,9 @@ Recorded here in brief; the reasoning is in [docs/DESIGN.md](docs/DESIGN.md).
 | Drive the `ssh` binary | Paramiko / asyncssh | The site's `ssh_config`, GSSAPI and host-key policy are then automatically in force |
 | Drive `kinit`/`klist` | A native krb5 binding | No build-time dependency on a host that may itself be recovering |
 | Separate credential cache per principal | One cache collection | Acquiring root must not displace the ordinary ticket |
+| Service tickets via `mu2edaq-kerberos` | Fetch the keytab and kinit here | That package owns the keytab-in-Vault layout; a second copy would be a second thing to keep in step |
+| Only an auth failure advances the credential chain | Always try every identity | Seven identities against a dead host costs seven connect timeouts and learns nothing |
+| Root sessions do not fall back | Try service identities for root too | The service accounts are ordinary users; it could not succeed |
 | FAIL distinct from UNKNOWN | One failure status | "Broken" and "could not look" need different responses |
 | SKIP dropped before the node roll-up | Rank SKIP above OK | Otherwise a node with no BMC reports as "n/a" rather than healthy |
 | Power sequence is YAML | Hard-coded order | Operations changes the order more often than the code |

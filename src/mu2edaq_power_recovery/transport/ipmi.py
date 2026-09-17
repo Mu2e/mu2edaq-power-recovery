@@ -98,7 +98,10 @@ class IPMIClient:
                  timeout: int = 10,
                  retries: int = 2,
                  dry_run: bool = True,
-                 protected: Optional[Any] = None):
+                 protected: Optional[Any] = None,
+                 message_timeout: Optional[int] = None,
+                 tool_retries: Optional[int] = None,
+                 extra_args: Optional[List[str]] = None):
         self.gateway = gateway
         self.username = username
         self._password = password
@@ -107,7 +110,14 @@ class IPMIClient:
         self.privilege = privilege
         self.cipher_suite = cipher_suite
         self.timeout = timeout
+        #: Our own retry loop around the whole invocation.
         self.retries = retries
+        #: ipmitool's -N and -R. None means "do not pass the flag", which
+        #: leaves ipmitool's defaults in force -- see _remote_command.
+        self.message_timeout = message_timeout
+        self.tool_retries = tool_retries
+        #: Extra ipmitool arguments from configuration, e.g. ['-e', '^'].
+        self.extra_args = list(extra_args or [])
         self.dry_run = dry_run
         #: Callable(hostname) -> bool, normally Topology.is_protected.
         self.protected = protected or (lambda host: False)
@@ -117,14 +127,27 @@ class IPMIClient:
     def _remote_command(self, bmc_host: str, args: List[str]) -> str:
         """The shell line executed on the gateway.
 
-        ``IPMI_PASSWORD`` is exported inside the remote shell (its value
-        arrives via stdin, see :meth:`_run`), and ipmitool's ``-E`` reads it
-        from there.  ``timeout`` bounds a BMC that accepts the TCP session and
-        then never answers -- a common failure mode for a BMC that has just
-        had its power restored.
+        Deliberately the same invocation as the known-working
+        mu2edaq-operations script::
+
+            ipmitool -I lanplus -H <bmc> -U <user> -L Operator -C 3 <args>
+
+        with one difference: ``-E`` instead of ``-P <password>``, so the
+        password is read from the environment rather than the command line.
+        ``IPMI_PASSWORD`` is exported inside the remote shell from a value that
+        arrives on stdin (see :meth:`_run`).
+
+        ``-N`` (per-message timeout) and ``-R`` (retry count) are *not* sent
+        unless configured. They were, once, at ``-N 5 -R 1``, and that single
+        attempt was enough to turn a BMC that needs a retry to establish its
+        RMCP+ session into an outright failure. ipmitool's own defaults -- four
+        retries -- are what the upstream script relies on and what works.
+
+        ``timeout`` on the gateway still bounds the whole invocation, so a BMC
+        that accepts the session and then never answers cannot hang a stage.
         """
         parts = [
-            "timeout", str(self.timeout + 5),
+            "timeout", str(self.tool_timeout()),
             self.tool,
             "-I", self.interface,
             "-H", bmc_host,
@@ -132,10 +155,30 @@ class IPMIClient:
             "-L", self.privilege,
             "-C", str(self.cipher_suite),
             "-E",
-            "-N", str(max(1, self.timeout // 2)),
-            "-R", "1",
         ]
+        if self.message_timeout:
+            parts += ["-N", str(self.message_timeout)]
+        if self.tool_retries is not None:
+            parts += ["-R", str(self.tool_retries)]
+        parts += [str(a) for a in self.extra_args]
         return " ".join(shlex.quote(p) for p in parts + [str(a) for a in args])
+
+    def tool_timeout(self) -> int:
+        """Wall-clock bound applied on the gateway.
+
+        Generous relative to the per-message timeout, because ipmitool retries
+        internally: cutting it to roughly one attempt is what broke this
+        before.
+        """
+        return max(self.timeout * 3, 20)
+
+    def describe(self, bmc_host: str, args: List[str]) -> str:
+        """The invocation as it would be run, for the operator to compare.
+
+        Contains no secret -- the password is passed by environment -- so this
+        is safe to print and to put in the report.
+        """
+        return self._remote_command(bmc_host, args)
 
     def _run(self, bmc_host: str, args: List[str]) -> CommandResult:
         """Run one ipmitool invocation on the gateway, with retries.
@@ -175,7 +218,45 @@ class IPMIClient:
                 log.debug("ipmi %s %s rc=%s, retrying", bmc_host, args, result.rc)
                 time.sleep(1.0)
         assert last is not None
+        self._annotate_failure(last, bmc_host)
         return last
+
+    #: Substrings of ipmitool failures that mean the session never opened, and
+    #: what an operator should actually check for each.
+    _DIAGNOSES = (
+        ("unable to establish",
+         "the BMC refused the session. In order of likelihood: the username is "
+         "wrong (upstream mu2e_ipmi.sh hard-codes 'MU2E' -- compare it against "
+         "vault.ipmi_user_field), the password is wrong, or this BMC wants a "
+         "different cipher suite (try ipmi.cipher_suite: 17, or 0)."),
+        ("rakp", "the BMC rejected the credentials during RMCP+ authentication: "
+                 "the username or password is wrong."),
+        ("unauthorized name",
+         "the BMC does not have an account with this username."),
+        ("privilege level",
+         "the account exists but may not use ipmi.privilege "
+         f"-- try Administrator."),
+        ("no route to host",
+         "the gateway cannot reach the IPMI segment; check net.ipmi_reach."),
+        ("timed out",
+         "the BMC did not answer. If it answers intermittently, raise "
+         "ipmi.timeout or set ipmi.tool_retries."),
+    )
+
+    def _annotate_failure(self, result: CommandResult, bmc_host: str) -> None:
+        """Attach a plain-language cause to a failed invocation.
+
+        "Unable to establish IPMI v2 / RMCP+ session" is the same message for a
+        wrong username, a wrong password and an unsupported cipher suite, so
+        the raw output alone does not tell an operator what to change.
+        """
+        text = (result.stderr + result.stdout).lower()
+        for needle, diagnosis in self._DIAGNOSES:
+            if needle in text:
+                result.meta["diagnosis"] = diagnosis
+                result.meta["invocation"] = self.describe(bmc_host, [])
+                log.error("%s: %s", bmc_host, diagnosis)
+                return
 
     # -- read-only operations ---------------------------------------------
 

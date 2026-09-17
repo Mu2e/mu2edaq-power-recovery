@@ -132,7 +132,20 @@ Passed to
 .BR ipmitool .
 .TP
 .IR timeout ", " retries
-Per-command budget and retry count.
+Per-command budget, and how many times this tool re-runs the whole invocation.
+.TP
+.IR message_timeout ", " tool_retries
+ipmitool's own
+.BR \-N " and " \-R .
+Both default to null, meaning the flags are not passed and ipmitool's defaults
+(four retries) stand \(em which is what the known-working upstream invocation
+relies on. Forcing a single attempt turns a BMC that needs a retry into an
+"Unable to establish IPMI v2 / RMCP+ session" failure.
+.TP
+.I extra_args
+Extra ipmitool arguments, appended verbatim, e.g.
+.B ['-e', '^']
+for the SOL escape character.
 .TP
 .I power_on_delay
 Seconds to wait after
@@ -155,6 +168,43 @@ the run then fails with instructions instead.
 .I verify_users
 Accounts whose ability to log in is itself a check
 .RI ( login.users ).
+.TP
+.I use_service_keytabs
+Fall back to the Mu2e service identities when the operator's own ticket is
+refused by a host. Default
+.BR true .
+Tickets come from the
+.B mu2edaq-kerberos
+package, which owns the keytab-in-Vault layout at
+.IR <base_path>/kerberos/<identity> .
+.TP
+.I service_identities
+Identities to try first, in order. Default
+.BR "[mu2edaq, mu2eshift]" ,
+which between them cover most of the cluster, so the common case is one extra
+attempt rather than the whole list.
+.TP
+.I discover_identities
+After the preferred ones, try every other identity
+.B mu2edaq-kerberos
+knows about. Default
+.BR true ,
+so an identity added to Vault becomes usable with no change here.
+.TP
+.IR get_kerberos_ticket_command ", " vault_client_command
+Paths to the
+.B mu2edaq-kerberos
+commands. Left null they are found on
+.BR PATH ,
+then in a sibling
+.I ../mu2edaq-kerberos
+checkout's venv.
+.TP
+.I vault_client_args
+Extra arguments passed through to
+.BR vault-client ,
+for example
+.BR "['--org', 'mu2e']" .
 .SS vault
 .TP
 .IR addr ", " kv_mount ", " base_path

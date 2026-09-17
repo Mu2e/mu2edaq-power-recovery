@@ -22,7 +22,7 @@ mu2e-power-on --execute                      # phase 2, actually switches on
 mu2e-power-netcheck                          # phase 3
 mu2e-power-report --post-ecl                 # phase 4
 
-pytest                                       # 212 tests, no cluster needed
+pytest                                       # 256 tests, no cluster needed
 cmake -S . -B build && cmake --build build   # optional C/C++ library
 ctest --test-dir build --output-on-failure
 ```
@@ -43,7 +43,9 @@ src/mu2edaq_power_recovery/
   state.py         SQLAlchemy run store (SQLite; Postgres by URL)
   console.py       on-screen report
   cli.py           the driver and the four single-phase entry points
-  creds/           kerberos.py (kinit/klist), vault.py (hvac)
+  creds/           kerberos.py (kinit/klist, credential chains),
+                   ticketsource.py (adapter over mu2edaq-kerberos),
+                   vault.py (hvac: IPMI and ECL secrets)
   transport/       base.py, local.py, ssh.py, ipmi.py, fake.py
   checks/          base.py (registry), parsers.py, and one module per area
   phases/          phase1_assess .. phase4_report
@@ -72,7 +74,8 @@ topology: {file, sequence_file, checks_file, locations: [mc2, teststand]}
 selfupdate: {enabled, remote, branch, rebuild_globs, allow_dirty, timeout}
 ssh:      {user, root_user, proxy: auto, connect_timeout, options, max_sessions}
 ipmi:     {execute_on: gateway, tool, interface, privilege, cipher_suite, retries}
-kerberos: {principal, root_principal, min_lifetime, prompt, verify_users}
+kerberos: {principal, root_principal, min_lifetime, prompt, verify_users,
+           use_service_keytabs, service_identities, discover_identities}
 vault:    {addr, kv_mount: td, base_path, ipmi_path: ipmi/config, ipmi_*_field,
            allow_file_fallback, fallback_password_file, auto_login}
 database: {url, path}          # url set => Postgres
@@ -114,6 +117,13 @@ the healthy baseline.
   code change.
 - **Never let a secret reach an argument vector.** Passwords go to stdin;
   `ipmitool` uses `-E`, never `-P`. There is a test for this.
+- **Never handle a keytab here.** `mu2edaq-kerberos` owns the keytab-in-Vault
+  layout and mints the tickets; `creds/ticketsource.py` is a thin adapter over
+  its commands. A second copy of that logic would be a second thing to keep in
+  step with how the secrets are stored.
+- **Only an auth failure advances the credential chain.** `classify_ssh_failure`
+  makes that call; getting it wrong means either cycling seven identities
+  against a dead host, or giving up on a node one of them could have opened.
 - **Never weaken the protected-host refusal.** It is the one place the tool
   declines to do what it is told, and it is deliberate.
 - **Keep FAIL and UNKNOWN distinct.** "It is broken" and "we could not look"

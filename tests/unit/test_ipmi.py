@@ -195,3 +195,86 @@ def test_retries_are_bounded(gateway):
     client.power_status("mu2e-trk-01-ipmi.fnal.gov")
     attempts = [c for c in gateway.calls if "chassis power status" in c["command"]]
     assert len(attempts) == 3      # the first try plus two retries, then stop
+
+
+# ---------------------------------------------------------------------------
+# invocation shape -- this is where a regression breaks the real cluster
+# ---------------------------------------------------------------------------
+
+
+def test_the_invocation_matches_the_known_working_upstream_form(gateway):
+    """The upstream mu2e_ipmi.sh command is known to work against these BMCs.
+
+    Deviating from it is how "Unable to establish IPMI v2 / RMCP+ session"
+    happened: an added ``-R 1`` cut ipmitool to a single attempt, and a BMC
+    that needs a retry then never establishes a session at all.
+    """
+    client = make_client(gateway)
+    command = client.describe("mu2e-crv-01-ipmi.fnal.gov",
+                              ["chassis", "power", "status"])
+    for expected in ("-I lanplus", "-H mu2e-crv-01-ipmi.fnal.gov", "-U MU2E",
+                     "-L Operator", "-C 3", "chassis power status"):
+        assert expected in command, f"missing {expected!r}"
+
+
+def test_ipmitool_retry_flags_are_not_sent_by_default(gateway):
+    # ipmitool retries four times by default; forcing fewer is what broke it.
+    command = make_client(gateway).describe("bmc", ["chassis", "power", "status"])
+    assert " -R " not in command
+    assert " -N " not in command
+
+
+def test_retry_flags_are_sent_when_configured(gateway):
+    client = IPMIClient(gateway=gateway, username="MU2E", password="x",
+                        message_timeout=3, tool_retries=6)
+    command = client.describe("bmc", ["chassis", "power", "status"])
+    assert "-N 3" in command and "-R 6" in command
+
+
+def test_extra_args_are_appended(gateway):
+    client = IPMIClient(gateway=gateway, username="MU2E", password="x",
+                        extra_args=["-e", "^"])
+    # Quoted, because '^' is a shell metacharacter and this string is run by
+    # the gateway's shell.
+    assert "-e '^'" in client.describe("bmc", ["sol", "activate"])
+
+
+def test_the_gateway_timeout_allows_for_ipmitool_retries(gateway):
+    # The wall-clock bound must not itself cut the retries short.
+    client = IPMIClient(gateway=gateway, username="MU2E", password="x", timeout=10)
+    assert client.tool_timeout() >= 30
+    assert client.describe("bmc", []).startswith("timeout 30 ")
+
+
+def test_describe_never_contains_the_password(gateway):
+    client = IPMIClient(gateway=gateway, username="MU2E", password="s3cret")
+    assert "s3cret" not in client.describe("bmc", ["chassis", "power", "status"])
+
+
+# ---------------------------------------------------------------------------
+# failure diagnosis
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("stderr,expected", [
+    ("Error: Unable to establish IPMI v2 / RMCP+ session", "username"),
+    ("Error: RAKP 2 HMAC is invalid", "password is wrong"),
+    ("Error: Unauthorized name", "does not have an account"),
+    ("Error: Requested privilege level exceeds limit", "Administrator"),
+])
+def test_session_failures_get_a_plain_language_cause(gateway, stderr, expected):
+    # All of these look alike in raw ipmitool output; the operator needs to be
+    # told which knob to turn.
+    gateway.expect_first(r"chassis power status",
+                         ScriptedResponse(stderr=stderr, rc=1))
+    client = IPMIClient(gateway=gateway, username="MU2E", password="x", retries=0)
+    result = client._run("bmc", ["chassis", "power", "status"])
+    assert expected in result.meta.get("diagnosis", "")
+    # The invocation is attached so it can be compared with a working one.
+    assert "ipmitool" in result.meta.get("invocation", "")
+
+
+def test_a_successful_call_is_not_annotated(gateway):
+    client = make_client(gateway)
+    result = client._run("bmc", ["chassis", "power", "status"])
+    assert result.ok and "diagnosis" not in result.meta

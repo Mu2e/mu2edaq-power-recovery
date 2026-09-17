@@ -83,10 +83,22 @@ ipmi:
   interface: lanplus
   privilege: Operator
   cipher_suite: 3
+  # Our own retry loop around the whole invocation.
   timeout: 10
   retries: 2
   # Seconds to wait between 'chassis power on' and the first SSH attempt.
   power_on_delay: 20
+
+  # ipmitool's own -N (per-message timeout) and -R (retry count). Leave these
+  # null: ipmitool retries four times by default, and that is what the
+  # known-working mu2edaq-operations invocation relies on. Forcing a single
+  # attempt here turned BMCs that need a retry into "Unable to establish IPMI
+  # v2 / RMCP+ session" failures.
+  message_timeout: null
+  tool_retries: null
+  # Extra ipmitool arguments, appended verbatim. The upstream script passes
+  # -e ^ to set the SOL escape character; add it here if a BMC needs it.
+  extra_args: []
 
 kerberos:
   # Principals the tools will use.  Leave null to take whatever is in the
@@ -105,6 +117,34 @@ kerberos:
   verify_users:
     - mu2edaq
     - mu2eshift
+
+  # --- service identities -------------------------------------------------
+  # No single identity can log in to every DAQ node. When the operator's own
+  # ticket is refused by a host, the tools try the Mu2e service identities in
+  # turn until one gets in or the list is exhausted. Tickets for these come
+  # from the mu2edaq-kerberos package, which owns the keytab-in-Vault layout
+  # at td/scd/experiments/mu2e/kerberos/<identity> -- this project never
+  # handles a keytab itself.
+  #
+  # Only an *authentication* failure advances the chain; a refused connection
+  # or a timeout stops it, because a host that is down will refuse every
+  # identity equally and each attempt costs a full connect timeout.
+  use_service_keytabs: true
+  # Tried first, in this order -- between them these two cover most of the
+  # cluster, so the common case is one extra attempt rather than seven.
+  service_identities:
+    - mu2edaq
+    - mu2eshift
+  # After those, try every other identity mu2edaq-kerberos knows about
+  # (mu2edcs, mu2edqm, mu2eraw, mu2e-controlroom, mu2e-teststand, ...), so an
+  # identity added to Vault becomes usable here with no change to this file.
+  discover_identities: true
+  # Paths to the mu2edaq-kerberos commands. Left null they are found on PATH,
+  # then in a sibling ../mu2edaq-kerberos checkout's venv.
+  get_kerberos_ticket_command: null
+  vault_client_command: null
+  # Extra arguments passed through to vault-client, e.g. ['--org', 'mu2e'].
+  vault_client_args: []
 
 vault:
   addr: https://ssivault.fnal.gov:8200

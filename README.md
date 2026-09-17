@@ -112,6 +112,23 @@ mu2e-power-recovery --phase all --execute \
     --root-principal anorman/root@FNAL.GOV
 ```
 
+**Service identities.** No single identity can log in to every DAQ node. When
+your own ticket is refused by a host, the tools try the Mu2e service
+identities in turn — `mu2edaq` and `mu2eshift` first, then every other
+identity in Vault (`mu2edcs`, `mu2edqm`, `mu2eraw`, `mu2e-controlroom`,
+`mu2e-teststand`) — until one gets in or the list is exhausted. The report
+records which identity worked for each node.
+
+Tickets for these come from [`mu2edaq-kerberos`](../mu2edaq-kerberos), which
+owns the keytab-in-Vault layout; this project never handles a keytab. Its
+commands are found on `PATH`, or in a sibling checkout's venv. Turn the
+fallback off with `kerberos.use_service_keytabs: false`.
+
+Only an *authentication* failure advances the chain. A refused connection or a
+timeout stops it — a host that is down refuses every identity equally, and each
+attempt would cost a full connect timeout. Root sessions never fall back: the
+service accounts are ordinary users.
+
 **Vault.** BMC credentials come from `td/scd/experiments/mu2e/ipmi/config` on
 `https://ssivault.fnal.gov:8200`. Get a token with:
 
@@ -213,7 +230,7 @@ between two runs has an explanation. See `man 3 libmu2eprobe`.
 ## Testing
 
 ```sh
-pytest                                              # 212 tests, no cluster needed
+pytest                                              # 256 tests, no cluster needed
 mu2e-power-recovery --phase all --simulate          # end-to-end rehearsal
 ctest --test-dir build --output-on-failure          # C++ and Python
 ```
@@ -239,7 +256,7 @@ time it matters that the tests pass is *before* an outage.
 | Repository | Relationship |
 |---|---|
 | `mu2edaq-operations` | Authoritative node inventory (`node_list.py`, `nodes_config.yaml`) and the on-node health checks whose semantics this reimplements. |
-| `mu2edaq-kerberos` | Same Vault access pattern; keytabs and service tickets. |
+| `mu2edaq-kerberos` | Mints the service-identity tickets used as login fallbacks, from keytabs in Vault. Optional but recommended. |
 | `ecl-client` | Posts the phase-4 report to the electronic logbook. |
 
 ## License

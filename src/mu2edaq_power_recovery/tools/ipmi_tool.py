@@ -58,6 +58,14 @@ notes
                              "are targeted (default: the first configured)")
     parser.add_argument("--gateway", metavar="HOST",
                         help="force a particular gateway to run ipmitool on")
+    parser.add_argument("--user", metavar="NAME",
+                        help="override the BMC username from Vault. The "
+                             "upstream mu2e_ipmi.sh hard-codes MU2E; use this "
+                             "to test whether the Vault username differs.")
+    parser.add_argument("--show-command", action="store_true",
+                        help="print the exact ipmitool invocation and exit, "
+                             "for comparison against a known-working one. It "
+                             "contains no password.")
     parser.add_argument("--execute", action="store_true",
                         help="really issue a state-changing verb "
                              "(power on/off/cycle/reset)")
@@ -117,13 +125,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"error: no gateway for {location} answered ssh; ipmitool cannot "
               f"be run", file=sys.stderr)
         return 2
+    username = args.user or creds.username
     if not args.quiet:
-        print(f"  running ipmitool on {gateway_host} "
-              f"(credentials from {creds.source})\n")
+        # The username is not a secret and is the first thing to check when a
+        # BMC refuses the session, so say it rather than making the operator
+        # go and look it up.
+        print(f"  running ipmitool on {gateway_host} as BMC user "
+              f"'{username}' (credentials from {creds.source})\n")
 
     client = IPMIClient(
         gateway=factory.for_host(gateway_host, direct=True),
-        username=creds.username, password=creds.password,
+        username=username, password=creds.password,
         tool=settings.get("ipmi.tool", "ipmitool"),
         interface=settings.get("ipmi.interface", "lanplus"),
         privilege=settings.get("ipmi.privilege", "Operator"),
@@ -132,7 +144,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         retries=settings.get("ipmi.retries", 2),
         dry_run=not args.execute,
         protected=topology.is_protected,
+        message_timeout=settings.get("ipmi.message_timeout"),
+        tool_retries=settings.get("ipmi.tool_retries"),
+        extra_args=settings.get("ipmi.extra_args", []),
     )
+
+    if args.show_command:
+        print("  the invocation run on the gateway. It carries no password --\n"
+              "  ipmitool reads IPMI_PASSWORD from the environment:\n")
+        for node in nodes:
+            print(f"    {client.describe(node.ipmi_host, list(args.command))}")
+        print(f"\n  BMC username in use : {client.username}")
+        print(f"  credential source   : {creds.source}")
+        print("\n  the known-working upstream form, for comparison:")
+        print("    ipmitool -I lanplus -H <bmc> -UMU2E -P<password> "
+              "-L Operator -C 3 -e^ <args>")
+        return 0
 
     # --- run --------------------------------------------------------------
     results = []
@@ -155,7 +182,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         results.append({"node": node.hostname, "bmc": node.ipmi_host,
                         "rc": result.rc, "output": result.output.strip(),
                         "refused": result.meta.get("refused", False),
-                        "dry_run": result.meta.get("dry_run", False)})
+                        "dry_run": result.meta.get("dry_run", False),
+                        "diagnosis": result.meta.get("diagnosis"),
+                        "invocation": result.meta.get("invocation")})
         if not result.ok:
             failures += 1
 
@@ -164,6 +193,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     else:
         print(console.table(rows, ["NODE", "BMC", "RESULT", "OUTPUT"]))
         print(f"\n  {len(rows) - failures}/{len(rows)} succeeded")
+        # One diagnosis, not one per node: a credential or cipher-suite problem
+        # hits every BMC identically, and repeating it fifty times helps nobody.
+        for entry in results:
+            if entry.get("diagnosis"):
+                print(f"\n  {entry['diagnosis']}")
+                print(f"\n  BMC username in use: {client.username}")
+                print(f"  invocation: {entry['invocation']}")
+                short = entry["node"].split(".")[0]
+                print(f"\n  to compare against the upstream form:"
+                      f"\n    mu2e-ipmi-tool --show-command -n {short} "
+                      f"chassis power status")
+                break
     return 1 if failures else 0
 
 

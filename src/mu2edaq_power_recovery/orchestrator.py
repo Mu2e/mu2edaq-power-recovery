@@ -217,6 +217,14 @@ class Orchestrator:
         except KerberosError as exc:
             raise SystemExit(f"error: {exc}")
 
+        identities = self.kerberos.available_identities()
+        if identities:
+            info["service_identities"] = identities
+            log.info("service identities available as fallbacks: %s",
+                     ", ".join(identities))
+        elif self.settings.get("kerberos.use_service_keytabs", True):
+            info["notes"].append(self.kerberos.tickets.unavailable_reason())
+
         if not self.settings.get("kerberos.root_principal") and \
                 not self.settings.get("kerberos.principal"):
             info["notes"].append(
@@ -224,7 +232,12 @@ class Orchestrator:
                 "ambient ticket and will be reported as failures if it is not "
                 "root-capable")
 
-        self.ssh_factory = SSHFactory(self.settings, self.topology, local=self.local)
+        # The factory needs the Kerberos manager: it is what supplies the
+        # credential chain, and -- more basically -- what puts KRB5CCNAME into
+        # the ssh environment, without which a designated principal is minted
+        # into a private cache that ssh never looks at.
+        self.ssh_factory = SSHFactory(self.settings, self.topology,
+                                      local=self.local, kerberos=self.kerberos)
 
         # BMC credentials.  A failure here is not fatal for phase 1 -- the
         # OS-level checks still work -- so it degrades to "no IPMI" with a note
@@ -267,6 +280,9 @@ class Orchestrator:
             retries=self.settings.get("ipmi.retries", 2),
             dry_run=bool(self.settings.get("run.dry_run", True)),
             protected=self.topology.is_protected,
+            message_timeout=self.settings.get("ipmi.message_timeout"),
+            tool_retries=self.settings.get("ipmi.tool_retries"),
+            extra_args=self.settings.get("ipmi.extra_args", []),
         )
 
     # -- check execution ---------------------------------------------------

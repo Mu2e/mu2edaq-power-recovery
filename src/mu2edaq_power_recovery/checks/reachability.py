@@ -50,19 +50,52 @@ def ping_lab(ctx: CheckContext) -> CheckResult:
 
 @register("ssh.login", "an ordinary SSH session can be opened")
 def ssh_login(ctx: CheckContext) -> CheckResult:
+    """Open an ordinary session, trying each identity in turn.
+
+    The transport walks the credential chain -- the operator's own principal
+    first, then the Mu2e service identities -- so this records not just whether
+    a login worked but *which* identity it took. That matters operationally: a
+    node reachable only as ``mu2eshift`` is a node the operator has no account
+    on, which is worth knowing before they try to debug it by hand.
+    """
     started = time.monotonic()
+    transport = ctx.ssh
     try:
         res = ctx.run(["id", "-un"])
     except TransportError as exc:
-        return result(ctx, "ssh.login", Status.FAIL,
-                      "SSH login failed", str(exc), {"user": None}, started)
+        # Every identity was refused, or the host is down. The transport
+        # records what each one was rejected for.
+        attempts = getattr(transport, "attempts", [])
+        detail = str(exc)
+        if attempts:
+            detail += "\n" + "\n".join(
+                f"  {a['credential']}: {a['reason']} -- {a['detail']}"
+                for a in attempts)
+        return result(ctx, "ssh.login", Status.FAIL, "SSH login failed", detail,
+                      {"user": None, "attempts": attempts}, started)
+
     who = res.output.strip()
     if not res.ok:
         return result(ctx, "ssh.login", Status.FAIL,
                       f"SSH session opened but 'id' exited {res.rc}",
                       res.stderr.strip(), {}, started)
-    return result(ctx, "ssh.login", Status.OK, f"logged in as {who}", "",
-                  {"user": who, "jump": res.meta.get("jump")}, started)
+
+    credential = res.meta.get("credential")
+    working = getattr(transport, "working", None)
+    data = {
+        "user": who,
+        "jump": res.meta.get("jump"),
+        "credential": credential,
+        "principal": getattr(working, "principal", None),
+        "source": getattr(working, "source", None),
+        "rejected": list(getattr(transport, "attempts", [])),
+    }
+    summary = f"logged in as {who}"
+    if credential and credential not in ("general", "root"):
+        summary += f" using the {credential} service identity"
+    if data["rejected"]:
+        summary += f" ({len(data['rejected'])} identity/identities refused first)"
+    return result(ctx, "ssh.login", Status.OK, summary, "", data, started)
 
 
 @register("ssh.login_root", "a root SSH session can be opened", needs_root=True)

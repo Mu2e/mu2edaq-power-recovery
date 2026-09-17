@@ -22,6 +22,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Service-identity fallback: when the operator's own ticket cannot log in to a
+# node, the tools try the Mu2e service identities, whose keytabs live in Vault.
+# mu2edaq-kerberos owns that layout and mints the tickets; this project only
+# calls its get-kerberos-ticket/vault-client commands, so it is an optional
+# extra rather than an import. It is not on PyPI -- install it from
+# https://github.com/Mu2e/mu2edaq-kerberos, or leave a checkout beside this
+# one and its venv will be found automatically.
+keytabs = ["mu2edaq-kerberos>=0.1"]
 # ECL logbook posting (phase 4).  ecl-client is built from
 # https://github.com/normanajn/ecl-client and is not on PyPI, so it is an
 # extra rather than a hard dependency -- phase 4 degrades to "write the

@@ -55,6 +55,22 @@ Force a particular gateway to run
 .B ipmitool
 on, rather than the first one that answers.
 .TP
+.BI \-\-user " NAME"
+Override the BMC username from Vault. The upstream
+.I mu2e_ipmi.sh
+hard-codes
+.BR MU2E ;
+use this to test whether the username in Vault differs, which is the most
+common cause of a refused session.
+.TP
+.B \-\-show\-command
+Print the exact
+.B ipmitool
+invocation and exit, for comparison against a known-working one. It carries no
+password \(em ipmitool reads
+.B IPMI_PASSWORD
+from the environment.
+.TP
 .B \-\-execute
 Really issue a state-changing verb
 .RB ( "chassis power on" / off / cycle / reset ).
@@ -108,6 +124,35 @@ Actually switch a node on:
 mu2e-ipmi-tool \-n mu2e-trk-03 \-\-execute chassis power on
 .EE
 .RE
+.SH DIAGNOSING A REFUSED SESSION
+.B "Error: Unable to establish IPMI v2 / RMCP+ session"
+is the same message for a wrong username, a wrong password and an unsupported
+cipher suite, so the raw output does not say what to change. This tool adds a
+plain-language cause and prints the invocation it used. Check, in order of
+likelihood:
+.IP 1. 4
+the username \(em compare
+.B \-\-show\-command
+against the upstream form, which hard-codes
+.BR MU2E ,
+and try
+.BI \-\-user " MU2E"
+if Vault holds something else;
+.IP 2. 4
+the password, with
+.BR mu2e-vault-ipmi (1);
+.IP 3. 4
+the cipher suite \(em some BMCs need
+.I ipmi.cipher_suite: 17
+rather than 3.
+.PP
+Note that
+.I ipmi.tool_retries
+and
+.I ipmi.message_timeout
+are unset by default on purpose. ipmitool retries four times of its own accord,
+and that is what the working upstream invocation relies on; forcing a single
+attempt makes a BMC that needs a retry fail to establish a session at all.
 .SH EXIT STATUS
 .TP
 .B 0

@@ -34,7 +34,15 @@ gateway01 or gateway02.
 .TP
 .B Credentials
 Kerberos tickets are minted into private credential caches and destroyed when
-the run ends. BMC credentials come from HashiCorp Vault at
+the run ends. No single identity can log in to every node, so each host is
+tried against an ordered chain: the operator's own principal, then the Mu2e
+service identities \(em
+.IR mu2edaq ", " mu2eshift
+and the rest \(em whose tickets the
+.B mu2edaq-kerberos
+package mints from keytabs in Vault. Only an authentication failure advances
+the chain; an unreachable host stops it. BMC credentials come from HashiCorp
+Vault at
 .I td/scd/experiments/mu2e/ipmi/config
 and are delivered to the gateway on standard input, so they appear in no
 process table on either host.
