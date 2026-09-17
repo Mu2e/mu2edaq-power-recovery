@@ -1,0 +1,144 @@
+.TH MU2EDAQ-CHECKS.YAML 5 "2026-09-17" "mu2edaq-power-recovery 0.1.0" "File Formats"
+.SH NAME
+checks.yaml \- health-check thresholds, expectations and profiles
+.SH SYNOPSIS
+.I config/checks.yaml
+.SH DESCRIPTION
+Says what "healthy" means: the thresholds a check compares against, the
+filesystems and services a node is expected to have, and which checks apply to
+which class of host.
+.PP
+The semantics were taken from
+.I mu2edaq-operations/scripts/check_functions.sh
+so that a node this tool calls healthy is also healthy by the on-node script's
+standard.
+.PP
+A check id listed here with no implementation is reported as
+.B skip
+with an explanation, never silently dropped: an unimplemented check must not
+look like a passing one.
+.BR "mu2e-power-recovery \-\-list\-checks"
+prints what is actually implemented.
+.SH SECTIONS
+.SS thresholds
+.TP
+.IR disk_full_pct ", " disk_warn_pct
+Filesystem usage that fails and warns. Defaults 90 and 80; 90 matches the
+on-node script.
+.TP
+.I data_link_speed_mbps
+Expected data-network link rate, from
+.IR /sys/class/net/<nic>/speed .
+Default 10000. A link that renegotiated at 1 Gb/s after a switch reboot is a
+real and quiet failure: everything works, ten times too slowly.
+.TP
+.I load_per_core_warn
+Load average per core above which a freshly booted node is suspicious.
+.TP
+.I max_post_boot_uptime_s
+Uptime above which a node that phase 2 just powered on is flagged \(em it did
+not actually reboot, so the IPMI command probably reached a different chassis.
+.TP
+.IR ping_count ", " ping_timeout_s ", " ssh_connect_timeout_s ", " ipmi_timeout_s
+Per-probe budgets.
+.SS mounts
+.TP
+.I common
+Filesystems every node should have.
+.TP
+.IR mc2 ", " mc1 ", " teststand
+Additional per-location expectations.
+.TP
+.I paths
+Plain existence checks, which catch a half-mounted tree that
+.BR mountpoint (1)
+alone would pass.
+.PP
+A mount entry may name a
+.IR server .
+The check is then skipped on that host \(em
+.I mu2e-mgr-01
+does not NFS-mount its own
+.I /home
+\(em and, in the
+.I disk.nfs_from_mgr
+check, the actual mount source is compared against it. That is not the same
+test as
+.IR disk.mounts :
+a stale entry can leave
+.I /home
+mounted from an address that no longer serves it, which passes
+.B mountpoint
+and fails the moment anything reads a file.
+.SS services
+Daemons whose absence means the node is up but not usable, listed under
+.I common
+and per host class.
+.SS profiles
+Check ids per host class.
+.I base
+is merged into every other profile and comes first, because its members \(em
+reachability and login \(em are the ones whose failure explains every later
+failure.
+.PP
+The shipped profiles are
+.BR base ", " gateway ", " manager ", " datalogger ", " dcs ", " cfo ,
+.BR readout ", " teststand " and " other .
+A host whose class has no profile uses
+.BR other .
+.SS mesh
+Phase 3 settings.
+.TP
+.I networks
+Each entry gives a network
+.IR name ,
+whether to probe a
+.I full_mesh
+or sample against anchors, and whether to run an
+.IR mtu_probe .
+The data network is full-mesh with an MTU probe; the lab and IPMI networks are
+sampled, which is O(N) rather than O(N^2).
+.TP
+.I anchors
+Representative targets used when
+.I full_mesh
+is false.
+.TP
+.I mtu_payload_bytes
+ICMP payload for the jumbo-frame probe. 8972 plus an 8-byte ICMP header plus a
+20-byte IP header is exactly a 9000-byte frame, sent with DF set, so it fails
+if any hop on the path is not jumbo-clean.
+.TP
+.IR count ", " timeout_s
+Per-pair probe budget.
+.SH EXAMPLES
+Warn earlier about disk usage:
+.RS
+.EX
+thresholds:
+  disk_warn_pct: 70
+.EE
+.RE
+.PP
+Require a new daemon on the data loggers:
+.RS
+.EX
+services:
+  datalogger:
+    \- node_exporter
+    \- mu2e_fts
+.EE
+.RE
+.PP
+List the implemented checks and what each verifies:
+.RS
+.EX
+mu2e-power-recovery \-\-list\-checks
+.EE
+.RE
+.SH SEE ALSO
+.BR mu2e-power-recovery (1),
+.BR mu2e-power-netcheck (1),
+.BR mu2edaq-power-recovery (7)
+.SH AUTHOR
+A. Norman <anorman@fnal.gov>, Mu2e DAQ Operations.

@@ -1,0 +1,77 @@
+.TH MU2E-PROBE 1 "2026-09-17" "mu2edaq-power-recovery 0.1.0" "Mu2e DAQ Operations"
+.SH NAME
+mu2e-probe \- parallel TCP reachability sweep of DAQ hosts
+.SH SYNOPSIS
+.B mu2e-probe
+.RI [ options ]
+.RI [ host ...]
+.SH DESCRIPTION
+Probes many hosts in parallel and reports which ones answer. With no host
+arguments, hosts are read from standard input, one per line, so it composes
+with
+.BR mu2e-node-inventory (1).
+.PP
+The probe is a non-blocking TCP connect, not ICMP. It needs no privilege (a raw
+ICMP socket needs root), it answers a more useful question than "the IP stack
+is up", and TCP/22 is not filtered on the lab network because the cluster is
+administered over it.
+.PP
+A
+.I refused
+connection counts as reachable: the machine answered, its sshd simply is not
+listening yet. During a power-on that is the normal intermediate state, and
+treating it as "down" would report most of the cluster as dead.
+.PP
+This is the command-line face of
+.BR libmu2eprobe (3),
+which is also what
+.BR mu2e-power-recovery (1)
+uses to choose a responsive gateway quickly. The library is optional; when it
+is not built, the Python tools fall back to their own implementation and this
+command is simply not installed.
+.SH OPTIONS
+.TP
+.BI \-p " PORT" "\fR, \fP" \-\-port " PORT"
+TCP port to probe. Default: 22. Use 623 for a BMC's RMCP port.
+.TP
+.BI \-t " MS" "\fR, \fP" \-\-timeout " MS"
+Per-host connect budget in milliseconds. Default: 2000.
+.TP
+.BI \-j " N" "\fR, \fP" \-\-threads " N"
+Worker threads. Default: the hardware thread count, via OpenMP.
+.TP
+.BR \-r ", " \-\-resolve\-only
+Resolve names and stop; do not connect.
+.TP
+.BR \-u ", " \-\-up\-only
+Print only the hosts that answered.
+.TP
+.BR \-q ", " \-\-quiet
+Print nothing; use the exit status.
+.TP
+.B \-\-version
+Print the library version, and whether it was built with OpenMP.
+.SH EXIT STATUS
+.TP
+.B 0
+Every host answered.
+.TP
+.B 1
+At least one host did not.
+.TP
+.B 2
+Usage error.
+.SH EXAMPLES
+.RS
+.EX
+mu2e-probe mu2e-trk-01 mu2e-trk-02
+mu2e-node-inventory \-\-hostnames | mu2e-probe \-\-timeout 1000
+mu2e-node-inventory \-n ipmi \-\-hostnames | mu2e-probe \-\-port 623 \-u
+.EE
+.RE
+.SH SEE ALSO
+.BR libmu2eprobe (3),
+.BR mu2e-node-inventory (1),
+.BR mu2e-power-recovery (1)
+.SH AUTHOR
+A. Norman <anorman@fnal.gov>, Mu2e DAQ Operations.

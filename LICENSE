@@ -1,0 +1,46 @@
+Copyright (c) 2026, Fermi Forward Discovery Group, LLC.
+
+This software was produced by employees of Fermi Forward Discovery Group,
+LLC under Contract No. DE-AC02-07CH11359 with the U.S. Department of Energy
+for the operation of Fermi National Accelerator Laboratory ("Fermilab").
+The U.S. Government retains, and the software recipient grants back to the
+U.S. Government, a paid-up, nonexclusive, irrevocable, worldwide license to
+reproduce, prepare derivative works, distribute copies to the public, and
+perform publicly and display publicly, by or on behalf of the U.S.
+Government.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice,
+   this list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright
+   notice, this list of conditions and the following disclaimer in the
+   documentation and/or other materials provided with the distribution.
+
+3. Neither the name of Fermi Forward Discovery Group, LLC, Fermi National
+   Accelerator Laboratory, Fermilab, nor the names of its contributors may
+   be used to endorse or promote products derived from this software
+   without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDER AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+POSSIBILITY OF SUCH DAMAGE.
+
+------------------------------------------------------------------------
+
+NOTE (remove once resolved): This file is a best-effort draft assembled
+from the general shape of the public "Fermitools"-style BSD-3-Clause-with-
+US-Government-rights notice used by other Fermilab open-source projects
+(e.g. art, cetlib). It has NOT been reviewed or approved by Fermilab's
+Office of Technology Transfer or SCD legal, and should be treated as a
+placeholder rather than authoritative legal text until that review happens.

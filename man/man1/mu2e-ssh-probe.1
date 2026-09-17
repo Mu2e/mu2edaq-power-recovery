@@ -1,0 +1,85 @@
+.TH MU2E-SSH-PROBE 1 "2026-09-17" "mu2edaq-power-recovery 0.1.0" "Mu2e DAQ Operations"
+.SH NAME
+mu2e-ssh-probe \- show, or run, the exact ssh command the recovery tools use
+.SH SYNOPSIS
+.B mu2e-ssh-probe
+.RI [ HOST ...]
+.RB [ \-c
+.IR CLASS ]
+.RB [ \-\-root ]
+.RB [ \-\-run
+.IR COMMAND ]
+.SH DESCRIPTION
+When a check reports that a node could not be reached, the next question is
+always what command was actually issued, and through which gateway. This prints
+that command verbatim so it can be pasted into a shell and debugged by hand,
+and with
+.B \-\-run
+executes it and shows what came back.
+.PP
+It builds the command through the same code path the phases use \(em the same
+jump-host selection, the same
+.B ssh
+options, the same root login \(em so what it prints is what a real run does.
+.SH OPTIONS
+.TP
+.I HOST
+Nodes to probe, short or fully qualified. Repeatable.
+.TP
+.BI \-c " CLASS" "\fR, \fP" \-\-class " CLASS"
+Probe every node of this host class.
+.TP
+.BI \-l " NAME" "\fR, \fP" \-\-location " NAME"
+Location to resolve names in.
+.TP
+.B \-\-root
+Use the root login
+.RI ( ssh.root_user )
+rather than the ordinary one.
+.TP
+.BI \-\-run " COMMAND"
+Actually run this command and show the result. Without it, nothing is executed.
+.TP
+.BI \-\-timeout " SECONDS"
+Override the command timeout.
+.TP
+.B \-\-json
+Emit the argument vectors and results as JSON.
+.SH EXAMPLES
+What would be run, without running it:
+.RS
+.EX
+mu2e-ssh-probe mu2e-trk-03
+.EE
+.RE
+.PP
+Check a mount as root, through the gateway, exactly as the tools would:
+.RS
+.EX
+mu2e-ssh-probe mu2e-trk-03 \-\-root \-\-run 'mountpoint \-q /home; echo $?'
+.EE
+.RE
+.PP
+Confirm every tracker node answers at all:
+.RS
+.EX
+mu2e-ssh-probe \-c tracker \-\-run true
+.EE
+.RE
+.SH EXIT STATUS
+.TP
+.B 0
+Every probe succeeded, or nothing was run.
+.TP
+.B 1
+At least one node failed.
+.TP
+.B 2
+No node was named.
+.SH SEE ALSO
+.BR mu2e-power-recovery (1),
+.BR mu2e-node-inventory (1),
+.BR ssh (1),
+.BR ssh_config (5)
+.SH AUTHOR
+A. Norman <anorman@fnal.gov>, Mu2e DAQ Operations.

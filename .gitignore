@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+venv/
+.venv/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# CMake / C++
+build/
+*.so
+*.dylib
+*.dll
+*.o
+*.a
+
+# Runtime artefacts
+data/*.db
+data/*.db-journal
+logs/*.log
+core/*
+!core/.gitkeep
+config/.env
+
+# Generated report output. The pages are produced by every run; committing them
+# would mean a diff on each one, and the report is an artefact of a recovery,
+# not source. The directory itself is kept so a fresh clone can write into it.
+html/*
+!html/.gitkeep
+
+# Editors / OS
+.DS_Store
+*.swp

@@ -1,0 +1,152 @@
+# ---------------------------------------------------------------------------
+# Health-check definitions and the per-host-class profiles that select them.
+#
+# Every check id below maps to a registered implementation in
+# src/mu2edaq_power_recovery/checks/.  A check that is listed here but has no
+# implementation is reported as SKIP with "no implementation", never silently
+# dropped -- an unimplemented check must not look like a passing one.
+#
+# The semantics of disks/network/pcie/puppet/node_exporter were taken from
+# mu2edaq-operations/scripts/check_functions.sh so that a node judged healthy
+# here is judged healthy by the on-node script too.
+# ---------------------------------------------------------------------------
+
+thresholds:
+  # A filesystem at or above this percentage is a FAIL (check_functions.sh
+  # flags anything matching 9.% or 10.%, i.e. >= 90%).
+  disk_full_pct: 90
+  # ... and a WARN above this, to give an operator lead time.
+  disk_warn_pct: 80
+  # Expected link rate of the 10 GbE data-network NIC, in Mb/s, as reported
+  # by /sys/class/net/<nic>/speed.
+  data_link_speed_mbps: 10000
+  # Load average per core above which a freshly booted node is suspicious.
+  load_per_core_warn: 2.0
+  # A node that claims an uptime longer than this after we just powered it on
+  # did not actually reboot -- flagged so the operator notices.
+  max_post_boot_uptime_s: 3600
+  # ICMP / TCP probe budget.
+  ping_count: 3
+  ping_timeout_s: 5
+  ssh_connect_timeout_s: 10
+  ipmi_timeout_s: 10
+
+# Filesystems every DAQ node is expected to have mounted.  'server' entries
+# are skipped on the host that exports them (mu2e-mgr-01 does not NFS-mount
+# its own /home), matching check_nfs() upstream.
+mounts:
+  common:
+    - {path: /home,    type: nfs,  server: mu2e-mgr-01.fnal.gov}
+  mc2:
+    - {path: /daqlogs, type: nfs,  server: mu2e-mgr-01.fnal.gov}
+  paths:
+    # Plain existence checks -- cheap, and they catch a half-mounted tree
+    # that 'mountpoint' alone would pass.
+    - /scratch/mu2e
+    - /mu2e/spack_pcie/setup-env.sh
+
+# Services whose absence means the node is up but not usable.
+services:
+  common:
+    - node_exporter
+  dcs:
+    - node_exporter
+
+# ---------------------------------------------------------------------------
+# Check profiles.  'base' is merged into every other profile; a profile only
+# lists what it adds on top.
+# ---------------------------------------------------------------------------
+profiles:
+
+  base:
+    - ping.lab            # ICMP reachability on the lab network
+    - ssh.login           # ordinary (non-root) SSH login succeeds
+    - ssh.login_root      # root SSH login succeeds
+    - host.uptime         # uptime / load, and post-power-on sanity
+    - host.kernel         # kernel version + no taint flags
+    - disk.local          # df: no local filesystem over threshold
+    - disk.smart          # SMART overall-health for every physical device
+    - disk.errors         # dmesg / journal I/O and md errors since boot
+    - net.interfaces      # every expected NIC is UP with an address
+    - net.dns             # forward + reverse resolution works
+    - power.status        # IPMI chassis power state
+    - power.sensors       # IPMI sensor thresholds (temps, fans, voltages)
+    - power.sel           # IPMI system event log: new critical events
+
+  gateway:
+    - disk.mounts         # gateway-specific export/mount list
+    - net.forwarding      # routing between lab/data/ipmi segments is live
+    - net.ipmi_reach      # the IPMI segment is reachable from this gateway
+    - svc.firewall        # packet filter loaded and not in a fail-open state
+
+  manager:
+    - disk.mounts
+    - disk.raid           # md/ZFS array state -- this host holds /home
+    - svc.nfs_export      # exports are published
+    - login.users         # mu2edaq and mu2eshift can log in
+    - svc.running
+
+  datalogger:
+    - disk.mounts
+    - disk.raid
+    - net.data            # data-network NIC present, up, at link speed
+    - login.users
+    - svc.running
+
+  dcs:
+    - disk.mounts
+    - disk.nfs_from_mgr   # mounts from mu2e-mgr-01 specifically
+    - net.data
+    - login.users
+    - svc.running
+
+  cfo:
+    - disk.mounts
+    - net.data
+    - pcie.devices        # DTC/CFO PCIe card enumerated
+    - pcie.driver         # mu2e driver loaded, device nodes present
+    - login.users
+    - svc.running
+
+  readout:
+    - disk.mounts
+    - net.data
+    - pcie.devices
+    - pcie.driver
+    - login.users
+    - svc.running
+
+  teststand:
+    - disk.mounts
+    - net.data
+    - login.users
+    - svc.running
+
+  # Applied to any host whose class matched no role pattern.
+  other:
+    - disk.mounts
+
+# ---------------------------------------------------------------------------
+# Phase 3: inter-node connectivity mesh.
+# ---------------------------------------------------------------------------
+mesh:
+  # Networks to test.  For each, every source node pings every target node on
+  # that network.  full_mesh: false samples a representative set instead --
+  # each node to the stage leaders -- which is O(N) rather than O(N^2) and is
+  # the default for the large lab network.
+  networks:
+    - {name: data, full_mesh: true,  mtu_probe: true}
+    - {name: lab,  full_mesh: false, mtu_probe: false}
+    - {name: ipmi, full_mesh: false, mtu_probe: false}
+  # Representative targets used when full_mesh is false.
+  anchors:
+    - mu2e-mgr-01.fnal.gov
+    - mu2e-dl-01.fnal.gov
+    - mu2e-cfo-01.fnal.gov
+  # Payload size for the MTU probe -- 8972 bytes of ICMP payload plus 8 bytes
+  # of ICMP header plus 20 bytes of IP header is exactly a 9000-byte jumbo
+  # frame, sent with DF set, so it fails if any hop is not jumbo-clean.
+  mtu_payload_bytes: 8972
+  # Per-pair probe budget.
+  count: 3
+  timeout_s: 5

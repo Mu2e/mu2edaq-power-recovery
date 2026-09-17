@@ -1,0 +1,135 @@
+.TH MU2EDAQ-POWER-SEQUENCE.YAML 5 "2026-09-17" "mu2edaq-power-recovery 0.1.0" "File Formats"
+.SH NAME
+power-sequence.yaml \- phase 2 power-on stage order for the Mu2e DAQ
+.SH SYNOPSIS
+.I config/power-sequence.yaml
+.SH DESCRIPTION
+Defines the order in which the cluster is brought up, as data rather than code:
+.BR mu2e-power-on (1)
+is the engine that walks this file.
+.PP
+The order is operational, not arbitrary.
+.I mu2e-mgr-01
+exports
+.I /home
+and the shared areas, so every later node's NFS mounts fail if it is not up and
+healthy first; the data loggers and DCS servers must be serving before the CFO
+and the readout nodes have anywhere to write; the CFO distributes the clock and
+control fabric the tracker, calorimeter, CRV and STM nodes synchronise to.
+.SH STRUCTURE
+.SS defaults
+Values inherited by every stage that does not set its own:
+.IR location ", " require ", " concurrency ", " power_on ", " boot_timeout ", " settle .
+.SS stages
+An ordered list. Each stage runs only after the previous one reached its
+.I require
+state.
+.TP
+.I name
+Short identifier, used in the report and by
+.BR \-\-from / \-\-until .
+.TP
+.I title
+Human label for the report tables.
+.TP
+.I nodes
+Explicit hostnames and NodeRange mappings, in the same syntax as
+.BR mu2edaq-topology.yaml (5).
+.TP
+.I location
+Topology location the nodes belong to. Default
+.IR mc2 .
+.TP
+.I checks
+Check profile from
+.BR mu2edaq-checks.yaml (5)
+applied after power-on.
+.TP
+.I require
+How much of the stage must pass before the next may start:
+.RS
+.TP
+.B all
+Every node. The default, and correct for anything the rest of the cluster
+depends on.
+.TP
+.B majority
+More than half. Used for the readout nodes, where one dead machine should not
+hold up the rest \(em the report still lists every failure.
+.TP
+.B any
+At least one. Used for the gateways: one working jump host is enough.
+.RE
+.TP
+.I concurrency
+Maximum nodes worked on at once within the stage.
+.TP
+.I power_on
+When false the stage verifies only and never issues a power command. The
+gateway stage sets this, because power-cycling a jump host removes the path
+every later stage depends on.
+.TP
+.I boot_timeout
+Seconds to wait for SSH to answer after
+.BR "chassis power on" .
+.TP
+.I settle
+Seconds to wait after SSH answers before running checks, so that late-starting
+units \(em NFS automounts, network-online targets, DTC firmware load \(em are
+not sampled mid-start. The wait is skipped entirely when nothing in the stage
+actually had to be switched on.
+.SH THE SHIPPED SEQUENCE
+.TP
+.B gateways
+.IR mu2egateway01 ", " mu2egateway02 .
+Verify only,
+.IR require: any .
+.TP
+.B manager
+.IR mu2e-mgr-01 .
+The NFS and home server;
+.IR require: all ,
+concurrency 1.
+.TP
+.B dataloggers
+.IR mu2e-dl-01 ", " mu2e-dl-02 .
+.TP
+.B dcs
+.IR mu2e-dcs-01 ", " mu2e-dcs-02 .
+Additionally verifies that the shared areas are mounted from
+.I mu2e-mgr-01
+specifically, not merely that something is mounted there.
+.TP
+.B cfo
+.IR mu2e-cfo-01 ,
+including its PCIe device and driver.
+.TP
+.B readout
+.IR mu2e-crv-01 ", " "mu2e-trk-01..14" ", " "mu2e-calo-01..11" ", " mu2e-stm-01 ", " mu2e-stm-02 .
+.IR require: majority ,
+concurrency 8.
+.SH EXAMPLES
+Add a stage after the CFO:
+.RS
+.EX
+\- name: extmon
+  title: Extinction monitor
+  checks: readout
+  concurrency: 1
+  nodes:
+    \- mu2e-extmon-01.fnal.gov
+.EE
+.RE
+.PP
+Run only part of the sequence:
+.RS
+.EX
+mu2e-power-on \-\-execute \-\-from manager \-\-until cfo
+.EE
+.RE
+.SH SEE ALSO
+.BR mu2e-power-on (1),
+.BR mu2edaq-topology.yaml (5),
+.BR mu2edaq-checks.yaml (5)
+.SH AUTHOR
+A. Norman <anorman@fnal.gov>, Mu2e DAQ Operations.

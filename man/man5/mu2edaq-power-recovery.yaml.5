@@ -1,0 +1,260 @@
+.TH MU2EDAQ-POWER-RECOVERY.YAML 5 "2026-09-17" "mu2edaq-power-recovery 0.1.0" "File Formats"
+.SH NAME
+power-recovery.yaml \- main configuration for the Mu2e DAQ power-recovery tools
+.SH SYNOPSIS
+.I config/power-recovery.yaml
+.SH DESCRIPTION
+A YAML mapping of sections, each holding scalar settings. Every key can be
+overridden without editing this file.
+.SS Precedence
+Lowest priority first:
+.IP 1. 4
+built-in defaults, so the tools still run with
+.I config/
+missing entirely;
+.IP 2. 4
+this file;
+.IP 3. 4
+.IR config/.env ;
+.IP 4. 4
+the process environment;
+.IP 5. 4
+the command line.
+.PP
+The environment-variable spelling of any key is mechanical:
+.BI MU2E_POWER_RECOVERY_ PATH
+with the dotted path upper-cased and dots replaced by underscores. A key added
+to this file is immediately overridable from the environment with no code
+change.
+.B VAULT_ADDR
+is also honoured in its conventional form.
+.SH SECTIONS
+.SS run
+.TP
+.I label
+Label for the recovery, shown in the report and the logbook subject.
+.TP
+.I dry_run
+Default
+.BR true .
+When true, no power command is issued.
+.B \-\-execute
+sets it false. It is one of two independent gates \(em a simulated run cannot
+be armed at all \(em so a config edit alone cannot enable the destructive path.
+.TP
+.I stop_on_stage_failure
+Default
+.BR true .
+Stop phase 2 at the first stage that does not meet its requirement.
+.TP
+.I phase_timeout
+Wall-clock budget for one phase, in seconds. 0 disables.
+.TP
+.IR from_stage ", " until_stage
+Default stage range for phase 2; normally set with
+.BR \-\-from / \-\-until .
+.SS topology
+.TP
+.IR file ", " sequence_file ", " checks_file
+Names of the other configuration files, resolved inside
+.IR config/ .
+.TP
+.I locations
+Locations included when
+.B \-\-location
+is not given. Default:
+.BR "[mc2, teststand]" .
+.SS selfupdate
+.TP
+.I enabled
+Run the phase-0 update check. Default
+.BR true .
+.TP
+.IR remote ", " branch
+Git remote and branch to compare against.
+.I branch
+null means the checked-out branch.
+.TP
+.I rebuild_globs
+Paths whose modification by a pull triggers a rebuild.
+.TP
+.I allow_dirty
+Default
+.BR false .
+When false, a working tree with local modifications is reported and left alone
+rather than stashed.
+.TP
+.I timeout
+Seconds allowed for the git round trip before giving up and running the local
+revision.
+.SS ssh
+.TP
+.IR user ", " root_user
+Logins for ordinary and root sessions.
+.I user
+null means
+.BR $USER .
+.TP
+.I proxy
+Jump host.
+.B auto
+picks the first responsive gateway of the node's location;
+.B none
+disables proxying; anything else is used verbatim.
+.TP
+.IR connect_timeout ", " command_timeout
+Seconds.
+.TP
+.I options
+Options passed to every
+.BR ssh (1)
+invocation. A list here
+.I replaces
+the defaults rather than extending them.
+.B BatchMode=yes
+is important: it turns a missing ticket into a fast, legible failure instead of
+a worker thread blocked on a prompt nobody can see.
+.TP
+.I max_sessions
+Maximum simultaneous SSH sessions across the run.
+.SS ipmi
+.TP
+.I execute_on
+Where
+.BR ipmitool (1)
+runs.
+.B gateway
+is the only supported value, and is required: the IPMI subnets are not routable
+from off site.
+.TP
+.IR tool ", " interface ", " privilege ", " cipher_suite
+Passed to
+.BR ipmitool .
+.TP
+.IR timeout ", " retries
+Per-command budget and retry count.
+.TP
+.I power_on_delay
+Seconds to wait after
+.B chassis power on
+before the first SSH attempt.
+.SS kerberos
+.TP
+.IR principal ", " root_principal
+Principals to use. Null means "use whatever is in the ambient credential
+cache". When set, each gets its own private cache, destroyed when the run ends.
+.TP
+.I min_lifetime
+Remaining ticket lifetime, in seconds, below which a ticket is renewed up front
+rather than left to expire mid-phase.
+.TP
+.I prompt
+Prompt for a password when a ticket is missing. Set false for unattended runs;
+the run then fails with instructions instead.
+.TP
+.I verify_users
+Accounts whose ability to log in is itself a check
+.RI ( login.users ).
+.SS vault
+.TP
+.IR addr ", " kv_mount ", " base_path
+Vault address, KV v2 mount and the base path under it. Defaults address
+.IR https://ssivault.fnal.gov:8200 ,
+mount
+.IR td ,
+base path
+.IR scd/experiments/mu2e .
+.TP
+.I ipmi_path
+Secret holding the BMC credentials, relative to
+.IR base_path .
+Default
+.IR ipmi .
+.TP
+.IR ipmi_user_field ", " ipmi_password_field
+Field names inside that secret. Configurable because the live secret's field
+naming could not be confirmed from the repositories; the client also accepts
+the obvious synonyms and reports which it used. Verify with
+.BR mu2e-vault-ipmi (1).
+.TP
+.IR allow_file_fallback ", " fallback_password_file ", " fallback_user
+Fall back to a local password file when Vault is unreachable. A site-wide power
+event is exactly when the Vault server may also be down, and that must not be
+the reason the DAQ cannot be powered back on. The fallback is recorded in the
+run.
+.TP
+.I auto_login
+Run
+.B vault login \-method=ldap
+when no usable token is cached.
+.SS database
+.TP
+.I url
+Full SQLAlchemy URL. Set a
+.I postgresql+psycopg2://
+URL to use Postgres.
+.TP
+.I path
+SQLite path used when
+.I url
+is null.
+.SS report
+.TP
+.IR output_dir ", " title
+Where the static site is written, and its heading.
+.TP
+.I keep_runs
+How many archived runs to keep under
+.IR output_dir/runs/ .
+.TP
+.I publish
+.IR enabled ", " method
+.RB ( rsync ", " scp ", " copy ", " none ),
+.IR target ", " options .
+Publication failure is never fatal: the report on disk is the artefact.
+.SS ecl
+.TP
+.I enabled
+Post the phase-4 report to the electronic logbook.
+.TP
+.IR url ", " category
+ECL instance and category path.
+.TP
+.I credential_path
+Vault path, relative to
+.IR vault.base_path ,
+holding the ECL API user and key.
+.TP
+.I attach_html
+Attach the generated pages to the entry.
+.SS logging
+.TP
+.IR level ", " file
+Console level and the rotating log file.
+.TP
+.IR capture_command_output ", " max_capture_bytes
+Whether to keep remote command output in the run store, and how much per
+command. It is large, and it is the evidence trail the logbook entry is built
+from.
+.SH EXAMPLES
+Override one setting for a single run, without editing anything:
+.RS
+.EX
+MU2E_POWER_RECOVERY_SSH_CONNECT_TIMEOUT=30 mu2e-power-state
+.EE
+.RE
+.PP
+Use Postgres instead of SQLite:
+.RS
+.EX
+mu2e-power-recovery \-\-database\-url \e
+    postgresql+psycopg2://mu2e@dbhost/power_recovery
+.EE
+.RE
+.SH SEE ALSO
+.BR mu2e-power-recovery (1),
+.BR mu2edaq-topology.yaml (5),
+.BR mu2edaq-power-sequence.yaml (5),
+.BR mu2edaq-checks.yaml (5)
+.SH AUTHOR
+A. Norman <anorman@fnal.gov>, Mu2e DAQ Operations.

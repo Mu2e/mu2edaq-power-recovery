@@ -1,0 +1,349 @@
+.TH MU2E-POWER-RECOVERY 1 "2026-09-17" "mu2edaq-power-recovery 0.1.0" "Mu2e DAQ Operations"
+.SH NAME
+mu2e-power-recovery \- assess, power on, verify and report on the Mu2e DAQ clusters after a power outage
+.SH SYNOPSIS
+.B mu2e-power-recovery
+.RB [ \-\-phase
+.IR PHASE ]
+.RB [ \-\-execute ]
+.RB [ \-\-simulate ]
+.RB [ \-\-location
+.IR NAME ]
+.RB [ \-\-node
+.IR HOST ]
+.RI [ options ]
+.SH DESCRIPTION
+.B mu2e-power-recovery
+drives the recovery of the Mu2e DAQ computing centres after a planned or
+unplanned power outage. It runs from a workstation outside the DAQ networks:
+nodes are reached over SSH through a gateway using Kerberos/GSSAPI, and BMCs
+are reached by running
+.BR ipmitool (1)
+.I on
+a gateway, because the IPMI subnets are not routable from off site.
+.PP
+The work is divided into four phases, which may be run together or separately.
+.TP
+.B 1. assess
+A read-only survey. Every node's reachability, login, disk, mount, network and
+power state is recorded. Nothing is changed. Its output is the "initial state"
+report page.
+.TP
+.B 2. poweron
+Nodes are brought up in the dependency order given by
+.BR mu2edaq-power-sequence.yaml (5).
+Each stage is verified before the next begins. Requires
+.B \-\-execute
+to issue any power command.
+.TP
+.B 3. network
+Node-to-node connectivity across the lab, data and IPMI segments, including a
+jumbo-frame probe on the data network. This catches a switch that came back
+with a missing VLAN or the wrong MTU, which leaves every node individually
+healthy while the DAQ cannot move data.
+.TP
+.B 4. report
+The consolidated narrative, assembled from the stored run and optionally posted
+to the electronic logbook. It probes nothing and can be re-run at any time.
+.PP
+Before any phase, the tool checks its GitHub remote for a newer revision,
+fast-forwards if it is behind, rebuilds if the pull touched a build input, and
+restarts itself. It then prints the version, revision and configuration digest
+in force. See
+.B PHASE 0
+below.
+.SH OPTIONS
+.SS Run control
+.TP
+.BI \-\-phase " PHASE"
+One of
+.BR assess ", " poweron ", " network ", " report " or " all .
+Default:
+.BR assess .
+.TP
+.BI \-\-label " TEXT"
+Label for this recovery, shown in the report header and the logbook entry
+subject. Defaults to
+.IR user@host " " date .
+.TP
+.B \-\-execute
+Actually issue power commands. Without it the run is a dry run: power states
+are read and the intended actions are reported, but no chassis is switched on.
+.TP
+.B \-\-simulate
+Contact nothing at all; answer every command from a built-in script. Use this
+to rehearse the whole four-phase run, and to exercise the report, weeks before
+an outage.
+.B \-\-simulate
+overrides
+.BR \-\-execute .
+.TP
+.BI \-\-location " NAME"
+Limit the run to one location:
+.BR mc2 ", " mc1 " or " teststand
+.RB ( heerc
+is accepted as an alias). Repeatable. Defaults to
+.I topology.locations
+from the configuration.
+.TP
+.BI \-\-node " HOST"
+Limit the run to these nodes. Repeatable. Short or fully-qualified names are
+both accepted, as is a name that is not in the inventory.
+.TP
+.B \-\-continue\-on\-error
+In phase 2, carry on to the next stage even when a stage does not meet its
+requirement.
+.TP
+.BI \-\-from " STAGE" ", " \-\-until " STAGE"
+Start and stop the power-on sequence at these stage names, inclusive. Use
+.B \-\-from
+to resume a sequence that stopped, after fixing whatever stopped it.
+.TP
+.B \-\-include\-failed
+In phase 3, probe nodes that failed an earlier phase instead of skipping them.
+.SS Credentials
+.TP
+.BI \-\-principal " PRINCIPAL"
+Kerberos principal for ordinary logins. If there is no usable ticket, a
+password is prompted for and
+.BR kinit (1)
+is run into a private credential cache, which is destroyed when the run ends.
+.TP
+.BI \-\-root\-principal " PRINCIPAL"
+Kerberos principal with root access on the nodes. Kept in a separate credential
+cache from the general one, so acquiring it cannot displace the other.
+.TP
+.B \-\-no\-prompt
+Never prompt for a password; fail with instructions instead. For unattended
+runs.
+.TP
+.BI \-\-vault\-addr " URL"
+HashiCorp Vault address. Default:
+.IR https://ssivault.fnal.gov:8200 .
+.SS Report
+.TP
+.BI \-\-output\-dir " DIR"
+Where the static report pages are written. Default:
+.IR html/ .
+.TP
+.B \-\-publish
+Copy the report to
+.I report.publish.target
+after the run.
+.TP
+.BI \-\-publish\-target " DEST"
+Override the publication target, e.g.
+.IR user@host:/web/recovery/ .
+Implies
+.BR \-\-publish .
+.TP
+.B \-\-no\-report
+Do not write the HTML pages; console output only.
+.TP
+.B \-\-post\-ecl
+Post the phase-4 report to the electronic logbook. Requires the
+.B ecl-client
+package and ECL credentials in Vault.
+.TP
+.BI \-\-run\-id " N"
+Operate on an existing run rather than starting a new one. Used with
+.B \-\-phase report
+to regenerate or repost an earlier run's report.
+.SS General
+.TP
+.BI \-\-config " FILE"
+Main configuration file. Default:
+.IR config/power-recovery.yaml .
+.TP
+.BI \-\-env\-file " FILE"
+Dotenv file. Default:
+.IR config/.env .
+.TP
+.BI \-\-database\-url " URL"
+SQLAlchemy URL for the run store. Default: SQLite under
+.IR data/ .
+Set a
+.I postgresql+psycopg2://
+URL to use Postgres instead.
+.TP
+.B \-\-no\-self\-update
+Skip the phase-0 check for a newer revision.
+.TP
+.B \-\-list\-checks
+Print every registered check and exit.
+.TP
+.B \-\-list\-nodes
+Print the node inventory and exit.
+.TP
+.B \-\-json
+Print the result as JSON on stdout instead of tables.
+.TP
+.BR \-v ", " \-\-verbose
+Debug logging.
+.TP
+.BR \-q ", " \-\-quiet
+Warnings and errors only.
+.SH PHASE 0
+Every invocation begins by checking
+.I origin
+for a newer revision. The update is
+.I fast-forward only:
+if the working tree has local modifications, or the local branch has commits
+the remote does not, the tool says so and runs the code that is checked out
+rather than reconciling anything itself. A fetch that fails or times out is a
+warning, never a stop. When an update is applied, the process re-executes once
+so the new code is actually the code that runs.
+.SH SAFETY
+.TP
+.B Dry run by default
+Power commands require both
+.I run.dry_run: false
+(or
+.BR \-\-execute )
+and a non-simulated run. Two independent gates, so a configuration edit alone
+cannot arm the destructive path.
+.TP
+.B Protected hosts
+.BR "chassis power off" ", " cycle " and " reset
+are refused for the gateways,
+.IR mu2e-mgr-01 " and " mu2e-dcs-01 ,
+regardless of
+.BR \-\-execute .
+Powering any of them down would cut the operator off from the cluster they are
+recovering, or stop the NFS server everything else mounts from. The list is
+.I protected:
+in
+.BR mu2edaq-topology.yaml (5).
+.TP
+.B Credentials
+BMC passwords are read from Vault and delivered to the gateway on standard
+input, never as a command-line argument, so they appear in no process table on
+either host. Kerberos passwords go straight to
+.BR kinit (1)
+on standard input and are not retained.
+.TP
+.B Audit trail
+Every state-changing attempt, including every refusal, is written to the run
+store before the command is issued.
+.SH FILES
+.TP
+.I config/power-recovery.yaml
+Main configuration. See
+.BR mu2edaq-power-recovery.yaml (5).
+.TP
+.I config/topology.yaml
+Node inventory. See
+.BR mu2edaq-topology.yaml (5).
+.TP
+.I config/power-sequence.yaml
+Phase-2 stage order. See
+.BR mu2edaq-power-sequence.yaml (5).
+.TP
+.I config/checks.yaml
+Check definitions, thresholds and profiles. See
+.BR mu2edaq-checks.yaml (5).
+.TP
+.I config/.env
+Local overrides. Not in version control.
+.TP
+.I data/power-recovery.db
+The run store.
+.TP
+.I html/
+The generated report site.
+.TP
+.I logs/power-recovery.log
+Rotating log of every run.
+.SH ENVIRONMENT
+Every configuration key can be overridden by an environment variable named
+.BI MU2E_POWER_RECOVERY_ KEY
+with the dotted path upper-cased and dots replaced by underscores, for example
+.B MU2E_POWER_RECOVERY_SSH_CONNECT_TIMEOUT
+for
+.IR ssh.connect_timeout .
+.B VAULT_ADDR
+and
+.B VAULT_TOKEN
+are honoured in their conventional form.
+.PP
+Priority, lowest first: built-in defaults, the YAML config file,
+.IR config/.env ,
+the environment, the command line.
+.SH EXIT STATUS
+.TP
+.B 0
+Every phase completed and nothing failed.
+.TP
+.B 1
+A phase completed but one or more nodes failed their checks.
+.TP
+.B 2
+The run could not start: configuration, credentials, or no reachable gateway.
+.TP
+.B 3
+Interrupted by the operator.
+.SH EXAMPLES
+Read-only survey of the configured locations:
+.PP
+.RS
+.EX
+mu2e-power-recovery \-\-phase assess
+.EE
+.RE
+.PP
+Rehearse the whole four-phase run with no cluster attached:
+.PP
+.RS
+.EX
+mu2e-power-recovery \-\-phase all \-\-simulate
+.EE
+.RE
+.PP
+A real recovery, with a root principal and a label for the logbook:
+.PP
+.RS
+.EX
+mu2e-power-recovery \-\-phase all \-\-execute \e
+    \-\-principal anorman@FNAL.GOV \e
+    \-\-root\-principal anorman/root@FNAL.GOV \e
+    \-\-label "Sept 2026 planned outage"
+.EE
+.RE
+.PP
+Resume a power-on that stopped at the
+.I dcs
+stage, after fixing it:
+.PP
+.RS
+.EX
+mu2e-power\-on \-\-execute \-\-from dcs
+.EE
+.RE
+.PP
+Regenerate and post the report for an earlier run:
+.PP
+.RS
+.EX
+mu2e-power\-report \-\-run\-id 17 \-\-post\-ecl
+.EE
+.RE
+.SH SEE ALSO
+.BR mu2e-power-state (1),
+.BR mu2e-power-on (1),
+.BR mu2e-power-netcheck (1),
+.BR mu2e-power-report (1),
+.BR mu2e-node-inventory (1),
+.BR mu2e-ipmi-tool (1),
+.BR mu2e-ssh-probe (1),
+.BR mu2e-vault-ipmi (1),
+.BR mu2e-probe (1),
+.BR mu2edaq-power-recovery.yaml (5),
+.BR mu2edaq-topology.yaml (5),
+.BR mu2edaq-power-sequence.yaml (5),
+.BR mu2edaq-checks.yaml (5),
+.BR mu2edaq-power-recovery (7),
+.BR libmu2eprobe (3),
+.BR ipmitool (1),
+.BR kinit (1)
+.SH AUTHOR
+A. Norman <anorman@fnal.gov>, Mu2e DAQ Operations.

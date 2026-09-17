@@ -1,0 +1,95 @@
+.TH MU2E-NODE-INVENTORY 1 "2026-09-17" "mu2edaq-power-recovery 0.1.0" "Mu2e DAQ Operations"
+.SH NAME
+mu2e-node-inventory \- print the Mu2e DAQ node inventory used by the recovery tools
+.SH SYNOPSIS
+.B mu2e-node-inventory
+.RB [ \-l
+.IR LOCATION ]
+.RB [ \-c
+.IR CLASS ]
+.RB [ \-n
+.IR NETWORK ]
+.RB [ \-\-hostnames ]
+.RB [ \-\-protected ]
+.RB [ \-\-json ]
+.SH DESCRIPTION
+Prints the node inventory that
+.BR mu2e-power-recovery (1)
+will use, read from
+.BR mu2edaq-topology.yaml (5).
+It contacts nothing.
+.PP
+When a run reports something unexpected about a machine, the first question is
+whether it knew about that machine at all, and with which interfaces. This
+answers that, from the same file the phases read, so its answer is the phases'
+answer.
+.SH OPTIONS
+.TP
+.BI \-l " LOCATION" "\fR, \fP" \-\-location " LOCATION"
+Limit to a location:
+.BR mc2 ", " mc1 " or " teststand .
+Repeatable.
+.TP
+.BI \-c " CLASS" "\fR, \fP" \-\-class " CLASS"
+Limit to a host class:
+.BR gateway ", " manager ", " datalogger ", " dcs ", " cfo ", " tracker ,
+.BR calorimeter ", " crv ", " stm ", " extmon ", " worker ", " teststand .
+Repeatable.
+.TP
+.BI \-n " NETWORK" "\fR, \fP" \-\-network " NETWORK"
+Limit to nodes present on this network, and with
+.B \-\-hostnames
+print that network's interface names rather than the lab names.
+.TP
+.B \-\-hostnames
+Print bare hostnames, one per line, for piping into
+.BR pssh (1)
+or a shell loop.
+.TP
+.B \-\-protected
+List only the hosts protected from destructive IPMI commands.
+.TP
+.B \-\-json
+Emit the full inventory as JSON, including each node's class, location,
+per-network interface names and subnets.
+.SH EXAMPLES
+Everything the tools know about:
+.RS
+.EX
+mu2e-node-inventory
+.EE
+.RE
+.PP
+The MC-2 tracker nodes:
+.RS
+.EX
+mu2e-node-inventory \-l mc2 \-c tracker
+.EE
+.RE
+.PP
+BMC names for a sweep, piped into the C++ prober:
+.RS
+.EX
+mu2e-node-inventory \-n ipmi \-\-hostnames | mu2e-probe \-\-port 623
+.EE
+.RE
+.PP
+Which hosts may never be powered off:
+.RS
+.EX
+mu2e-node-inventory \-\-protected
+.EE
+.RE
+.SH EXIT STATUS
+.TP
+.B 0
+The inventory was printed.
+.TP
+.B 2
+The topology file is missing, malformed, or the location is unknown.
+.SH SEE ALSO
+.BR mu2e-power-recovery (1),
+.BR mu2edaq-topology.yaml (5),
+.BR mu2e-probe (1)
+.SH AUTHOR
+A. Norman <anorman@fnal.gov>, Mu2e DAQ Operations.

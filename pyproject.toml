@@ -1,0 +1,63 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mu2edaq-power-recovery"
+version = "0.1.0"
+description = "Assess, power on, verify and report on the Mu2e DAQ clusters after a planned or unplanned power outage."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+authors = [
+    { name = "A. Norman", email = "anorman@fnal.gov" },
+]
+keywords = ["mu2e", "daq", "ipmi", "power", "recovery", "fermilab"]
+
+dependencies = [
+    "PyYAML>=5.4",
+    "Jinja2>=3.0",
+    "SQLAlchemy>=1.4",
+    "hvac>=1.2",
+]
+
+[project.optional-dependencies]
+# ECL logbook posting (phase 4).  ecl-client is built from
+# https://github.com/normanajn/ecl-client and is not on PyPI, so it is an
+# extra rather than a hard dependency -- phase 4 degrades to "write the
+# report, skip the post" when it is absent.
+ecl = ["ecl-client>=0.1"]
+# Postgres instead of the default SQLite run store.
+postgres = ["psycopg2-binary>=2.9"]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+]
+
+[project.scripts]
+# --- drivers -------------------------------------------------------------
+mu2e-power-recovery = "mu2edaq_power_recovery.cli:main"
+mu2e-power-state    = "mu2edaq_power_recovery.cli:main_state"
+mu2e-power-on       = "mu2edaq_power_recovery.cli:main_poweron"
+mu2e-power-netcheck = "mu2edaq_power_recovery.cli:main_netcheck"
+mu2e-power-report   = "mu2edaq_power_recovery.cli:main_report"
+# --- diagnostics helpers -------------------------------------------------
+mu2e-node-inventory = "mu2edaq_power_recovery.tools.node_inventory:main"
+mu2e-ipmi-tool      = "mu2edaq_power_recovery.tools.ipmi_tool:main"
+mu2e-ssh-probe      = "mu2edaq_power_recovery.tools.ssh_probe:main"
+mu2e-vault-ipmi     = "mu2edaq_power_recovery.tools.vault_ipmi:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["mu2edaq_power_recovery*"]
+
+[tool.setuptools.package-data]
+mu2edaq_power_recovery = ["report/templates/*.html", "report/assets/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = ["ignore::DeprecationWarning"]

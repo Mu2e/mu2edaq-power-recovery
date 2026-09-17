@@ -1,0 +1,223 @@
+.TH MU2EDAQ-POWER-RECOVERY 7 "2026-09-17" "mu2edaq-power-recovery 0.1.0" "Overview"
+.SH NAME
+mu2edaq-power-recovery \- overview of the Mu2e DAQ power-outage recovery tools
+.SH DESCRIPTION
+A set of tools for recovering the Mu2e DAQ computing centres from a planned or
+unplanned power outage, driven from a workstation outside the DAQ networks.
+.PP
+Three computing centres are covered:
+.BR MC-2 ,
+the primary DAQ room;
+.BR MC-1 ;
+and the
+.B Teststand
+in the Helen Edwards Engineering Center. Each has up to three local networks
+\(em lab, data and IPMI \(em with different CIDRs per site, recorded in
+.BR mu2edaq-topology.yaml (5).
+.SH HOW THE TOOLS REACH THE CLUSTER
+.TP
+.B SSH
+Direct to the gateways; everything else through one with
+.BR ssh 's
+.B \-J
+ProxyJump. Authentication is Kerberos/GSSAPI with delegation, so the ticket
+that opened the gateway session authenticates the second hop. There is no
+password path.
+.TP
+.B IPMI
+.BR ipmitool (1)
+is run
+.I on a gateway,
+never locally: the IPMI subnets are private and not routable from off site.
+This is also what the requirements ask for \(em IPMI commands issued from
+gateway01 or gateway02.
+.TP
+.B Credentials
+Kerberos tickets are minted into private credential caches and destroyed when
+the run ends. BMC credentials come from HashiCorp Vault at
+.I td/scd/experiments/mu2e/ipmi
+and are delivered to the gateway on standard input, so they appear in no
+process table on either host.
+.SH THE FOUR PHASES
+.TP
+.B Phase 0 \(em self-update
+Before anything else, the tools check their GitHub remote, fast-forward if
+behind, rebuild if a build input changed, restart once, and print the version,
+revision and configuration digest in force. The update is fast-forward only: a
+dirty or divergent working tree is reported and left alone.
+.TP
+.B Phase 1 \(em assess
+A read-only survey. Gateways first, because everything else is probed through
+one; then every node's reachability, logins, disks, mounts, interfaces, link
+speeds, services, PCIe state, and the chassis power and event log from its BMC.
+No corrective action is taken. Produces the "initial state" pages.
+.TP
+.B Phase 2 \(em power on
+The dependency-ordered power-on sequence, verifying each stage before starting
+the next. Dry run unless
+.B \-\-execute
+is given. Produces the "power on" pages.
+.TP
+.B Phase 3 \(em network
+Node-to-node connectivity across the segments, with a jumbo-frame probe on the
+data network. Produces the "network" pages.
+.TP
+.B Phase 4 \(em report
+The consolidated narrative, assembled from the stored run and optionally posted
+to the electronic logbook.
+.SH STATUS VOCABULARY
+.TP
+.B OK
+The check ran and the answer was right.
+.TP
+.B WARN
+Right enough to proceed, worth an operator's attention.
+.TP
+.B FAIL
+The check ran and the answer was wrong.
+.TP
+.B UNREACHABLE
+The check could not be run, because the node could not be contacted. Reported
+separately from FAIL throughout, because "it is broken" and "we could not look"
+need different responses during a recovery.
+.TP
+.B n/a
+Not applicable to this host \(em a node with no BMC, a host with no PCIe card.
+A node whose every applicable check passed is OK, not n/a.
+.SH SAFETY MODEL
+.IP \(bu 2
+Power actions are a dry run unless
+.B \-\-execute
+is given; a simulated run cannot be armed at all.
+.IP \(bu 2
+.BR "chassis power off" ", " cycle " and " reset
+are refused for the gateways,
+.I mu2e-mgr-01
+and
+.IR mu2e-dcs-01 ,
+regardless of flags.
+.IP \(bu 2
+Every state-changing attempt, including every refusal, is written to the run
+store before the command is issued.
+.IP \(bu 2
+The gateway stage of phase 2 never issues a power command at all.
+.SH REPORTS
+Each phase writes a static HTML page and a JSON companion into
+.I html/
+\(em no server, no build step, readable from a laptop or copied to a web area.
+Re-running a phase refreshes its page in place; each run is also archived under
+.IR html/runs/<id>/ .
+The pages are overview, initial state, power on, network, detailed report, run
+history, about, API and site map.
+.SH CHECK REFERENCE
+The checks below are registered by their dotted id and selected by profile in
+.BR mu2edaq-checks.yaml (5).
+Ids marked
+.B [root]
+need a root session.
+.TP
+.B disk.errors [root]
+no storage errors in the kernel log since boot
+.TP
+.B disk.local
+no local filesystem is over its usage threshold
+.TP
+.B disk.mounts
+every expected filesystem is mounted
+.TP
+.B disk.nfs_from_mgr
+shared areas are mounted from mu2e-mgr-01
+.TP
+.B disk.raid [root]
+md/RAID arrays are complete and not rebuilding
+.TP
+.B disk.smart [root]
+SMART overall health for every physical device
+.TP
+.B host.kernel
+kernel release and taint state
+.TP
+.B host.uptime
+uptime and load average, with a post-power-on sanity test
+.TP
+.B login.users [root]
+the mu2edaq and mu2eshift accounts can log in
+.TP
+.B net.data
+the 10 GbE data-network interface is up at link speed
+.TP
+.B net.dns
+forward and reverse name resolution work
+.TP
+.B net.forwarding [root]
+the gateway is routing between the DAQ segments
+.TP
+.B net.interfaces
+every network the node belongs to has an interface up
+.TP
+.B net.ipmi_reach
+the IPMI segment is reachable from this gateway
+.TP
+.B pcie.devices [root]
+the DTC/CFO PCIe cards are enumerated
+.TP
+.B pcie.driver [root]
+the mu2e PCIe driver is loaded with device nodes
+.TP
+.B ping.lab
+ICMP reachability on the lab network, probed from the gateway
+.TP
+.B power.sel
+no new critical entries in the BMC event log
+.TP
+.B power.sensors
+no IPMI sensor is in a critical state
+.TP
+.B power.status
+IPMI chassis power state
+.TP
+.B ssh.login
+an ordinary SSH session can be opened
+.TP
+.B ssh.login_root [root]
+a root SSH session can be opened
+.TP
+.B svc.firewall [root]
+the packet filter is loaded
+.TP
+.B svc.nfs_export [root]
+the NFS exports are published
+.TP
+.B svc.running
+the expected daemons are running
+.SH FILES
+.TP
+.I config/
+Configuration: the main file, the topology, the power sequence, the checks.
+.TP
+.I data/power-recovery.db
+The run store: runs, phases, nodes, check results, actions and events.
+.TP
+.I html/
+The generated report site.
+.TP
+.I logs/power-recovery.log
+Rotating log.
+.SH SEE ALSO
+.BR mu2e-power-recovery (1),
+.BR mu2e-power-state (1),
+.BR mu2e-power-on (1),
+.BR mu2e-power-netcheck (1),
+.BR mu2e-power-report (1),
+.BR mu2e-node-inventory (1),
+.BR mu2e-ipmi-tool (1),
+.BR mu2e-ssh-probe (1),
+.BR mu2e-vault-ipmi (1),
+.BR mu2e-probe (1),
+.BR libmu2eprobe (3),
+.BR mu2edaq-power-recovery.yaml (5),
+.BR mu2edaq-topology.yaml (5),
+.BR mu2edaq-power-sequence.yaml (5),
+.BR mu2edaq-checks.yaml (5)
+.SH AUTHOR
+A. Norman <anorman@fnal.gov>, Mu2e DAQ Operations.

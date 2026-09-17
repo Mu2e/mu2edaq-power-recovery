@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en" class="h-full">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}{{ site_title }}{% endblock %}</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+  // Respect the operator's OS theme.  A control room at night and a laptop in
+  // daylight are both normal places to read this.
+  tailwind.config = { darkMode: 'media' };
+</script>
+<style>
+  /* Sticky table headers: node tables are long and the class column is the
+     only way to keep your place while scrolling one. */
+  thead th { position: sticky; top: 0; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body class="h-full bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100">
+
+<header class="border-b border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-900">
+  <div class="mx-auto max-w-7xl px-4 py-4">
+    <div class="flex flex-wrap items-baseline justify-between gap-2">
+      <h1 class="text-xl font-semibold tracking-tight">{{ site_title }}</h1>
+      <p class="text-xs text-slate-500 dark:text-slate-400">
+        generated {{ generated_at }} &middot; mu2edaq-power-recovery {{ tool_version }}
+      </p>
+    </div>
+    <nav class="mt-3 flex flex-wrap gap-1 text-sm">
+      {% for pid, (filename, label) in pages.items() %}
+      <a href="{{ prefix }}{{ filename }}"
+         class="rounded px-2.5 py-1 {% if pid == page_id %}bg-slate-900 text-white dark:bg-slate-100 dark:text-slate-900{% else %}text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800{% endif %}">
+        {{ label }}
+      </a>
+      {% endfor %}
+    </nav>
+  </div>
+</header>
+
+<main class="mx-auto max-w-7xl px-4 py-6">
+{% block content %}{% endblock %}
+</main>
+
+<footer class="mx-auto max-w-7xl px-4 py-8 text-xs text-slate-500 dark:text-slate-400">
+  <p>
+    Produced by <code>mu2edaq-power-recovery</code>. Re-running a phase refreshes
+    its page in place; previous runs are kept under
+    <a class="underline" href="{{ prefix }}runs.html">run history</a>.
+  </p>
+</footer>
+
+<script>
+// Table filtering and sorting, shared by every node table on the site.
+// Vanilla, ~40 lines, no framework: the page has to open from a file:// URL on
+// a machine with no network.
+(function () {
+  function rows(table) { return Array.from(table.tBodies[0].rows); }
+
+  document.querySelectorAll('[data-filter-for]').forEach(function (input) {
+    const table = document.getElementById(input.dataset.filterFor);
+    if (!table) return;
+    input.addEventListener('input', function () {
+      const needle = input.value.toLowerCase();
+      rows(table).forEach(function (row) {
+        row.hidden = needle && !row.textContent.toLowerCase().includes(needle);
+      });
+    });
+  });
+
+  document.querySelectorAll('[data-status-filter]').forEach(function (button) {
+    button.addEventListener('click', function () {
+      const table = document.getElementById(button.dataset.statusFilter);
+      const want = button.dataset.status;
+      if (!table) return;
+      button.parentElement.querySelectorAll('[data-status-filter]')
+        .forEach(function (b) { b.classList.remove('ring-2', 'ring-slate-500'); });
+      button.classList.add('ring-2', 'ring-slate-500');
+      rows(table).forEach(function (row) {
+        row.hidden = want !== 'all' && row.dataset.status !== want;
+      });
+    });
+  });
+
+  document.querySelectorAll('table[data-sortable] th[data-sort]').forEach(function (th) {
+    th.classList.add('cursor-pointer', 'select-none');
+    th.addEventListener('click', function () {
+      const table = th.closest('table');
+      const index = Array.from(th.parentElement.children).indexOf(th);
+      const asc = th.dataset.dir !== 'asc';
+      th.dataset.dir = asc ? 'asc' : 'desc';
+      const sorted = rows(table).sort(function (a, b) {
+        const x = a.cells[index].textContent.trim();
+        const y = b.cells[index].textContent.trim();
+        // Numeric where both sides are numeric, so "10" sorts after "9".
+        const nx = parseFloat(x), ny = parseFloat(y);
+        const cmp = (!isNaN(nx) && !isNaN(ny)) ? nx - ny : x.localeCompare(y);
+        return asc ? cmp : -cmp;
+      });
+      sorted.forEach(function (row) { table.tBodies[0].appendChild(row); });
+    });
+  });
+
+  document.querySelectorAll('[data-toggle]').forEach(function (button) {
+    button.addEventListener('click', function () {
+      const target = document.getElementById(button.dataset.toggle);
+      if (target) target.hidden = !target.hidden;
+    });
+  });
+})();
+</script>
+</body>
+</html>

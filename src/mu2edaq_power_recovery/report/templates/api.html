@@ -1,0 +1,67 @@
+{% extends "base.html" %}
+{% block title %}{{ site_title }} &middot; API{% endblock %}
+{% block content %}
+
+<h2 class="mb-3 text-lg font-semibold">Data files and check reference</h2>
+<p class="mb-6 max-w-3xl text-sm text-slate-600 dark:text-slate-300">
+  This is a static site, so there are no HTTP routes. Everything the pages show
+  is also written as JSON beside them, so the report can be consumed by another
+  tool rather than only read.
+</p>
+
+<section class="mb-8">
+  <h3 class="mb-2 font-semibold">JSON files</h3>
+  <div class="overflow-x-auto rounded-lg border border-slate-200 dark:border-slate-800">
+  <table class="min-w-full divide-y divide-slate-200 text-sm dark:divide-slate-800">
+    <thead class="bg-slate-100 text-left text-xs uppercase text-slate-600 dark:bg-slate-900 dark:text-slate-400">
+      <tr><th class="px-3 py-2">Path</th><th class="px-3 py-2">Contents</th></tr>
+    </thead>
+    <tbody class="divide-y divide-slate-100 bg-white dark:divide-slate-800 dark:bg-slate-950">
+      {% for e in endpoints %}
+      <tr><td class="px-3 py-2 font-mono text-xs"><a class="text-sky-700 underline dark:text-sky-400" href="{{ e.path }}">{{ e.path }}</a></td>
+          <td class="px-3 py-2">{{ e.content }}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  </div>
+</section>
+
+<section class="mb-8">
+  <h3 class="mb-2 font-semibold">Checks ({{ checks|length }})</h3>
+  <p class="mb-2 text-sm text-slate-600 dark:text-slate-300">
+    Check ids as used in <code>config/checks.yaml</code> profiles. A check named
+    in the config with no implementation is reported as <code>skip</code>, never
+    silently dropped.
+  </p>
+  <div class="overflow-x-auto rounded-lg border border-slate-200 dark:border-slate-800">
+  <table data-sortable class="min-w-full divide-y divide-slate-200 text-sm dark:divide-slate-800">
+    <thead class="bg-slate-100 text-left text-xs uppercase text-slate-600 dark:bg-slate-900 dark:text-slate-400">
+      <tr><th data-sort class="px-3 py-2">Check id</th><th class="px-3 py-2">What it verifies</th></tr>
+    </thead>
+    <tbody class="divide-y divide-slate-100 bg-white dark:divide-slate-800 dark:bg-slate-950">
+      {% for cid, desc in checks.items() | sort %}
+      <tr><td class="px-3 py-2 font-mono text-xs">{{ cid }}</td><td class="px-3 py-2">{{ desc }}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  </div>
+</section>
+
+<section class="mb-8">
+  <h3 class="mb-2 font-semibold">Command-line entry points</h3>
+  <pre class="overflow-auto rounded-lg border border-slate-200 bg-white p-3 text-xs dark:border-slate-800 dark:bg-slate-900">mu2e-power-recovery   drive one or more phases (--phase assess|poweron|network|report|all)
+mu2e-power-state      phase 1 only: read-only survey
+mu2e-power-on         phase 2 only: the power-on sequence (needs --execute to act)
+mu2e-power-netcheck   phase 3 only: the connectivity mesh
+mu2e-power-report     phase 4 only: regenerate and optionally post the report
+
+mu2e-node-inventory   print the node inventory the tools will use
+mu2e-ipmi-tool        issue one IPMI command through a gateway
+mu2e-ssh-probe        show, or run, the exact ssh command used for a node
+mu2e-vault-ipmi       verify the Vault path holding the BMC credentials</pre>
+  <p class="mt-2 text-sm text-slate-600 dark:text-slate-300">
+    Every one has a man page; see <code>man mu2e-power-recovery</code>.
+  </p>
+</section>
+
+{% endblock %}

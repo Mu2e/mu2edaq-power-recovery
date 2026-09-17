@@ -1,0 +1,170 @@
+# ---------------------------------------------------------------------------
+# Main configuration for mu2edaq-power-recovery.
+#
+# Every value here can be overridden, in increasing order of priority, by:
+#     this file  <  config/.env  <  environment  <  command line
+# The environment-variable name for a key is MU2E_POWER_RECOVERY_<KEY>
+# with the dotted path upper-cased and dots replaced by underscores, e.g.
+#     run.dry_run           -> MU2E_POWER_RECOVERY_RUN_DRY_RUN
+#     report.output_dir     -> MU2E_POWER_RECOVERY_REPORT_OUTPUT_DIR
+# ---------------------------------------------------------------------------
+
+run:
+  # Human label for this recovery campaign; appears in the report header and
+  # in the ECL entry subject.  Defaults to "<user>@<host> <ISO date>".
+  label: null
+  # Never issue a state-changing command (IPMI power on/off, remote writes)
+  # unless this is false *and* --execute was passed.  Two independent gates,
+  # deliberately: a config file edit alone cannot arm the destructive path.
+  dry_run: true
+  # Stop the phase-2 sequence at the first stage that fails its require:.
+  stop_on_stage_failure: true
+  # Overall wall-clock budget for one phase, in seconds.  0 disables.
+  phase_timeout: 7200
+  # Where the sequence starts/stops, by stage name.  null = the whole thing.
+  from_stage: null
+  until_stage: null
+
+topology:
+  file: topology.yaml
+  sequence_file: power-sequence.yaml
+  checks_file: checks.yaml
+  # Locations included in a run when --location is not given.
+  locations: [mc2, teststand]
+
+selfupdate:
+  # Phase 0: check the git remote for a newer revision and fast-forward.
+  enabled: true
+  remote: origin
+  branch: null          # null => whatever branch is checked out
+  # Rebuild (re-run bootstrap / cmake) when the pull touched any of these.
+  rebuild_globs:
+    - pyproject.toml
+    - requirements.txt
+    - CMakeLists.txt
+    - src/cpp/**
+    - src/include/**
+  # Refuse to fast-forward over local modifications rather than stashing
+  # them -- an operator running this during an outage should be told, not
+  # surprised.
+  allow_dirty: false
+  # Seconds to allow the network round trip to GitHub before giving up and
+  # running with whatever is checked out.
+  timeout: 60
+
+ssh:
+  # Login used for ordinary (non-root) checks.
+  user: null                    # null => $USER
+  # Login used for checks that need root.  Authentication is GSSAPI from the
+  # Kerberos ticket of kerberos.root_principal.
+  root_user: root
+  # Jump host used to reach non-gateway nodes.  'auto' picks the first
+  # responsive gateway of the node's location from topology.yaml.
+  proxy: auto
+  connect_timeout: 10
+  command_timeout: 120
+  # Extra options appended to every ssh invocation.  BatchMode keeps ssh from
+  # blocking on a password prompt inside a worker thread -- credentials come
+  # from Kerberos, and if the ticket is bad we want a fast, clear failure.
+  options:
+    - -o BatchMode=yes
+    - -o StrictHostKeyChecking=accept-new
+    - -o GSSAPIAuthentication=yes
+    - -o GSSAPIDelegateCredentials=yes
+    - -o LogLevel=ERROR
+  # Maximum simultaneous SSH sessions across the whole run.
+  max_sessions: 16
+
+ipmi:
+  # ipmitool is executed *on the gateway*, not locally: the IPMI subnets
+  # (192.168.157.0/24, 192.168.150.0/24) are not routable from off-site.
+  execute_on: gateway
+  tool: ipmitool
+  interface: lanplus
+  privilege: Operator
+  cipher_suite: 3
+  timeout: 10
+  retries: 2
+  # Seconds to wait between 'chassis power on' and the first SSH attempt.
+  power_on_delay: 20
+
+kerberos:
+  # Principals the tools will use.  Leave null to take whatever is in the
+  # current credential cache.  When a principal has no live ticket the tools
+  # prompt for a password and run kinit -- they never read a password from
+  # a config file or an environment variable.
+  principal: null
+  root_principal: null
+  # Minimum remaining lifetime, in seconds, before a ticket is treated as
+  # too short for a run and renewed up front rather than expiring mid-phase.
+  min_lifetime: 3600
+  # Prompt interactively for a password when a ticket is missing.  Set false
+  # for unattended runs; the run then fails fast with instructions instead.
+  prompt: true
+  # Accounts whose ability to log in is itself a check (login.users).
+  verify_users:
+    - mu2edaq
+    - mu2eshift
+
+vault:
+  addr: https://ssivault.fnal.gov:8200
+  kv_mount: td
+  base_path: scd/experiments/mu2e
+  # KV v2 secret holding the BMC credentials.
+  ipmi_path: ipmi
+  # Field names inside that secret.  *** Verify against the live secret. ***
+  # The upstream shell tooling hard-codes the user MU2E and reads the
+  # password from ~/.ipmipasswd, so the field naming in Vault could not be
+  # confirmed from the repository; these are the conventional names and are
+  # overridable precisely because of that.
+  ipmi_user_field: username
+  ipmi_password_field: password
+  # Fall back to ~/.ipmipasswd (and ipmi.default_user) when Vault is
+  # unreachable, so a recovery is not blocked by a Vault outage.
+  allow_file_fallback: true
+  fallback_password_file: ~/.ipmipasswd
+  fallback_user: MU2E
+  # Run `vault login -method=ldap` when no usable token is cached.
+  auto_login: true
+  timeout: 30
+
+database:
+  # SQLite by default; set a full SQLAlchemy URL to use Postgres, e.g.
+  #   postgresql+psycopg2://user@host/mu2e_power_recovery
+  url: null
+  # Used only when url is null.
+  path: data/power-recovery.db
+
+report:
+  # Where the static site is written.  Relative paths are resolved against
+  # the project root.
+  output_dir: html
+  title: Mu2e DAQ Power Outage Recovery
+  # Keep this many past runs browsable under <output_dir>/runs/.
+  keep_runs: 30
+  # Optional upload of the generated site after each phase.
+  publish:
+    enabled: false
+    # rsync | scp | none
+    method: rsync
+    # e.g. mu2edaq@mu2egateway01.fnal.gov:/web/sites/mu2e/recovery/
+    target: null
+    options: [-az, --delete]
+
+ecl:
+  # Phase 4 posting to the electronic logbook via ecl-client.
+  enabled: false
+  url: https://dbweb8.fnal.gov:8443/ECL/mu2e
+  category: DAQ/Recovery
+  # Vault path holding the ECL API user and key, relative to vault.base_path.
+  credential_path: ecl
+  # Attach the generated HTML pages to the entry.
+  attach_html: true
+
+logging:
+  level: INFO
+  file: logs/power-recovery.log
+  # Keep the full stdout/stderr of every remote command in the run store.
+  # Large, but it is the evidence trail for the logbook entry.
+  capture_command_output: true
+  max_capture_bytes: 65536

@@ -1,0 +1,53 @@
+{% extends "base.html" %}
+{% block title %}{{ site_title }} &middot; About{% endblock %}
+{% block content %}
+
+<h2 class="mb-3 text-lg font-semibold">About these tools</h2>
+<p class="mb-6 max-w-3xl text-sm text-slate-600 dark:text-slate-300">
+  <code>mu2edaq-power-recovery</code> assesses, powers on, verifies and reports
+  on the Mu2e DAQ computing centres after a planned or unplanned power outage.
+  It runs from a workstation outside the DAQ networks: nodes are reached over
+  SSH through a gateway with Kerberos/GSSAPI, and BMCs are reached by running
+  <code>ipmitool</code> <em>on</em> a gateway, because the IPMI subnets are not
+  routable from off site.
+</p>
+
+<section class="mb-8">
+  <h3 class="mb-2 font-semibold">Version</h3>
+  <dl class="grid grid-cols-2 gap-x-6 gap-y-2 rounded-lg border border-slate-200 bg-white p-4 text-sm sm:grid-cols-3 dark:border-slate-800 dark:bg-slate-900">
+    <div><dt class="text-xs uppercase text-slate-500">Package</dt><dd class="font-mono">{{ version.package_version }}</dd></div>
+    <div><dt class="text-xs uppercase text-slate-500">Revision</dt><dd class="font-mono text-xs">{{ version.git_describe or version.git_commit or '-' }}</dd></div>
+    <div><dt class="text-xs uppercase text-slate-500">Branch</dt><dd class="font-mono text-xs">{{ version.git_branch or '-' }}</dd></div>
+    <div><dt class="text-xs uppercase text-slate-500">Config digest</dt><dd class="font-mono text-xs">{{ version.config_digest or '-' }}</dd></div>
+    <div><dt class="text-xs uppercase text-slate-500">Python</dt><dd class="font-mono text-xs">{{ version.python_version }}</dd></div>
+    <div><dt class="text-xs uppercase text-slate-500">Platform</dt><dd class="text-xs">{{ version.platform }}</dd></div>
+  </dl>
+</section>
+
+<section class="mb-8">
+  <h3 class="mb-2 font-semibold">Dependencies</h3>
+  <div class="overflow-x-auto rounded-lg border border-slate-200 dark:border-slate-800">
+  <table class="min-w-full divide-y divide-slate-200 text-sm dark:divide-slate-800">
+    <thead class="bg-slate-100 text-left text-xs uppercase text-slate-600 dark:bg-slate-900 dark:text-slate-400">
+      <tr><th class="px-3 py-2">Component</th><th class="px-3 py-2">Used for</th></tr>
+    </thead>
+    <tbody class="divide-y divide-slate-100 bg-white dark:divide-slate-800 dark:bg-slate-950">
+      {% for d in dependencies %}
+      <tr><td class="px-3 py-2 font-mono text-xs">{{ d.name }}</td><td class="px-3 py-2">{{ d.use }}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  </div>
+</section>
+
+<section class="mb-8">
+  <h3 class="mb-2 font-semibold">Configuration in force</h3>
+  <p class="mb-2 text-sm text-slate-600 dark:text-slate-300">
+    Credentials are redacted. Priority, lowest first:
+    <code>config/power-recovery.yaml</code> &lt; <code>config/.env</code> &lt;
+    environment &lt; command line.
+  </p>
+  <pre class="max-h-96 overflow-auto rounded-lg border border-slate-200 bg-white p-3 text-xs dark:border-slate-800 dark:bg-slate-900">{{ settings | tojson(indent=2) }}</pre>
+</section>
+
+{% endblock %}

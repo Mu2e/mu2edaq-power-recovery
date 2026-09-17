@@ -1,0 +1,74 @@
+.TH MU2E-POWER-STATE 1 "2026-09-17" "mu2edaq-power-recovery 0.1.0" "Mu2e DAQ Operations"
+.SH NAME
+mu2e-power-state \- phase 1: read-only survey of the Mu2e DAQ clusters
+.SH SYNOPSIS
+.B mu2e-power-state
+.RI [ options ]
+.SH DESCRIPTION
+Runs phase 1 of
+.BR mu2e-power-recovery (1)
+and nothing else: a read-only survey of every node in the selected locations.
+It takes no corrective action, so it is safe to run at any time, including
+while the DAQ is taking data.
+.PP
+The survey proceeds in the order an operator actually asks the questions:
+.IP 1. 4
+Are the gateways up, and can they be logged in to? If no gateway can be reached
+the phase stops, because everything else is probed through one.
+.IP 2. 4
+Do the gateways have their expected mounts, routing and IPMI-segment access?
+.IP 3. 4
+From a gateway, what answers ICMP, and what does each BMC say about the chassis
+it controls?
+.IP 4. 4
+For everything that answers: disks, mounts, interfaces, link speeds, services,
+PCIe cards and kernel state.
+.PP
+Its results are written to the
+.I initial-state.html
+report page and to
+.IR data/assess.json ,
+and are recorded in the run store so that later phases can compare against
+them. In particular the BMC event-log length is recorded here, so phase 2 can
+report only the events its own power-on produced.
+.SH OPTIONS
+Identical to
+.BR mu2e-power-recovery (1),
+except that
+.B \-\-phase
+is fixed to
+.BR assess .
+The options that matter most here are
+.BR \-\-location ,
+.BR \-\-node ,
+.B \-\-principal
+and
+.BR \-\-root\-principal .
+.PP
+.B \-\-execute
+has no effect: this phase changes nothing by construction.
+.SH EXIT STATUS
+.TP
+.B 0
+Every node passed every applicable check.
+.TP
+.B 1
+At least one node failed a check or could not be reached.
+.TP
+.B 2
+The survey could not start, or no gateway could be logged in to.
+.SH EXAMPLES
+.RS
+.EX
+mu2e-power-state
+mu2e-power-state \-\-location teststand
+mu2e-power-state \-\-node mu2e-mgr-01 \-\-node mu2e-dl-01 \-v
+mu2e-power-state \-\-json > state.json
+.EE
+.RE
+.SH SEE ALSO
+.BR mu2e-power-recovery (1),
+.BR mu2e-power-on (1),
+.BR mu2edaq-checks.yaml (5)
+.SH AUTHOR
+A. Norman <anorman@fnal.gov>, Mu2e DAQ Operations.

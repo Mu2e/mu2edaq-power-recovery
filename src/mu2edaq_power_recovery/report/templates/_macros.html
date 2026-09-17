@@ -1,0 +1,169 @@
+{# Shared fragments.  Kept in one file so a table on the power-on page cannot
+   drift away from the identical table on the initial-state page. #}
+
+{% macro pill(status) %}
+<span class="inline-flex items-center rounded-md px-2 py-0.5 text-xs font-medium ring-1 ring-inset {{ status|status_class }}">{{ status|status_badge }}</span>
+{% endmacro %}
+
+{% macro counts_bar(counts, table_id='') %}
+<div class="flex flex-wrap gap-2 text-sm">
+  {% for key, label in [('ok','OK'), ('warn','Warning'), ('fail','Failed'), ('unknown','Unreachable')] %}
+  <button {% if table_id %}data-status-filter="{{ table_id }}" data-status="{{ key }}"{% endif %}
+          class="rounded-md px-3 py-1.5 ring-1 ring-inset {{ key|status_class }}">
+    <span class="font-semibold">{{ counts.get(key, 0) }}</span> {{ label }}
+  </button>
+  {% endfor %}
+  {% if table_id %}
+  <button data-status-filter="{{ table_id }}" data-status="all"
+          class="rounded-md px-3 py-1.5 ring-1 ring-inset ring-slate-400/30 text-slate-600 dark:text-slate-300">
+    Show all {{ counts.get('total', 0) }}
+  </button>
+  {% endif %}
+</div>
+{% endmacro %}
+
+{% macro node_table(table_id, assessments, show_power=False) %}
+<div class="mb-3 flex flex-wrap items-center gap-3">
+  <input type="search" data-filter-for="{{ table_id }}" placeholder="filter nodes, checks or text..."
+         class="w-72 rounded-md border border-slate-300 px-3 py-1.5 text-sm dark:border-slate-700 dark:bg-slate-900">
+</div>
+<div class="overflow-x-auto rounded-lg border border-slate-200 dark:border-slate-800">
+<table id="{{ table_id }}" data-sortable class="min-w-full divide-y divide-slate-200 text-sm dark:divide-slate-800">
+  <thead class="bg-slate-100 text-left text-xs uppercase tracking-wide text-slate-600 dark:bg-slate-900 dark:text-slate-400">
+    <tr>
+      <th data-sort class="px-3 py-2">Node</th>
+      <th data-sort class="px-3 py-2">Class</th>
+      <th data-sort class="px-3 py-2">Location</th>
+      <th data-sort class="px-3 py-2">Status</th>
+      {% if show_power %}<th data-sort class="px-3 py-2">Power</th>{% endif %}
+      <th class="px-3 py-2">Summary</th>
+      <th data-sort class="px-3 py-2">Time</th>
+      <th class="px-3 py-2"></th>
+    </tr>
+  </thead>
+  <tbody class="divide-y divide-slate-100 bg-white dark:divide-slate-800 dark:bg-slate-950">
+    {% for a in assessments %}
+    <tr data-status="{{ a.status }}" class="align-top">
+      <td class="whitespace-nowrap px-3 py-2 font-mono text-xs">{{ a.node.hostname|shorthost }}</td>
+      <td class="px-3 py-2">{{ a.node['class'] }}</td>
+      <td class="px-3 py-2">{{ a.node.location }}</td>
+      <td class="px-3 py-2">{{ pill(a.status) }}</td>
+      {% if show_power %}
+      <td class="px-3 py-2 text-xs">
+        {{ a.power_state or '-' }}
+        {% if a.power_action and a.power_action.action not in (None, 'none') %}
+        <span class="ml-1 rounded bg-slate-100 px-1 text-[10px] dark:bg-slate-800">{{ a.power_action.action }}</span>
+        {% endif %}
+      </td>
+      {% endif %}
+      <td class="px-3 py-2">{{ a.summary }}</td>
+      <td class="whitespace-nowrap px-3 py-2 text-xs text-slate-500">{{ a.duration|duration }}</td>
+      <td class="px-3 py-2">
+        <button data-toggle="{{ table_id }}-{{ loop.index }}"
+                class="rounded border border-slate-300 px-2 py-0.5 text-xs hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800">
+          checks
+        </button>
+      </td>
+    </tr>
+    <tr id="{{ table_id }}-{{ loop.index }}" hidden class="bg-slate-50 dark:bg-slate-900">
+      <td colspan="{{ 8 if show_power else 7 }}" class="px-3 py-3">
+        <table class="min-w-full text-xs">
+          <thead class="text-left text-slate-500">
+            <tr><th class="py-1 pr-4">Check</th><th class="py-1 pr-4">Status</th><th class="py-1 pr-4">Summary</th><th class="py-1">Detail</th></tr>
+          </thead>
+          <tbody>
+            {% for r in a.results %}
+            <tr class="border-t border-slate-200 dark:border-slate-800">
+              <td class="py-1 pr-4 font-mono">{{ r.check_id }}</td>
+              <td class="py-1 pr-4">{{ pill(r.status) }}</td>
+              <td class="py-1 pr-4">{{ r.summary }}</td>
+              <td class="py-1 whitespace-pre-wrap text-slate-500">{{ r.detail }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+</div>
+{% endmacro %}
+
+{% macro notes(items, tone='info') %}
+{% if items %}
+<div class="mb-6 rounded-lg border-l-4 {% if tone == 'warn' %}border-amber-500 bg-amber-50 dark:bg-amber-950/40{% else %}border-sky-500 bg-sky-50 dark:bg-sky-950/40{% endif %} p-4">
+  <ul class="list-disc space-y-1 pl-5 text-sm">
+    {% for item in items %}<li>{{ item }}</li>{% endfor %}
+  </ul>
+</div>
+{% endif %}
+{% endmacro %}
+
+{% macro run_header(run, version) %}
+<dl class="mb-6 grid grid-cols-2 gap-x-6 gap-y-2 rounded-lg border border-slate-200 bg-white p-4 text-sm sm:grid-cols-4 dark:border-slate-800 dark:bg-slate-900">
+  <div><dt class="text-xs uppercase text-slate-500">Run</dt><dd class="font-mono">{{ run.id }}</dd></div>
+  <div><dt class="text-xs uppercase text-slate-500">Label</dt><dd>{{ run.label or '(unlabelled)' }}</dd></div>
+  <div><dt class="text-xs uppercase text-slate-500">Operator</dt><dd>{{ run.operator }}</dd></div>
+  <div><dt class="text-xs uppercase text-slate-500">Mode</dt>
+    <dd>{% if run.dry_run %}<span class="rounded bg-amber-100 px-1.5 py-0.5 text-xs font-semibold text-amber-900 dark:bg-amber-950 dark:text-amber-200">DRY RUN</span>{% else %}live{% endif %}</dd></div>
+  <div><dt class="text-xs uppercase text-slate-500">Started</dt><dd class="font-mono text-xs">{{ run.started_at }}</dd></div>
+  <div><dt class="text-xs uppercase text-slate-500">Finished</dt><dd class="font-mono text-xs">{{ run.finished_at or 'in progress' }}</dd></div>
+  <div><dt class="text-xs uppercase text-slate-500">Revision</dt><dd class="font-mono text-xs">{{ version.git_describe or version.git_commit or '-' }}</dd></div>
+  <div><dt class="text-xs uppercase text-slate-500">Config digest</dt><dd class="font-mono text-xs">{{ version.config_digest or '-' }}</dd></div>
+</dl>
+{% endmacro %}
+
+{% macro area_table(locations) %}
+{# Per-area roll-up: "tables of the states of the machines in each area"
+   (Project-Description.md). Counts only -- the detail is one table down. #}
+<div class="overflow-x-auto rounded-lg border border-slate-200 dark:border-slate-800">
+<table class="min-w-full divide-y divide-slate-200 text-sm dark:divide-slate-800">
+  <thead class="bg-slate-100 text-left text-xs uppercase tracking-wide text-slate-600 dark:bg-slate-900 dark:text-slate-400">
+    <tr><th class="px-3 py-2">Area</th><th class="px-3 py-2">Nodes</th><th class="px-3 py-2">OK</th>
+        <th class="px-3 py-2">Warning</th><th class="px-3 py-2">Failed</th>
+        <th class="px-3 py-2">Unreachable</th><th class="px-3 py-2">n/a</th></tr>
+  </thead>
+  <tbody class="divide-y divide-slate-100 bg-white dark:divide-slate-800 dark:bg-slate-950">
+    {% for name, c in locations.items() %}
+    <tr>
+      <td class="px-3 py-2 font-medium uppercase">{{ name }}</td>
+      <td class="px-3 py-2">{{ c.total }}</td>
+      <td class="px-3 py-2 text-emerald-700 dark:text-emerald-400">{{ c.ok }}</td>
+      <td class="px-3 py-2 text-amber-700 dark:text-amber-400">{{ c.warn }}</td>
+      <td class="px-3 py-2 font-semibold {% if c.fail %}text-rose-700 dark:text-rose-400{% endif %}">{{ c.fail }}</td>
+      <td class="px-3 py-2 {% if c.unknown %}text-fuchsia-700 dark:text-fuchsia-400{% endif %}">{{ c.unknown }}</td>
+      <td class="px-3 py-2 text-slate-400">{{ c.skip }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+</div>
+{% endmacro %}
+
+{% macro class_table(table_id, grouped) %}
+{# Per-class roll-up. Compact by design: the full per-check detail lives in the
+   all-nodes table above, and repeating it here doubled the page weight for no
+   extra information. #}
+<div class="grid gap-4 md:grid-cols-2">
+  {% for cls, nodes in grouped.items() %}
+  <div class="rounded-lg border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-900">
+    <h4 class="mb-2 font-semibold capitalize">{{ cls }}
+      <span class="text-xs font-normal text-slate-500">({{ nodes|length }} node{{ '' if nodes|length == 1 else 's' }})</span>
+    </h4>
+    <table class="min-w-full text-xs">
+      <tbody>
+        {% for a in nodes %}
+        <tr class="border-t border-slate-100 first:border-0 dark:border-slate-800">
+          <td class="py-1 pr-3 font-mono">{{ a.node.hostname|shorthost }}</td>
+          <td class="py-1 pr-3">{{ pill(a.status) }}</td>
+          <td class="py-1 pr-3 text-slate-500">{{ a.power_state or '-' }}</td>
+          <td class="py-1 text-slate-600 dark:text-slate-300">{{ a.summary }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endfor %}
+</div>
+{% endmacro %}

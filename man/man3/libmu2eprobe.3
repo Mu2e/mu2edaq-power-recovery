@@ -1,0 +1,155 @@
+.TH LIBMU2EPROBE 3 "2026-09-17" "mu2edaq-power-recovery 0.1.0" "Mu2e DAQ Operations"
+.SH NAME
+libmu2eprobe \- parallel TCP reachability probing for the Mu2e DAQ recovery tools
+.SH SYNOPSIS
+.nf
+.B #include <mu2eprobe/probe.hpp>   /* C++ */
+.B #include <mu2eprobe/probe.h>     /* C   */
+.PP
+.B cc ... \-lmu2eprobe
+.fi
+.SH DESCRIPTION
+.B libmu2eprobe
+answers one question quickly: of these hosts, which are up? Phase 1 of a
+recovery has to answer it for about sixty hosts on three network segments
+before it can do anything else, and phase 3 probes a full mesh on the data
+network.
+.PP
+The probe is a non-blocking TCP connect with a bounded
+.BR poll (2),
+not ICMP. It needs no privilege, it tests something more useful than bare IP
+reachability, and TCP/22 is not filtered on the lab network. A
+.I refused
+connection counts as reachable: the host answered, its sshd simply is not
+listening yet, which during a power-on is the normal intermediate state.
+.PP
+The library is C++17 with a C ABI wrapper and pybind11 bindings. It has no
+dependencies beyond the standard library and POSIX sockets, and OpenMP if it is
+available \(em without OpenMP the sweep is correct but serial.
+.SH C++ INTERFACE
+.SS Types
+.TP
+.B enum class mu2eprobe::Outcome
+.BR Open ", " Refused ", " Timeout ", " Unresolved ", " Error .
+.TP
+.B struct mu2eprobe::Result
+.RS
+.nf
+std::string host;        /* host as given                       */
+std::string address;     /* resolved address, empty if unresolved */
+std::uint16_t port;
+Outcome outcome;
+double elapsed_ms;
+std::string detail;      /* errno text for Outcome::Error       */
+bool reachable() const;  /* Open or Refused                     */
+const char* outcome_name() const;
+.fi
+.RE
+.TP
+.B struct mu2eprobe::Options
+.RS
+.nf
+std::uint16_t port = 22;
+int timeout_ms = 2000;
+int threads = 0;         /* 0 = the OpenMP default              */
+bool resolve_only = false;
+.fi
+.RE
+.SS Functions
+.TP
+.BI "Result mu2eprobe::probe_one(const std::string& " host ", const Options& " options );
+Probe one host. Never throws; failures are reported in the
+.BR Result .
+.TP
+.BI "std::vector<Result> mu2eprobe::probe_many(const std::vector<std::string>& " hosts ", const Options& " options );
+Probe many hosts in parallel. Results are returned
+.I in input order
+regardless of completion order, because the caller's node list is ordered
+meaningfully and should not have to be re-sorted.
+.TP
+.BI "std::vector<std::string> mu2eprobe::reachable_hosts(const std::vector<Result>& " results );
+The hosts that answered, in input order.
+.TP
+.B const char* mu2eprobe::version();
+.TQ
+.B bool mu2eprobe::has_openmp();
+Library version, and whether parallelism is actually compiled in.
+.SH C INTERFACE
+.nf
+.BI "void mu2e_probe_default_options(mu2e_probe_options_t* " options );
+.BI "int  mu2e_probe_one(const char* " host ", const mu2e_probe_options_t* " options ,
+.BI "                    mu2e_probe_result_t* " out );
+.BI "int  mu2e_probe_many(const char* const* " hosts ", size_t " count ,
+.BI "                     const mu2e_probe_options_t* " options ,
+.BI "                     mu2e_probe_result_t* " results );
+.BI "const char* mu2e_probe_outcome_name(int " outcome );
+.BI "const char* mu2e_probe_version(void);"
+.BI "int  mu2e_probe_has_openmp(void);"
+.fi
+.PP
+.B mu2e_probe_one
+returns the outcome code
+.RB ( MU2E_PROBE_OPEN ", " MU2E_PROBE_REFUSED ", " MU2E_PROBE_TIMEOUT ,
+.BR MU2E_PROBE_UNRESOLVED ", " MU2E_PROBE_ERROR ).
+.B mu2e_probe_many
+returns the number of hosts that answered, or \-1 on a bad argument; the caller
+supplies the results array, and the strings inside each result are fixed-size
+buffers, so nothing is ever freed by the caller.
+.PP
+All functions are safe to call from multiple threads.
+.B mu2e_probe_many
+runs its own parallelism internally.
+.SH PYTHON INTERFACE
+When the pybind11 extension is built, the same sweep is available as:
+.RS
+.EX
+import mu2eprobe
+results = mu2eprobe.probe_many(hosts, port=22, timeout_ms=2000)
+up = [r.host for r in results if r.reachable]
+mu2eprobe.has_openmp()
+.EE
+.RE
+.PP
+The GIL is released for the duration of a sweep. The recovery tools do not
+import this directly \(em they use
+.I mu2edaq_power_recovery.sweep,
+which uses the extension when it is present and a thread-pool implementation
+with identical semantics when it is not.
+.SH EXAMPLES
+.RS
+.EX
+#include <mu2eprobe/probe.hpp>
+#include <cstdio>
+
+int main() {
+  mu2eprobe::Options options;
+  options.timeout_ms = 1000;
+  const auto results = mu2eprobe::probe_many(
+      {"mu2e-trk-01.fnal.gov", "mu2e-trk-02.fnal.gov"}, options);
+  for (const auto& r : results)
+    std::printf("%-30s %s\\n", r.host.c_str(), r.outcome_name());
+}
+.EE
+.RE
+.SH BUILDING
+.RS
+.EX
+cmake \-S . \-B build \-DCMAKE_BUILD_TYPE=Release
+cmake \-\-build build
+ctest \-\-test\-dir build \-\-output\-on\-failure
+cmake \-\-install build \-\-prefix /usr/local
+.EE
+.RE
+.PP
+.B \-DBUILD_BINDINGS=OFF
+skips the Python extension;
+.B \-DBUILD_PROBE=OFF
+skips the library entirely.
+.SH SEE ALSO
+.BR mu2e-probe (1),
+.BR mu2e-power-recovery (1),
+.BR connect (2),
+.BR poll (2),
+.BR getaddrinfo (3)
+.SH AUTHOR
+A. Norman <anorman@fnal.gov>, Mu2e DAQ Operations.

@@ -1,0 +1,85 @@
+.TH MU2E-POWER-REPORT 1 "2026-09-17" "mu2edaq-power-recovery 0.1.0" "Mu2e DAQ Operations"
+.SH NAME
+mu2e-power-report \- phase 4: the consolidated recovery report
+.SH SYNOPSIS
+.B mu2e-power-report
+.RB [ \-\-run\-id
+.IR N ]
+.RB [ \-\-post\-ecl ]
+.RB [ \-\-publish ]
+.RI [ options ]
+.SH DESCRIPTION
+Runs phase 4 of
+.BR mu2e-power-recovery (1):
+it reads a run back out of the run store, renders the detailed report page, and
+optionally posts it to the Fermilab Electronic Logbook.
+.PP
+This phase probes nothing, which is what makes it repeatable. An operator can
+regenerate a report hours after the event, or repost it after fixing the
+logbook credentials, without touching the cluster.
+.PP
+The narrative is derived entirely from stored rows, in the order a reader who
+was not present needs them: what the run did, what is still wrong, and what has
+to happen next. Follow-ups are derived rather than generic \(em a check that
+failed on three or more nodes is called out as one likely shared cause rather
+than as three separate problems.
+.SH LOGBOOK POSTING
+.B \-\-post\-ecl
+posts the entry using the
+.B ecl-client
+package, which implements the ECL 8.x XML posting API. It is an optional
+dependency: if it is not installed, or the ECL is unreachable, the phase
+records that in its notes and the HTML report \(em the durable artefact \(em is
+unaffected.
+.PP
+ECL credentials are read from Vault at the path given by
+.I ecl.credential_path
+under
+.IR vault.base_path .
+The generated HTML pages are attached when
+.I ecl.attach_html
+is set.
+.SH OPTIONS
+As
+.BR mu2e-power-recovery (1),
+with
+.B \-\-phase
+fixed to
+.BR report .
+.TP
+.BI \-\-run\-id " N"
+Report on this run rather than the most recent one. Run ids are shown on the
+report's run-history page and by
+.BR "mu2e-power-report \-\-json" .
+.TP
+.B \-\-post\-ecl
+Post the entry to the logbook.
+.TP
+.B \-\-publish
+Copy the report site to
+.I report.publish.target
+after rendering.
+.SH EXIT STATUS
+.TP
+.B 0
+The report was generated and, if requested, posted.
+.TP
+.B 1
+The report was generated but the run it describes contains failures.
+.TP
+.B 2
+No run could be found to report on.
+.SH EXAMPLES
+.RS
+.EX
+mu2e-power-report
+mu2e-power-report \-\-run\-id 17 \-\-post\-ecl
+mu2e-power-report \-\-publish \-\-publish\-target mu2edaq@mu2egateway01:/web/recovery/
+.EE
+.RE
+.SH SEE ALSO
+.BR mu2e-power-recovery (1),
+.BR mu2edaq-power-recovery.yaml (5),
+.BR mu2edaq-power-recovery (7)
+.SH AUTHOR
+A. Norman <anorman@fnal.gov>, Mu2e DAQ Operations.

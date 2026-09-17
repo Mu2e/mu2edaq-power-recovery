@@ -1,0 +1,100 @@
+.TH MU2E-VAULT-IPMI 1 "2026-09-17" "mu2edaq-power-recovery 0.1.0" "Mu2e DAQ Operations"
+.SH NAME
+mu2e-vault-ipmi \- verify the Vault secret holding the Mu2e DAQ BMC credentials
+.SH SYNOPSIS
+.B mu2e-vault-ipmi
+.RB [ \-\-path
+.IR REL ]
+.RB [ \-\-addr
+.IR URL ]
+.RB [ \-\-fields ]
+.RB [ \-\-no\-fallback ]
+.SH DESCRIPTION
+Checks that the recovery tools will be able to read the BMC credentials, which
+live at
+.I td/scd/experiments/mu2e/ipmi
+on
+.IR https://ssivault.fnal.gov:8200 .
+.PP
+The purpose is to find a credential problem
+.I before
+an outage rather than during one. The exact field names in the live secret
+could not be confirmed from the repositories, so
+.I vault.ipmi_user_field
+and
+.I vault.ipmi_password_field
+are configurable, the client accepts the obvious synonyms, and this tool
+reports which field was actually used.
+.PP
+No secret value is ever printed. The output gives the field names present, the
+field selected, the username, the password's length, and where the credential
+came from \(em enough to confirm the configuration and nothing that needs
+protecting.
+.SH OPTIONS
+.TP
+.BI \-\-path " REL"
+Secret path relative to
+.IR vault.base_path .
+Default:
+.IR vault.ipmi_path ", normally " ipmi .
+.TP
+.BI \-\-addr " URL"
+Override
+.IR vault.addr .
+.TP
+.B \-\-fields
+Print only the field names present in the secret.
+.TP
+.B \-\-no\-fallback
+Fail rather than falling back to the local password file. Use this to test
+Vault itself, rather than testing whether a recovery could proceed.
+.TP
+.B \-\-json
+Emit the report as JSON.
+.SH FALLBACK
+When Vault is unreachable and
+.I vault.allow_file_fallback
+is set, the tools fall back to
+.I ~/.ipmipasswd
+\(em the file the existing
+.I mu2edaq-operations
+scripts already read. This matters more here than it would elsewhere: a
+site-wide power event is exactly when the Vault server may also be down, and
+being unable to reach Vault must not be the reason the DAQ cannot be powered
+back on. The fallback is recorded in the run, and this tool reports it in the
+.I Source
+line.
+.SH AUTHENTICATION
+A Vault token is needed. Obtain one with:
+.RS
+.EX
+vault login \-method=ldap \-address=https://ssivault.fnal.gov:8200
+.EE
+.RE
+.PP
+which caches the token at
+.IR ~/.vault-token .
+The tools run that command themselves when no usable token is found, unless
+.I vault.auto_login
+is false.
+.SH EXIT STATUS
+.TP
+.B 0
+Usable BMC credentials were obtained.
+.TP
+.B 1
+They were not; the reason is printed.
+.SH EXAMPLES
+.RS
+.EX
+mu2e-vault-ipmi
+mu2e-vault-ipmi \-\-fields
+mu2e-vault-ipmi \-\-no\-fallback \-\-json
+.EE
+.RE
+.SH SEE ALSO
+.BR mu2e-ipmi-tool (1),
+.BR mu2edaq-power-recovery.yaml (5),
+.BR vault (1)
+.SH AUTHOR
+A. Norman <anorman@fnal.gov>, Mu2e DAQ Operations.

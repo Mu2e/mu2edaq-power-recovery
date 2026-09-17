@@ -1,0 +1,100 @@
+# ---------------------------------------------------------------------------
+# Phase 2 power-on sequence.
+#
+# The order here is operational, not arbitrary: mu2e-mgr-01 exports /home and
+# the shared areas, so every later node's NFS mounts fail if it is not up and
+# healthy first; the data loggers and DCS servers must be serving before the
+# CFO and the detector readout nodes have anywhere to write; the CFO
+# distributes the clock/control fabric the trk/calo/crv/stm nodes sync to.
+#
+# Semantics:
+#   stages are executed strictly in order.  A stage is only entered when the
+#   previous stage reached its 'require:' state.  Within a stage, nodes are
+#   processed in parallel up to 'concurrency:' (default from
+#   power-recovery.yaml: sequence.default_concurrency).
+#
+# Per-stage keys:
+#   name           short identifier, used in the report and in --from/--until
+#   title          human label for the report tables
+#   nodes          explicit hostnames and/or NodeRange mappings (same syntax
+#                  as config/topology.yaml)
+#   location       topology location the nodes belong to (default: mc2)
+#   checks         check profile from config/checks.yaml applied after power-on
+#   require        all | majority | any -- how much of the stage must pass
+#                  before the next stage is allowed to start
+#   concurrency    max nodes worked on at once in this stage
+#   power_on       false => verify only, never issue an IPMI power command
+#   boot_timeout   seconds to wait for SSH to answer after chassis power on
+#   settle         seconds to wait after SSH answers before running checks,
+#                  so that late-starting units (NFS automount, network-online
+#                  targets, DTC firmware load) are not sampled mid-start
+# ---------------------------------------------------------------------------
+
+defaults:
+  location: mc2
+  require: all
+  concurrency: 8
+  power_on: true
+  boot_timeout: 600
+  settle: 30
+
+stages:
+
+  # The gateways are the jump hosts; if they are down there is nothing to
+  # drive IPMI *from*, so they are verified rather than power-cycled.  They
+  # are on protected: in topology.yaml for the same reason.
+  - name: gateways
+    title: Gateway / firewall hosts
+    power_on: false
+    checks: gateway
+    require: any
+    nodes:
+      - mu2egateway01.fnal.gov
+      - mu2egateway02.fnal.gov
+
+  # Home and shared-area NFS server.  Everything downstream mounts from it,
+  # so this stage is require:all with no exceptions.
+  - name: manager
+    title: Cluster manager (NFS / home server)
+    checks: manager
+    concurrency: 1
+    nodes:
+      - mu2e-mgr-01.fnal.gov
+
+  - name: dataloggers
+    title: Data loggers
+    checks: datalogger
+    concurrency: 2
+    nodes:
+      - mu2e-dl-01.fnal.gov
+      - mu2e-dl-02.fnal.gov
+
+  - name: dcs
+    title: Detector control system servers
+    checks: dcs
+    concurrency: 2
+    nodes:
+      - mu2e-dcs-01.fnal.gov
+      - mu2e-dcs-02.fnal.gov
+
+  - name: cfo
+    title: Central Fibre Optic (CFO) timing host
+    checks: cfo
+    concurrency: 1
+    nodes:
+      - mu2e-cfo-01.fnal.gov
+
+  # Detector readout.  These are independent of one another, so they run at
+  # full concurrency; a single bad node should not hold up the rest, hence
+  # require: majority -- the report still lists every failure.
+  - name: readout
+    title: Detector readout nodes
+    checks: readout
+    concurrency: 8
+    require: majority
+    nodes:
+      - mu2e-crv-01.fnal.gov
+      - {category: trk,  start: 1, end: 14}
+      - {category: calo, start: 1, end: 11}
+      - mu2e-stm-01.fnal.gov
+      - mu2e-stm-02.fnal.gov

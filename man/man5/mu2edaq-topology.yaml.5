@@ -1,0 +1,157 @@
+.TH MU2EDAQ-TOPOLOGY.YAML 5 "2026-09-17" "mu2edaq-power-recovery 0.1.0" "File Formats"
+.SH NAME
+topology.yaml \- Mu2e DAQ node inventory for the power-recovery tools
+.SH SYNOPSIS
+.I config/topology.yaml
+.SH DESCRIPTION
+The node inventory: which machines exist, where they are, which networks they
+are on, what class they belong to, and which of them must never be powered off.
+.PP
+The per-network entry syntax is deliberately identical to
+.I mu2edaq-operations/scripts/nodes_config.yaml,
+so node lists can be copied between the two files without translation. That
+repository remains the authoritative inventory; this file adds the CIDRs, the
+gateways, the host classes and the protection list that a recovery needs.
+.SH TOP-LEVEL KEYS
+.TP
+.I domain
+DNS domain appended to generated hostnames. Default
+.IR fnal.gov .
+.TP
+.I default_prefix
+Site prefix for generated hostnames. Default
+.IR mu2e .
+.TP
+.IR ipmi_suffix ", " data_suffix
+How a lab hostname maps to its BMC and data-network names. Defaults
+.IR \-ipmi " and " \-data ,
+so the BMC of
+.I mu2e-trk-01.fnal.gov
+is
+.IR mu2e-trk-01-ipmi.fnal.gov .
+.TP
+.I protected
+Hosts for which destructive IPMI verbs are refused, regardless of
+.BR \-\-execute .
+Powering any of these down would cut the operator off from the cluster they are
+recovering, or stop the NFS server the rest of it mounts from. Matches on the
+short name, so a fully-qualified entry protects the short form too.
+.TP
+.I roles
+Ordered list of
+.RI { pattern ", " class }
+mappings. The first regular expression matching a host's short name assigns its
+class; a host matching nothing lands in
+.BR other .
+Classes select check profiles and group the report tables.
+.TP
+.I locations
+The sites, described below.
+.SH LOCATIONS
+Each location holds:
+.TP
+.IR label ", " description
+Human names used in the report.
+.TP
+.I aliases
+Alternative spellings accepted on the command line. The teststand accepts
+.BR heerc .
+Hyphens are ignored, so
+.B mc-2
+and
+.B mc2
+are the same location.
+.TP
+.I gateways
+Jump hosts used to reach this location, in preference order.
+.TP
+.I subnets
+Network name to CIDR. These are what
+.I net.interfaces
+matches an address against, which is why the check is independent of interface
+naming \(em it looks for an address in the expected subnet, not for
+.IR eno1 .
+.TP
+.I networks
+Network name to entry list.
+.SH ENTRY SYNTAX
+Each entry in a network's list is either a fully-qualified hostname, used
+verbatim, or a mapping describing a run of numbered hosts:
+.TP
+.IR start ", " end
+First and last node number, inclusive.
+.TP
+.I category
+Subsystem label inserted between the prefix and the number, giving
+.IR <prefix>-<category>-<NN><suffix>.<domain> .
+Omit it for hosts whose prefix already encodes the type, giving
+.IR <prefix><NN><suffix>.<domain> .
+.TP
+.I prefix
+Overrides
+.IR default_prefix .
+.TP
+.I suffix
+Appended after the number, e.g.
+.IR \-data ", " \-ipmi .
+.TP
+.I excludes
+Node numbers to skip. This is how a decommissioned machine, or one with no BMC,
+is kept out of a list.
+.TP
+.I fmt
+printf-style format for the number. Default
+.BR %02d .
+.SH THE CURRENT INVENTORY
+.TP
+.B mc2
+MC-2, the primary DAQ room. Lab 131.225.245.0/24, data 10.226.9.0/24, IPMI
+192.168.157.0/24. Gateways
+.IR mu2egateway01 " and " mu2egateway02 .
+.TP
+.B mc1
+MC-1.
+.B Its node list is empty.
+MC-1 is not carried in the upstream
+.I nodes_config.yaml,
+so no inventory could be imported. Its lab subnet (131.225.246.0/24) and the
+absence of a data network are recorded. Add hostnames to
+.I locations.mc1.networks
+and every phase picks MC-1 up with no code change; until then the tools report
+it as having no nodes configured rather than as healthy.
+.TP
+.B teststand
+The Helen Edwards Engineering Center (HEERC) test stand. Lab 131.225.237.0/24,
+data 10.226.9.0/24, IPMI 192.168.150.0/24. Hosts are
+.IR mu2edaqNN ,
+with three overlapping exclusion sets \(em decommissioned nodes, nodes outside
+the HEERC cluster, and nodes with no DTC card \(em applied per network.
+.SH EXAMPLES
+Add a tracker node and its interfaces:
+.RS
+.EX
+locations:
+  mc2:
+    networks:
+      lab:
+        \- {category: trk, start: 1, end: 19}
+      ipmi:
+        \- {category: trk, start: 1, end: 19, suffix: \-ipmi,
+           excludes: [5, 6, 7, 8, 10, 13]}
+      data:
+        \- {category: trk, start: 1, end: 19, suffix: \-data}
+.EE
+.RE
+.PP
+Check what the change produced:
+.RS
+.EX
+mu2e-node-inventory \-l mc2 \-c tracker
+.EE
+.RE
+.SH SEE ALSO
+.BR mu2e-node-inventory (1),
+.BR mu2e-power-recovery (1),
+.BR mu2edaq-power-sequence.yaml (5)
+.SH AUTHOR
+A. Norman <anorman@fnal.gov>, Mu2e DAQ Operations.

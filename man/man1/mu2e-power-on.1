@@ -1,0 +1,137 @@
+.TH MU2E-POWER-ON 1 "2026-09-17" "mu2edaq-power-recovery 0.1.0" "Mu2e DAQ Operations"
+.SH NAME
+mu2e-power-on \- phase 2: bring the Mu2e DAQ cluster up in dependency order
+.SH SYNOPSIS
+.B mu2e-power-on
+.RB [ \-\-execute ]
+.RB [ \-\-from
+.IR STAGE ]
+.RB [ \-\-until
+.IR STAGE ]
+.RI [ options ]
+.SH DESCRIPTION
+Runs phase 2 of
+.BR mu2e-power-recovery (1):
+the power-on sequence defined in
+.BR mu2edaq-power-sequence.yaml (5).
+.PP
+For each stage, in order:
+.IP \(bu 2
+read each node's chassis power state over IPMI;
+.IP \(bu 2
+issue
+.B chassis power on
+to whatever is off;
+.IP \(bu 2
+wait for SSH to answer, up to the stage's
+.IR boot_timeout ;
+.IP \(bu 2
+wait the stage's
+.I settle
+period, so late-starting units are not sampled mid-start;
+.IP \(bu 2
+run the stage's check profile;
+.IP \(bu 2
+decide whether the stage met its
+.I require
+setting
+.RB ( all ", " majority " or " any ).
+.PP
+The shipped order is gateways, then
+.IR mu2e-mgr-01 ,
+then the data loggers, the DCS servers, the CFO, and finally the detector
+readout nodes. It is operational rather than arbitrary:
+.I mu2e-mgr-01
+exports
+.I /home
+and the shared areas, so every later node's mounts fail if it is not healthy
+first; the CFO distributes the clock and control fabric the readout nodes
+synchronise to.
+.PP
+A stage that does not meet its requirement stops the sequence, unless
+.B \-\-continue\-on\-error
+is given. That is deliberate: later stages depend on the services the earlier
+ones provide, so continuing would produce failures that say nothing new.
+.SH SAFETY
+This command is a
+.B dry run
+unless
+.B \-\-execute
+is given: power states are read, and the report shows what
+.I would
+have been switched on, but no chassis is touched.
+.PP
+.BR "chassis power off" ", " cycle " and " reset
+are refused for the hosts listed under
+.I protected:
+in
+.BR mu2edaq-topology.yaml (5)
+\(em the gateways,
+.I mu2e-mgr-01
+and
+.I mu2e-dcs-01
+\(em regardless of
+.BR \-\-execute .
+The gateway stage never issues a power command at all; it verifies only.
+.PP
+Every attempt, including every refusal, is recorded in the run store before the
+command is issued, so a tool that dies mid-action still leaves evidence of what
+it was doing.
+.SH OPTIONS
+As
+.BR mu2e-power-recovery (1),
+with
+.B \-\-phase
+fixed to
+.BR poweron .
+The stage-selection options are specific to this phase:
+.TP
+.BI \-\-from " STAGE"
+Start at this stage. Use it to resume after fixing whatever stopped a previous
+attempt.
+.TP
+.BI \-\-until " STAGE"
+Stop after this stage. Useful for bringing up the infrastructure nodes and
+pausing before the detector readout.
+.TP
+.B \-\-continue\-on\-error
+Do not stop at the first stage that fails its requirement.
+.SH EXIT STATUS
+.TP
+.B 0
+Every stage met its requirement.
+.TP
+.B 1
+The sequence ran but a stage failed, or nodes failed their checks.
+.TP
+.B 2
+The sequence could not start: no gateway, or no BMC credentials.
+.SH EXAMPLES
+See what would happen, without doing it:
+.RS
+.EX
+mu2e-power-on
+.EE
+.RE
+.PP
+Bring up the infrastructure only, then stop and look:
+.RS
+.EX
+mu2e-power-on \-\-execute \-\-until cfo
+.EE
+.RE
+.PP
+Resume at the DCS stage after repairing it:
+.RS
+.EX
+mu2e-power-on \-\-execute \-\-from dcs
+.EE
+.RE
+.SH SEE ALSO
+.BR mu2e-power-recovery (1),
+.BR mu2e-power-state (1),
+.BR mu2e-ipmi-tool (1),
+.BR mu2edaq-power-sequence.yaml (5),
+.BR mu2edaq-topology.yaml (5)
+.SH AUTHOR
+A. Norman <anorman@fnal.gov>, Mu2e DAQ Operations.

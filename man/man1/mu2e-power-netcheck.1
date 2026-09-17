@@ -1,0 +1,78 @@
+.TH MU2E-POWER-NETCHECK 1 "2026-09-17" "mu2edaq-power-recovery 0.1.0" "Mu2e DAQ Operations"
+.SH NAME
+mu2e-power-netcheck \- phase 3: inter-node connectivity across the DAQ networks
+.SH SYNOPSIS
+.B mu2e-power-netcheck
+.RB [ \-\-include\-failed ]
+.RI [ options ]
+.SH DESCRIPTION
+Runs phase 3 of
+.BR mu2e-power-recovery (1).
+.PP
+Phases 1 and 2 establish that each node is reachable
+.I from a gateway.
+That is a weaker property than the nodes being able to reach
+.IR "each other" .
+After a power event a switch can come back with a VLAN missing, a port in the
+wrong group, or jumbo frames disabled on one uplink, and every node still
+passes its own health checks while the DAQ cannot move data. This phase probes
+node to node.
+.PP
+The networks probed, and how, come from the
+.I mesh:
+section of
+.BR mu2edaq-checks.yaml (5):
+.TP
+.B data
+Full mesh, with a jumbo-frame probe. This is the network the DAQ actually uses
+and it is small enough to afford O(N^2) probes.
+.TP
+.BR lab ", " ipmi
+Sampled: each node is probed against a small set of anchor hosts, which is O(N)
+and sufficient to find a segment that has not come back.
+.PP
+Probes for one source are packed into a single remote shell invocation rather
+than one SSH session per pair \(em a full mesh over thirty data-network nodes
+is 870 pairs, and doing that as 870 sessions would take longer than the rest of
+the recovery.
+.PP
+The results are interpreted, not merely tabulated. A node that reached nothing
+is reported separately from a node that nobody could reach: the first is a node
+or switch-port problem, the second suggests a one-way path, an ARP problem or a
+host firewall, and they need different responses.
+.SH OPTIONS
+As
+.BR mu2e-power-recovery (1),
+with
+.B \-\-phase
+fixed to
+.BR network .
+.TP
+.B \-\-include\-failed
+Probe nodes that failed an earlier phase. By default they are skipped, because
+probing a node already known to be down costs a full timeout per pair and tells
+the operator nothing new.
+.SH EXIT STATUS
+.TP
+.B 0
+Every probed path works.
+.TP
+.B 1
+At least one path failed, or a path could not carry a full jumbo frame.
+.TP
+.B 2
+The probe could not start.
+.SH EXAMPLES
+.RS
+.EX
+mu2e-power-netcheck
+mu2e-power-netcheck \-\-location teststand
+mu2e-power-netcheck \-\-include\-failed \-v
+.EE
+.RE
+.SH SEE ALSO
+.BR mu2e-power-recovery (1),
+.BR mu2edaq-checks.yaml (5),
+.BR mu2e-probe (1)
+.SH AUTHOR
+A. Norman <anorman@fnal.gov>, Mu2e DAQ Operations.

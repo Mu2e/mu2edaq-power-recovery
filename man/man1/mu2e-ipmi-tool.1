@@ -1,0 +1,130 @@
+.TH MU2E-IPMI-TOOL 1 "2026-09-17" "mu2edaq-power-recovery 0.1.0" "Mu2e DAQ Operations"
+.SH NAME
+mu2e-ipmi-tool \- run an ipmitool command against Mu2e DAQ BMCs, from a gateway
+.SH SYNOPSIS
+.B mu2e-ipmi-tool
+.RB [ \-n
+.IR HOST ]
+.RB [ \-c
+.IR CLASS ]
+.RB [ \-\-execute ]
+.I ARG...
+.SH DESCRIPTION
+Issues one
+.BR ipmitool (1)
+command against a set of DAQ BMCs. It is the successor to
+.I mu2edaq-operations/scripts/mu2e_ipmi.sh
+and differs from it in three ways that matter during a recovery:
+.IP \(bu 2
+The BMC password comes from HashiCorp Vault and is delivered to the gateway on
+standard input, so it appears in no process table on either host.
+.BR ipmitool 's
+.B \-E
+form is used, never
+.BR \-P .
+.IP \(bu 2
+Destructive verbs are refused for the protected hosts before the command is
+even built.
+.IP \(bu 2
+State-changing verbs require
+.BR \-\-execute ,
+so a mistyped host name in a hurry reads a power state instead of changing one.
+.PP
+.B ipmitool
+is run
+.I on the gateway,
+not locally: the IPMI subnets (192.168.157.0/24 at MC-2, 192.168.150.0/24 at
+the teststand) are not routable from off site.
+.SH OPTIONS
+.TP
+.BI \-n " HOST" "\fR, \fP" \-\-node " HOST"
+Target node, by its lab name, short or fully qualified. Repeatable. With no
+.B \-n
+and no
+.BR \-c ,
+every node at the location that has a BMC is targeted.
+.TP
+.BI \-c " CLASS" "\fR, \fP" \-\-class " CLASS"
+Target every node of this host class.
+.TP
+.BI \-l " NAME" "\fR, \fP" \-\-location " NAME"
+Location whose gateway is used and whose nodes are targeted.
+.TP
+.BI \-\-gateway " HOST"
+Force a particular gateway to run
+.B ipmitool
+on, rather than the first one that answers.
+.TP
+.B \-\-execute
+Really issue a state-changing verb
+.RB ( "chassis power on" / off / cycle / reset ).
+Without it, the intended action is reported and nothing is sent.
+.TP
+.B \-\-yes
+Skip the confirmation prompt before a destructive verb.
+.TP
+.B \-\-json
+Emit the per-node results as JSON.
+.SH SAFETY
+.BR "chassis power off" ", " cycle " and " reset
+are refused for every host listed under
+.I protected:
+in
+.BR mu2edaq-topology.yaml (5)
+\(em by default the gateways,
+.I mu2e-mgr-01
+and
+.IR mu2e-dcs-01 .
+.B \-\-execute
+and
+.B \-\-yes
+do not override this. Powering any of them down would cut off access to the
+cluster being recovered, or stop the NFS server the rest of it mounts from.
+.SH EXAMPLES
+Power state of every tracker node:
+.RS
+.EX
+mu2e-ipmi-tool \-c tracker chassis power status
+.EE
+.RE
+.PP
+Sensors on one node:
+.RS
+.EX
+mu2e-ipmi-tool \-n mu2e-trk-03 sdr elist
+.EE
+.RE
+.PP
+The BMC event log, which survives the outage the host did not:
+.RS
+.EX
+mu2e-ipmi-tool \-n mu2e-trk-03 sel list last 20
+.EE
+.RE
+.PP
+Actually switch a node on:
+.RS
+.EX
+mu2e-ipmi-tool \-n mu2e-trk-03 \-\-execute chassis power on
+.EE
+.RE
+.SH EXIT STATUS
+.TP
+.B 0
+The command succeeded on every target.
+.TP
+.B 1
+It failed, or was refused, on at least one target.
+.TP
+.B 2
+No credentials, or no gateway to run from.
+.TP
+.B 3
+The operator declined the confirmation prompt.
+.SH SEE ALSO
+.BR mu2e-power-on (1),
+.BR mu2e-vault-ipmi (1),
+.BR mu2edaq-topology.yaml (5),
+.BR ipmitool (1)
+.SH AUTHOR
+A. Norman <anorman@fnal.gov>, Mu2e DAQ Operations.

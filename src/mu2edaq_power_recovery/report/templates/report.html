@@ -1,0 +1,119 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{% block title %}{{ site_title }} &middot; Detailed report{% endblock %}
+{% block content %}
+
+<h2 class="mb-1 text-lg font-semibold">Phase 4 &mdash; recovery report</h2>
+<p class="mb-4 text-sm text-slate-600 dark:text-slate-300">
+  The consolidated record of the run, assembled from the stored evidence.
+  This page probes nothing and can be regenerated at any time.
+</p>
+
+{{ m.run_header(narrative.run, version) }}
+
+<section class="mb-8 rounded-lg border-l-4 border-sky-500 bg-sky-50 p-4 dark:bg-sky-950/40">
+  <h3 class="text-base font-semibold">{{ narrative.headline }}</h3>
+  {% if narrative.dry_run %}
+  <p class="mt-1 text-sm font-medium text-amber-800 dark:text-amber-300">
+    This was a dry run &mdash; no chassis was switched on.
+  </p>
+  {% endif %}
+</section>
+
+<section class="mb-8">
+  <h3 class="mb-3 font-semibold">What was done</h3>
+  <div class="overflow-x-auto rounded-lg border border-slate-200 dark:border-slate-800">
+  <table class="min-w-full divide-y divide-slate-200 text-sm dark:divide-slate-800">
+    <thead class="bg-slate-100 text-left text-xs uppercase text-slate-600 dark:bg-slate-900 dark:text-slate-400">
+      <tr><th class="px-3 py-2">#</th><th class="px-3 py-2">Phase</th><th class="px-3 py-2">Status</th>
+          <th class="px-3 py-2">Summary</th><th class="px-3 py-2">Nodes</th><th class="px-3 py-2">Started</th></tr>
+    </thead>
+    <tbody class="divide-y divide-slate-100 bg-white dark:divide-slate-800 dark:bg-slate-950">
+      {% for p in narrative.phases %}
+      <tr><td class="px-3 py-2">{{ p.number }}</td><td class="px-3 py-2">{{ p.name }}</td>
+          <td class="px-3 py-2">{{ p.status }}</td><td class="px-3 py-2">{{ p.summary }}</td>
+          <td class="px-3 py-2">{{ p.node_count }}</td>
+          <td class="px-3 py-2 font-mono text-xs">{{ p.started_at }}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  </div>
+</section>
+
+{% if narrative.powered_on %}
+<section class="mb-8">
+  <h3 class="mb-2 font-semibold">Nodes switched on by this run ({{ narrative.powered_on|length }})</h3>
+  <p class="font-mono text-xs text-slate-600 dark:text-slate-300">{{ narrative.powered_on|join(', ') }}</p>
+</section>
+{% endif %}
+
+{% if narrative.power_problems %}
+<section class="mb-8">
+  <h3 class="mb-2 font-semibold">Power actions that did not complete</h3>
+  <div class="overflow-x-auto rounded-lg border border-slate-200 dark:border-slate-800">
+  <table class="min-w-full divide-y divide-slate-200 text-sm dark:divide-slate-800">
+    <thead class="bg-slate-100 text-left text-xs uppercase text-slate-600 dark:bg-slate-900 dark:text-slate-400">
+      <tr><th class="px-3 py-2">Node</th><th class="px-3 py-2">Outcome</th><th class="px-3 py-2">Detail</th></tr>
+    </thead>
+    <tbody class="divide-y divide-slate-100 bg-white dark:divide-slate-800 dark:bg-slate-950">
+      {% for item in narrative.power_problems %}
+      <tr><td class="px-3 py-2 font-mono text-xs">{{ item.node|shorthost }}</td>
+          <td class="px-3 py-2">{{ item.outcome }}</td><td class="px-3 py-2">{{ item.detail }}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  </div>
+</section>
+{% endif %}
+
+<section class="mb-8">
+  <h3 class="mb-2 font-semibold">Outstanding problems ({{ narrative.outstanding|length }})</h3>
+  {% if narrative.outstanding %}
+  <input type="search" data-filter-for="outstanding-table" placeholder="filter..."
+         class="mb-2 w-72 rounded-md border border-slate-300 px-3 py-1.5 text-sm dark:border-slate-700 dark:bg-slate-900">
+  <div class="overflow-x-auto rounded-lg border border-slate-200 dark:border-slate-800">
+  <table id="outstanding-table" data-sortable class="min-w-full divide-y divide-slate-200 text-sm dark:divide-slate-800">
+    <thead class="bg-slate-100 text-left text-xs uppercase text-slate-600 dark:bg-slate-900 dark:text-slate-400">
+      <tr><th data-sort class="px-3 py-2">Node</th><th data-sort class="px-3 py-2">Check</th>
+          <th data-sort class="px-3 py-2">Status</th><th data-sort class="px-3 py-2">Phase</th>
+          <th class="px-3 py-2">Summary</th></tr>
+    </thead>
+    <tbody class="divide-y divide-slate-100 bg-white dark:divide-slate-800 dark:bg-slate-950">
+      {% for item in narrative.outstanding %}
+      <tr data-status="{{ item.status }}">
+        <td class="px-3 py-2 font-mono text-xs">{{ item.node|shorthost }}</td>
+        <td class="px-3 py-2 font-mono text-xs">{{ item.check }}</td>
+        <td class="px-3 py-2">{{ m.pill(item.status) }}</td>
+        <td class="px-3 py-2">{{ item.phase }}</td>
+        <td class="px-3 py-2">{{ item.summary }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% else %}
+  <p class="text-sm text-emerald-700 dark:text-emerald-400">None &mdash; every check passed.</p>
+  {% endif %}
+</section>
+
+<section class="mb-8">
+  <h3 class="mb-2 font-semibold">Next steps</h3>
+  <ul class="list-disc space-y-1 pl-5 text-sm">
+    {% for step in narrative.next_steps %}<li>{{ step }}</li>{% endfor %}
+  </ul>
+</section>
+
+<section class="mb-8">
+  <h3 class="mb-2 font-semibold">Timeline</h3>
+  <div class="max-h-96 overflow-y-auto rounded-lg border border-slate-200 bg-white p-3 text-xs dark:border-slate-800 dark:bg-slate-900">
+    {% for e in narrative.events %}
+    <div class="flex gap-3 border-b border-slate-100 py-1 last:border-0 dark:border-slate-800">
+      <span class="whitespace-nowrap font-mono text-slate-500">{{ e.recorded_at }}</span>
+      <span class="uppercase {% if e.level == 'error' %}text-rose-700 dark:text-rose-400{% else %}text-slate-400{% endif %}">{{ e.level }}</span>
+      <span>{{ e.message }}</span>
+    </div>
+    {% endfor %}
+  </div>
+</section>
+
+{% endblock %}
