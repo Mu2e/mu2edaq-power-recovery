@@ -127,8 +127,10 @@ the healthy baseline.
   its lab subnet but the inventory is empty — MC-1 is not in the upstream
   `mu2edaq-operations/scripts/nodes_config.yaml`. Fill it in and every phase
   picks it up.
-- **Vault IPMI field names are unverified.** `vault.ipmi_user_field` /
-  `ipmi_password_field` default to `username`/`password`, with synonym
-  fallback. Confirm with `mu2e-vault-ipmi`.
+- **The Vault secret is maintained outside this repository.** It is at
+  `td/scd/experiments/mu2e/ipmi/config` (note: `ipmi` is a KV folder, not the
+  secret) with fields `username`/`password`, both confirmed. If it is ever
+  re-keyed, `mu2e-vault-ipmi` diagnoses it and `vault.ipmi_path` /
+  `ipmi_*_field` fix it without a code change.
 - **`ecl-client`'s Python surface is version-dependent.** `report/ecl.py` tries
   the module-level `post()` first and the class API second.

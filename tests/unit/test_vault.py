@@ -109,8 +109,8 @@ def test_listing_an_absent_path_is_empty_not_an_error(vault):
 
 
 def test_synonym_fields_are_accepted(vault, monkeypatch):
-    # The live field naming could not be confirmed, so the obvious synonyms
-    # are accepted and the tools report which one was used.
+    # The live secret uses username/password, but it is maintained outside
+    # this repository; the synonyms are the fallback if it is ever re-keyed.
     kv = FakeKvV2(
         secrets={"scd/experiments/mu2e/ipmi/config": {"user": "MU2E",
                                                       "pass": "s3cret"}},

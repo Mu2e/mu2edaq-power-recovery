@@ -116,11 +116,10 @@ vault:
   # which looks identical to an empty secret, so `mu2e-vault-ipmi` lists the
   # tree and says which it was.
   ipmi_path: ipmi/config
-  # Field names inside that secret.  *** Verify against the live secret. ***
-  # The upstream shell tooling hard-codes the user MU2E and reads the
-  # password from ~/.ipmipasswd, so the field naming in Vault could not be
-  # confirmed from the repository; these are the conventional names and are
-  # overridable precisely because of that.
+  # Field names inside that secret, confirmed against the live secret
+  # (2026-09-17).  Kept configurable because the secret is maintained outside
+  # this repository and could be re-keyed without us; vault.py also accepts
+  # the obvious synonyms and logs which field it used.
   ipmi_user_field: username
   ipmi_password_field: password
   # Fall back to ~/.ipmipasswd (and ipmi.default_user) when Vault is

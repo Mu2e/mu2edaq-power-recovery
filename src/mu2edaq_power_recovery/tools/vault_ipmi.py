@@ -1,11 +1,12 @@
 """mu2e-vault-ipmi -- verify the Vault path that holds the BMC credentials.
 
 The IPMI secret lives at ``td/scd/experiments/mu2e/ipmi/config`` -- note
-that ``ipmi`` is a folder in the KV tree, not the secret.  Its exact field
-names could not be confirmed from the repositories, so
-``vault.ipmi_user_field`` / ``vault.ipmi_password_field`` are configurable and
-this tool exists to check what is actually there -- before an outage, not
-during one.
+that ``ipmi`` is a folder in the KV tree, not the secret -- with the fields
+``username`` and ``password``.
+
+This tool exists to confirm that before an outage rather than during one: the
+secret is maintained outside this repository, so its path and fields can change
+without anything here noticing until a recovery needs them.
 
 It never prints a password.  It prints which fields exist, which one was
 selected, and whether the value is non-empty, which is everything needed to

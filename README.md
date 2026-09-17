@@ -119,11 +119,13 @@ mu2e-power-recovery --phase all --execute \
 vault login -method=ldap -address=https://ssivault.fnal.gov:8200
 ```
 
-The tools run that for you when no usable token is cached. Check the path
-before you need it:
+The tools run that for you when no usable token is cached. The secret is at
+`ipmi/config` — note that `ipmi` is a KV folder, not the secret — with fields
+`username` and `password`. Check it before you need it:
 
 ```sh
-mu2e-vault-ipmi
+mu2e-vault-ipmi            # path, fields and whether the credentials work
+mu2e-vault-ipmi --list     # browse the KV tree, if the path has moved
 ```
 
 If Vault is unreachable — plausible during a site-wide power event — the tools

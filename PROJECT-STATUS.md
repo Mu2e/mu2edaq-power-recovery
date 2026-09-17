@@ -17,7 +17,8 @@ bindings, and the documentation set.
 212 automated tests pass, plus 7 C++ test groups and an end-to-end simulated
 four-phase run. **Nothing has yet been run against the real cluster** — the
 tests and the rehearsal deliberately contact nothing, so what is verified is
-the logic, not the environment. See §6.
+the logic, not the environment. Two items remain open (§6): the MC-1 node list,
+and live-cluster verification.
 
 ---
 
@@ -31,7 +32,7 @@ Every requirement from `Project-Description.md`, and where it is met.
 | 2 | Uses a Kerberos principal for cluster access | ✅ | `creds/kerberos.py` |
 | 3 | Uses a Vault token for secrets | ✅ | `creds/vault.py` |
 | 4 | Report hosting local or remote upload | ✅ | `report/publish.py` (rsync / scp / copy) |
-| 5 | Secrets from `td/scd/experiments/mu2e/`, IPMI at `.../ipmi` | ✅ | `config/power-recovery.yaml` `vault:` |
+| 5 | Secrets from `td/scd/experiments/mu2e/`, IPMI at `.../ipmi/config` | ✅ | `config/power-recovery.yaml` `vault:`; path and fields confirmed |
 | 6 | Three computing centres: MC-1, MC-2, Teststand | ⚠️ | `config/topology.yaml`; **MC-1 node list empty** (§6.1) |
 | 7 | Node names from `mu2edaq-operations` `node_list.py` | ✅ | `topology.py` uses the identical entry syntax |
 | 8 | Per-site network segments and CIDRs | ✅ | `topology.yaml` `subnets:` |
@@ -80,7 +81,7 @@ Every requirement from `Project-Description.md`, and where it is met.
 | SSH transport | ✅ Complete | via checks | ProxyJump, GSSAPI, no ControlMaster |
 | IPMI client | ✅ Complete | 25 | Runs on the gateway; secrets on stdin |
 | Kerberos | ✅ Complete | — | Needs a live KDC to test; see §6.3 |
-| Vault | ✅ Complete | 11 | Path corrected to `ipmi/config`; folder-vs-secret diagnosed |
+| Vault | ✅ Complete | 11 | Path and fields confirmed against the live Vault |
 | Check framework | ✅ Complete | 36 | 25 checks; registry; failure containment |
 | Output parsers | ✅ Complete | 19 | Real command output as fixtures |
 | Phase 1 assess | ✅ Complete | 6 | Read-only asserted by test |
@@ -188,22 +189,20 @@ upstream inventory, so nothing could be imported. Adding the hostnames is a
 config edit; no code change is needed. Until then the tools report MC-1 as
 "no nodes configured" rather than as healthy.
 
-### 6.2 Vault IPMI field names — **needs verification**
-**Path resolved (2026-09-17):** the secret is at
-`td/scd/experiments/mu2e/ipmi/config` — `ipmi` is a *folder* in the KV tree,
-not the secret. `vault.ipmi_path` now defaults to `ipmi/config`. A KV v2 folder
-read returns nothing at all, which is indistinguishable from an empty secret,
-so `mu2e-vault-ipmi` now lists the tree when a path holds no secret and names
-what is inside it; `--list` browses deliberately.
+### 6.2 Vault IPMI secret — ✅ **resolved 2026-09-17**
+Both parts confirmed against the live Vault:
 
-**Still open:** the field names inside that secret. They are read with
-`vault.ipmi_user_field` / `ipmi_password_field`, defaulting to
-`username` / `password`, with fallback to the obvious synonyms (`user`,
-`pass`, `passwd`, `ipmi_password`, `value`). The existing shell tooling
-hard-codes user `MU2E` and reads the password from `~/.ipmipasswd`, so the
-live naming could not be confirmed from the repositories. Run
-`mu2e-vault-ipmi --fields` against the corrected path and set the two config
-keys if the defaults do not match.
+- **Path:** `td/scd/experiments/mu2e/ipmi/config`. `ipmi` is a *folder* in the
+  KV v2 tree, not the secret; the original default of `ipmi` read the folder
+  and returned nothing, which is indistinguishable from an empty secret.
+  `vault.ipmi_path` now defaults to `ipmi/config`, and `mu2e-vault-ipmi` lists
+  the tree and names the secret inside when handed a folder, so the same
+  mistake now reports itself. `--list` browses deliberately.
+- **Fields:** `username` and `password` — the shipped defaults.
+
+Both remain configurable, and the synonym fallback is kept, because the secret
+is maintained outside this repository and could be re-keyed without anything
+here noticing until a recovery needs it. That is a fallback, not a doubt.
 
 ### 6.3 Live-cluster verification — **not yet done**
 Untested against real infrastructure, by design of the test suite:

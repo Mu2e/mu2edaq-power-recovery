@@ -236,10 +236,11 @@ class VaultCredentials:
         username = data.get(user_field)
         password = data.get(pass_field)
         if not password:
-            # Tolerate a different field naming rather than failing outright:
-            # the exact field names in the live secret could not be confirmed
-            # from the repositories, so accept the obvious synonyms and say
-            # which one was used.
+            # The live secret uses 'username'/'password' (confirmed
+            # 2026-09-17), which is what the defaults are.  The synonyms are
+            # kept as a fallback because the secret is maintained outside this
+            # repository: if it is ever re-keyed, a recovery should still get
+            # its credentials and log which field it used, rather than fail.
             for alt in ("password", "pass", "passwd", "ipmi_password", "value"):
                 if data.get(alt):
                     password = data[alt]

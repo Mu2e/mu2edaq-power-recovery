@@ -177,9 +177,11 @@ no fields at all, which looks the same as an empty secret.
 lists the tree when a path holds no secret, so the two are distinguishable.
 .TP
 .IR ipmi_user_field ", " ipmi_password_field
-Field names inside that secret. Configurable because the live secret's field
-naming could not be confirmed from the repositories; the client also accepts
-the obvious synonyms and reports which it used. Verify with
+Field names inside that secret. Default
+.IR username " and " password ,
+confirmed against the live secret. Kept configurable because the secret is
+maintained outside this repository and could be re-keyed; the client also
+accepts the obvious synonyms and logs which it used. Check with
 .BR mu2e-vault-ipmi (1).
 .TP
 .IR allow_file_fallback ", " fallback_password_file ", " fallback_user
