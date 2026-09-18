@@ -103,6 +103,10 @@ DEFAULTS: Dict[str, Any] = {
         "message_timeout": None,
         "tool_retries": None,
         "extra_args": [],
+        # One credential set serves every BMC, so a BMC that answers and
+        # rejects it will be rejected by all of them. Stop rather than send
+        # the same bad username to another sixty-four controllers.
+        "stop_on_auth_failure": True,
     },
     "kerberos": {
         "principal": None,

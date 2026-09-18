@@ -382,6 +382,40 @@ def test_without_a_kerberos_manager_there_is_no_chain(settings, topology):
     assert factory.credentials_for("any-host") == []
 
 
+def test_the_gateways_are_probed_once_even_if_every_worker_asks_at_once(
+        settings, topology, monkeypatch):
+    """Nodes are assessed a thread apiece, and each asks for its gateway first.
+
+    On a cold cache that meant the whole worker pool probing the same two
+    gateways simultaneously -- a TCP sweep plus a full handshake per credential
+    in the chain, times sixteen, in the first second of a phase. Against a
+    gateway that is refusing logins that is a burst of a couple of hundred
+    connections, which is how a rate limiter starts refusing everything else
+    too.
+    """
+    import concurrent.futures
+    import time
+
+    from mu2edaq_power_recovery.transport import ssh as ssh_module
+
+    probes = []
+    factory = SSHFactory(settings, topology)
+
+    def slow_probe(self, location):
+        probes.append(location)
+        time.sleep(0.05)          # widen the window a real probe leaves open
+        self._gateway_cache[location] = "mu2egateway01.fnal.gov"
+        return self._gateway_cache[location]
+
+    monkeypatch.setattr(ssh_module.SSHFactory, "_select_gateway", slow_probe)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
+        futures = [pool.submit(factory.gateway_for, "mc2") for _ in range(16)]
+        answers = [f.result() for f in futures]
+
+    assert probes == ["mc2"], f"the gateways were probed {len(probes)} times"
+    assert set(answers) == {"mu2egateway01.fnal.gov"}
+
+
 # ---------------------------------------------------------------------------
 # the operator's default credential cache must never be touched
 # ---------------------------------------------------------------------------

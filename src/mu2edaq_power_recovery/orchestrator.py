@@ -293,6 +293,8 @@ class Orchestrator:
             message_timeout=self.settings.get("ipmi.message_timeout"),
             tool_retries=self.settings.get("ipmi.tool_retries"),
             extra_args=self.settings.get("ipmi.extra_args", []),
+            stop_on_auth_failure=bool(
+                self.settings.get("ipmi.stop_on_auth_failure", True)),
         )
 
     # -- check execution ---------------------------------------------------

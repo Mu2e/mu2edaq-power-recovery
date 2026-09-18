@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import logging
 import shlex
+import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
@@ -333,6 +334,14 @@ class SSHFactory:
         #: mu2edaq-kerberos can mint from Vault.
         self.kerberos = kerberos
         self._gateway_cache: Dict[str, Optional[str]] = {}
+        #: Serialises gateway selection. Nodes are assessed a thread apiece,
+        #: and every one of them asks for its location's gateway before its
+        #: first command, so an unguarded cache miss means sixteen threads
+        #: probing the same two gateways simultaneously -- each a TCP sweep
+        #: plus a full handshake per credential in the chain. Against a
+        #: gateway that is refusing logins, that is a burst of a couple of
+        #: hundred connections at the very start of a phase.
+        self._gateway_lock = threading.Lock()
         #: host -> the credential that worked there, so a transport rebuilt for
         #: the same node does not repeat the search.
         self._working: Dict[str, Any] = {}
@@ -346,6 +355,10 @@ class SSHFactory:
         before every one of several hundred node commands would dominate the
         runtime, and a gateway that dies mid-run surfaces as SSHError on the
         next command anyway.
+
+        The probe is serialised, so the first caller does it and the rest wait
+        for the answer. Without that, the whole worker pool arrives here at
+        once on a cold cache and every thread probes the gateways for itself.
         """
         configured = self.settings.get("ssh.proxy", "auto")
         if configured and configured not in ("auto", "none"):
@@ -355,6 +368,14 @@ class SSHFactory:
         if location in self._gateway_cache:
             return self._gateway_cache[location]
 
+        with self._gateway_lock:
+            # Re-check: another thread may have filled it while we queued.
+            if location in self._gateway_cache:
+                return self._gateway_cache[location]
+            return self._select_gateway(location)
+
+    def _select_gateway(self, location: str) -> Optional[str]:
+        """Probe *location*'s gateways and cache the first that answers."""
         candidates = self.topology.gateways(location)
         # Pre-filter on TCP/22 before attempting a full SSH handshake.  A
         # gateway whose chassis is dark costs the whole ssh ConnectTimeout to

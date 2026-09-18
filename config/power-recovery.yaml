@@ -109,6 +109,18 @@ ipmi:
   # -e ^ to set the SOL escape character; add it here if a BMC needs it.
   extra_args: []
 
+  # Stop issuing IPMI commands once a BMC has answered and rejected the
+  # credentials (an RAKP failure, or "unauthorized name"). One credential set
+  # serves all 65 BMCs, so the next one will reject it too -- and each attempt
+  # is three invocations here with four ipmitool retries inside each. Set this
+  # false only to gather evidence from several BMCs at once; the run then
+  # sends the same bad username to every controller in the cluster.
+  #
+  # A BMC that simply does not answer is *not* this: "Unable to establish IPMI
+  # v2 / RMCP+ session" is what a dark chassis says too, and after an outage a
+  # dark chassis is the expected case.
+  stop_on_auth_failure: true
+
 kerberos:
   # Principals the tools will use.  Leave null to take whatever is in the
   # current credential cache.  When a principal has no live ticket the tools

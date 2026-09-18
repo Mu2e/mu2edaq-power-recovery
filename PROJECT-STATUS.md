@@ -14,7 +14,7 @@ with the phase-0 self-update, the static report site, the logbook integration,
 the diagnostics utilities, the optional C/C++ probe library and its Python
 bindings, and the documentation set.
 
-288 automated tests pass, plus 7 C++ test groups and an end-to-end simulated
+293 automated tests pass, plus 7 C++ test groups and an end-to-end simulated
 four-phase run. **Nothing has yet been run against the real cluster** — the
 tests and the rehearsal deliberately contact nothing, so what is verified is
 the logic, not the environment. Two items remain open (§6): the MC-1 node list,
@@ -107,7 +107,7 @@ Every requirement from `Project-Description.md`, and where it is met.
 
 ## 4. Test matrix
 
-`pytest` — **288 passed**, no cluster, no credentials, no network.
+`pytest` — **293 passed**, no cluster, no credentials, no network.
 
 | Suite | Tests | Covers |
 |---|---|---|
@@ -115,10 +115,10 @@ Every requirement from `Project-Description.md`, and where it is met.
 | `unit/test_settings.py` | 23 | All five precedence layers, coercion, redaction, malformed YAML |
 | `unit/test_parsers.py` | 20 | `df`, `ip`, `ping` (iputils + BSD + Windows), `mdstat`, SMART, kernel errors |
 | `unit/test_checks.py` | 39 | Every check's pass and fail path; framework containment; ping dialects |
-| `unit/test_ipmi.py` | 39 | **Safety gates**, credentials, invocation shape, failure diagnosis |
+| `unit/test_ipmi.py` | 43 | **Safety gates**, credentials, invocation shape, failure diagnosis, credential stop |
 | `unit/test_state.py` | 8 | Round-trip, refusal auditing, append-not-overwrite |
 | `unit/test_vault.py` | 11 | KV path resolution, folder-vs-secret, synonyms, file fallback |
-| `unit/test_credentials.py` | 54 | Primary-first chains, root fallback, ssh-failure classification, KRB5CCNAME, ccache protection |
+| `unit/test_credentials.py` | 55 | Primary-first chains, root fallback, ssh-failure classification, KRB5CCNAME, ccache protection |
 | `unit/test_network_guard.py` | 2 | The suite's "contacts nothing" claim is enforced, not just asserted |
 | `unit/test_sweep.py` | 8 | Both backends, identical semantics |
 | `unit/test_selfupdate.py` | 13 | Dirty tree, divergence, fast-forward, re-exec guard |
@@ -256,6 +256,25 @@ mu2egateway01 --run true` → `mu2e-ipmi-tool -n <one node> chassis power status
   neither spelling nor output wording); and a simulated run would still have
   published its report to the live web area, because `Publisher._copy` writes
   with `shutil.copytree` rather than through the transport.
+- **Two bursts a live run would have sent at the infrastructure.** Both the
+  same shape as the refused-ssh burst below. (i) `SSHFactory.gateway_for()` had
+  an unguarded check-then-set cache, and every worker thread asks for its
+  location's gateway before its first command. On a cold cache — which is what
+  a run gets whenever Vault fails, since it is `_make_ipmi_client` that
+  happens to warm it — all sixteen threads probed the same two gateways at
+  once, each a TCP sweep plus a full SSH handshake per credential in the
+  chain. Against a gateway already refusing logins that is a couple of hundred
+  connections in the first second of a phase. The probe is now serialised: the
+  first caller does it, the rest wait for the answer. (ii) `IPMIClient` retried
+  a BMC that had *answered and rejected the credentials*, three invocations
+  with four ipmitool retries inside each, and then did the same to the next
+  BMC — all 65 of them share one credential set. Given §6.2a is still open,
+  that is the most likely outcome of the first live run. A credential
+  rejection (RAKP, "unauthorized name") is no longer retried and now stops the
+  run's IPMI with one clear diagnosis; `ipmi.stop_on_auth_failure: false`
+  overrides it. A BMC that simply does not answer is deliberately not treated
+  this way — "Unable to establish IPMI v2 / RMCP+ session" is what a dark
+  chassis says too, and after an outage that is the expected case.
 - **Four remaining ways a run could have damaged the operator's credentials.**
   Found by reviewing the fix above adversarially rather than by a failure.
   (i) `cleanup()` ran a bare `kdestroy` steered only by `KRB5CCNAME` — the same
@@ -342,6 +361,22 @@ mu2egateway01 --run true` → `mu2e-ipmi-tool -n <one node> chassis power status
   source. If the cluster grows substantially, consider anchoring it too.
 - `pytest` takes ~25 s, dominated by deliberate sweep timeouts. It was ~70 s
   until the simulated run stopped issuing real pings (§6.4).
+- **Phase 2 waits for nodes one at a time.** `_wait_for_nodes` walks the
+  stage's nodes in sequence, so a node that never comes back costs the whole
+  `boot_timeout` (600 s by default) before the next one is even tried. The
+  `readout` stage has 28 nodes: three dead ones are half an hour of an outage
+  spent waiting in series, during which nothing else is happening.
+  Parallelising it is straightforward — the probes are read-only `ssh true`,
+  and `assess_nodes` right afterwards already runs the same nodes concurrently
+  — but it changes the connection profile against machines that have just
+  booted, in the most safety-critical phase, so it wants the author's eye
+  rather than a drive-by fix. Found during the hostility review; not changed.
+- A node that answers TCP but refuses every identity costs one connection per
+  credential in the chain — up to eight with the seven Mu2e service identities
+  discovered from Vault. That is the intended behaviour of the chain and it is
+  bounded, and since a refused `ssh.login` now skips the node's remaining
+  checks it happens once per node rather than thirteen times. Worth knowing
+  before pointing a run at a cluster whose sshd is rate-limiting.
 
 ---
 

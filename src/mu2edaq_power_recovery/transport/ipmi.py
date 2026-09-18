@@ -58,6 +58,14 @@ class PowerState(str, Enum):
         return cls.UNKNOWN
 
 
+#: Substrings that mean the BMC *answered* and rejected our identity, as
+#: opposed to not answering at all.  "Unable to establish ... session" is
+#: deliberately absent: a dark BMC says exactly the same thing, and during a
+#: power outage a dark BMC is the expected case.  These two are unambiguous --
+#: the BMC completed enough of RMCP+ to tell us the username or password is
+#: wrong.
+CREDENTIAL_REJECTIONS = ("rakp", "unauthorized name")
+
 #: Verbs that change the machine's state.  Everything not listed is read-only
 #: and is allowed in a dry run, because reading is how phase 1 works.
 DESTRUCTIVE_VERBS = {"off", "cycle", "reset", "soft"}
@@ -101,7 +109,8 @@ class IPMIClient:
                  protected: Optional[Any] = None,
                  message_timeout: Optional[int] = None,
                  tool_retries: Optional[int] = None,
-                 extra_args: Optional[List[str]] = None):
+                 extra_args: Optional[List[str]] = None,
+                 stop_on_auth_failure: bool = True):
         self.gateway = gateway
         self.username = username
         self._password = password
@@ -121,6 +130,10 @@ class IPMIClient:
         self.dry_run = dry_run
         #: Callable(hostname) -> bool, normally Topology.is_protected.
         self.protected = protected or (lambda host: False)
+        #: Stop issuing IPMI commands once a BMC has rejected the credentials.
+        self.stop_on_auth_failure = stop_on_auth_failure
+        #: Set when that happens: the message, for every later caller.
+        self.credentials_refused: Optional[str] = None
 
     # -- command construction ---------------------------------------------
 
@@ -187,6 +200,16 @@ class IPMIClient:
         line into IPMI_PASSWORD, exports it, and runs ipmitool.  `read -r`
         keeps backslashes intact, and the variable is never echoed.
         """
+        if self.credentials_refused:
+            # A BMC has already told us the username or password is wrong, and
+            # one credential set is used for every BMC in the cluster. Carrying
+            # on would put the same bad credentials to another sixty-four of
+            # them, three times each, with ipmitool retrying four times inside
+            # every one of those. That is the IPMI version of the refused-ssh
+            # burst, and it is a lot of failed authentications to send at a
+            # controller you are trying to recover.
+            raise IPMIError(self.credentials_refused)
+
         command = self._remote_command(bmc_host, args)
         script = (
             "IFS= read -r IPMI_PASSWORD || exit 97; "
@@ -214,12 +237,35 @@ class IPMIClient:
             if result.ok:
                 return result
             last = result
+            if self._rejected_credentials(result):
+                # Retrying a wrong username is wrong the second and third time
+                # too. All it adds is two more failed authentications against
+                # this BMC -- and a BMC that answered RAKP is one that is
+                # counting them.
+                log.error("%s rejected the IPMI credentials; not retrying",
+                          bmc_host)
+                break
             if attempt <= self.retries:
                 log.debug("ipmi %s %s rc=%s, retrying", bmc_host, args, result.rc)
                 time.sleep(1.0)
         assert last is not None
         self._annotate_failure(last, bmc_host)
+        if self.stop_on_auth_failure and self._rejected_credentials(last):
+            self.credentials_refused = (
+                f"{bmc_host} rejected the IPMI credentials for user "
+                f"{self.username!r}. The same credentials are used for every "
+                f"BMC, so no further IPMI command will be issued this run. "
+                f"{last.meta.get('diagnosis', '')} Re-run with ipmi.username "
+                f"set, or 'mu2e-ipmi-tool --diagnose' to find the combination "
+                f"that works.").strip()
+            log.error("%s", self.credentials_refused)
         return last
+
+    @staticmethod
+    def _rejected_credentials(result: CommandResult) -> bool:
+        """True when the BMC answered and refused the username or password."""
+        text = (result.stderr + result.stdout).lower()
+        return any(needle in text for needle in CREDENTIAL_REJECTIONS)
 
     #: Substrings of ipmitool failures that mean the session never opened, and
     #: what an operator should actually check for each.

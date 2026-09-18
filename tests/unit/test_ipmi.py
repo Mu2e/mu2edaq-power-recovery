@@ -197,6 +197,68 @@ def test_retries_are_bounded(gateway):
     assert len(attempts) == 3      # the first try plus two retries, then stop
 
 
+def test_a_rejected_credential_is_not_retried(gateway):
+    """A wrong username is still wrong on the second and third attempt.
+
+    All the retries add is two more failed authentications against a BMC that
+    has just demonstrated it is counting them.
+    """
+    gateway.expect_first(r"chassis power status", ScriptedResponse(
+        stderr="Error: Unable to establish IPMI v2 / RMCP+ session\n"
+               "RAKP 2 HMAC is invalid", rc=1))
+    client = IPMIClient(gateway=gateway, username="MU2E", password="x", retries=2)
+    client.power_status("mu2e-trk-01-ipmi.fnal.gov")
+    attempts = [c for c in gateway.calls if "chassis power status" in c["command"]]
+    assert len(attempts) == 1
+
+
+def test_a_rejected_credential_stops_the_run_talking_to_any_bmc(gateway):
+    # One credential set serves all 65 BMCs, so the next one rejects it too.
+    # Without this the wrong username reaches every controller in the cluster,
+    # three invocations each, with four ipmitool retries inside every one.
+    gateway.expect_first(r"chassis power status", ScriptedResponse(
+        stderr="RAKP 2 message indicates an error : unauthorized name", rc=1))
+    client = IPMIClient(gateway=gateway, username="MU2E", password="x", retries=2)
+
+    assert client.power_status("mu2e-trk-01-ipmi.fnal.gov") is PowerState.UNREACHABLE
+    issued = len(gateway.calls)
+    assert client.power_status("mu2e-trk-02-ipmi.fnal.gov") is PowerState.UNREACHABLE
+    assert client.sensors("mu2e-trk-03-ipmi.fnal.gov") == []
+    assert len(gateway.calls) == issued, "a further BMC was contacted"
+    assert "rejected the IPMI credentials" in client.credentials_refused
+    assert "--diagnose" in client.credentials_refused, "must say how to resolve it"
+
+
+def test_a_bmc_that_does_not_answer_does_not_stop_the_run(gateway):
+    """A dark chassis reports "Unable to establish ... session" too.
+
+    After a power outage that is the expected state of a good part of the
+    cluster, so it must not be read as a wrong password and must not stop the
+    other BMCs being interrogated.
+    """
+    gateway.expect_first(r"chassis power status", ScriptedResponse(
+        stderr="Error: Unable to establish IPMI v2 / RMCP+ session", rc=1))
+    client = IPMIClient(gateway=gateway, username="MU2E", password="x", retries=1)
+    client.power_status("mu2e-trk-01-ipmi.fnal.gov")
+
+    assert client.credentials_refused is None
+    attempts = [c for c in gateway.calls if "chassis power status" in c["command"]]
+    assert len(attempts) == 2, "an unanswered BMC must still be retried"
+
+
+def test_the_credential_stop_can_be_turned_off(gateway):
+    # For deliberately gathering evidence from several BMCs at once.
+    gateway.expect_first(r"chassis power status",
+                         ScriptedResponse(stderr="RAKP 2 HMAC is invalid", rc=1))
+    client = IPMIClient(gateway=gateway, username="MU2E", password="x", retries=0,
+                        stop_on_auth_failure=False)
+    client.power_status("mu2e-trk-01-ipmi.fnal.gov")
+    issued = len(gateway.calls)
+    client.power_status("mu2e-trk-02-ipmi.fnal.gov")
+    assert len(gateway.calls) > issued
+    assert client.credentials_refused is None
+
+
 # ---------------------------------------------------------------------------
 # invocation shape -- this is where a regression breaks the real cluster
 # ---------------------------------------------------------------------------
