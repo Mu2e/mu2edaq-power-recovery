@@ -331,8 +331,10 @@ class Orchestrator:
                                                   "power.sensors", "power.sel"):
                 assessment.results.append(CheckResult(
                     node=node.hostname, check_id=check_id, status=Status.UNKNOWN,
-                    summary="not run: the node could not be reached",
-                    detail="skipped after ping and ssh both failed"))
+                    summary="not run: no usable SSH session to this node",
+                    detail="skipped after the login was refused -- every check "
+                           "below needs a session, and retrying each one would "
+                           "just be another refused connection"))
                 continue
             res = run_check(check_id, ctx)
             assessment.results.append(res)
@@ -344,13 +346,19 @@ class Orchestrator:
                 self.baselines.setdefault(node.hostname, {})["sel_count"] = \
                     res.data["count"]
             if check_id == "ssh.login" and res.status is Status.FAIL:
+                # Every remaining check needs an ssh session, so once the login
+                # is refused the rest can only fail the same way -- twelve more
+                # times, each a fresh connection. On a host that is refusing
+                # because of a rate limiter, that makes things worse.
+                reachable = False
                 ping = next((r for r in assessment.results
                              if r.check_id == "ping.lab"), None)
-                if ping is not None and ping.status is Status.FAIL:
-                    reachable = False
-                    assessment.unreachable = True
-                    log.info("%s is unreachable; skipping its remaining checks",
-                             node.hostname)
+                # Answering ICMP but refusing ssh is a credential or sshd
+                # problem, not a dead machine; only the latter is UNREACHABLE.
+                assessment.unreachable = not (ping is not None
+                                              and ping.status is Status.OK)
+                log.info("%s refused the login; skipping its remaining "
+                         "ssh checks", node.hostname)
 
         if self.kerberos is not None:
             # Back to the operator's own principal. Nothing here mutates the

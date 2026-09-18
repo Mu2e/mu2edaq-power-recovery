@@ -14,7 +14,7 @@ with the phase-0 self-update, the static report site, the logbook integration,
 the diagnostics utilities, the optional C/C++ probe library and its Python
 bindings, and the documentation set.
 
-264 automated tests pass, plus 7 C++ test groups and an end-to-end simulated
+271 automated tests pass, plus 7 C++ test groups and an end-to-end simulated
 four-phase run. **Nothing has yet been run against the real cluster** — the
 tests and the rehearsal deliberately contact nothing, so what is verified is
 the logic, not the environment. Two items remain open (§6): the MC-1 node list,
@@ -107,7 +107,7 @@ Every requirement from `Project-Description.md`, and where it is met.
 
 ## 4. Test matrix
 
-`pytest` — **264 passed**, no cluster, no credentials, no network.
+`pytest` — **271 passed**, no cluster, no credentials, no network.
 
 | Suite | Tests | Covers |
 |---|---|---|
@@ -118,7 +118,7 @@ Every requirement from `Project-Description.md`, and where it is met.
 | `unit/test_ipmi.py` | 39 | **Safety gates**, credentials, invocation shape, failure diagnosis |
 | `unit/test_state.py` | 8 | Round-trip, refusal auditing, append-not-overwrite |
 | `unit/test_vault.py` | 11 | KV path resolution, folder-vs-secret, synonyms, file fallback |
-| `unit/test_credentials.py` | 37 | Primary-first chains, root fallback, ssh-failure classification, KRB5CCNAME |
+| `unit/test_credentials.py` | 44 | Primary-first chains, root fallback, ssh-failure classification, KRB5CCNAME |
 | `unit/test_network_guard.py` | 1 | The suite's "contacts nothing" claim is enforced, not just asserted |
 | `unit/test_sweep.py` | 8 | Both backends, identical semantics |
 | `unit/test_selfupdate.py` | 13 | Dirty tree, divergence, fast-forward, re-exec guard |
@@ -236,6 +236,27 @@ mu2egateway01 --run true` → `mu2e-ipmi-tool -n <one node> chassis power status
 --execute --until manager` on a maintenance day.
 
 ### 6.4 Fixed during development, worth knowing
+- **Service-identity minting destroyed the operator's Kerberos ticket.** Found
+  on the first live run. macOS ships Heimdal, whose default cache type is
+  `API:`; `get-kerberos-ticket` sets `KRB5CCNAME=<bare path>`, which Heimdal
+  does not read as a file cache, so all seven identities wrote into the
+  operator's *default* cache instead of ours -- leaving `mu2eraw` as the
+  ambient principal and making every later login, including `root@`, fail with
+  "Permission denied (gssapi)". Fixed three ways: an explicit `FILE:` type on
+  `--cache`, `KRB5CCNAME` also set in the subprocess environment, and a
+  before/after comparison of the default cache that aborts the run with
+  recovery instructions if it ever changes again.
+- **The primary login was left to ssh_config.** `~/.ssh/config_mu2e` sets
+  `User mu2edaq` for the DAQ hosts, so an unqualified ssh authenticated the
+  personal ticket into the service account and was refused. The personal
+  credential's login is now derived from the principal (`anorman@FNAL.GOV` ->
+  `anorman`), with `ssh.user` still overriding.
+- **A refused login was retried twelve more times per node.** Only `ping` and
+  `ssh` both failing marked a node unreachable, so a host answering ICMP but
+  refusing ssh had every remaining check open its own connection -- against a
+  server already rate-limiting. A refused login now skips the remaining ssh
+  checks, and `kex_exchange_identification` / `connection reset` stop the
+  credential chain instead of advancing it.
 - **The credential chain demoted the operator's own principal.** A service
   identity that had worked for a host was promoted to the front of that host's
   chain, so a later transport tried it before the personal ticket; and root

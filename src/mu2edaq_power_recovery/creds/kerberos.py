@@ -38,6 +38,9 @@ from .ticketsource import TicketSource, TicketSourceError
 
 log = logging.getLogger(__name__)
 
+#: Sentinel for "not looked up yet", so a genuine None is cached too.
+_UNSET = object()
+
 
 class KerberosError(RuntimeError):
     """No usable ticket could be obtained for a required principal."""
@@ -146,6 +149,8 @@ class KerberosManager:
         #: Identities that have successfully logged in somewhere, most recent
         #: first. Used to reorder the chain -- see order_chain().
         self._successful: List[str] = []
+        #: Cached principal of the default credential cache.
+        self._ambient: Any = _UNSET
 
     # -- inspection --------------------------------------------------------
 
@@ -212,13 +217,15 @@ class KerberosManager:
         """
         if not principal:
             info = self.current()
+            principal = info.principal or self.ambient_principal()
             if not info.valid:
                 raise KerberosError(
                     "no valid Kerberos ticket in the default credential cache.\n"
                     "Run 'kinit <your principal>' first, or pass "
                     "--principal <principal> to have this tool acquire one."
                 )
-            log.info("using ambient Kerberos ticket for %s", info.principal)
+            log.info("using the ambient Kerberos ticket: %s",
+                     info.principal or "(principal unknown)")
             return info
 
         cache = self.cache_for(principal)
@@ -323,6 +330,15 @@ class KerberosManager:
             try:
                 ticket = self.tickets.ticket(identity, cache)
             except TicketSourceError as exc:
+                message = str(exc)
+                if "default credential cache" in message:
+                    # The operator's own ticket has been replaced. Stop dead:
+                    # every later login would run as the wrong identity.
+                    log.error("%s", message)
+                    self.settings.set("kerberos.use_service_keytabs", False,
+                                      source="runtime (ccache was clobbered)")
+                    self._service[identity] = None
+                    return None
                 log.warning("cannot use the %s service identity: %s", identity, exc)
             else:
                 credential = Credential(
@@ -339,13 +355,47 @@ class KerberosManager:
 
     # -- credential chains ----------------------------------------------------
 
+    def operator_login(self) -> Optional[str]:
+        """The account the operator's own principal logs in as.
+
+        Resolved explicitly rather than left to ssh, because the site
+        ssh_config legitimately sets ``User mu2edaq`` for the DAQ hosts. An
+        unqualified ssh then authenticates the *personal* ticket into the
+        *service* account and is refused -- which looks like "your ticket is
+        bad" and is nothing of the kind.
+
+        Order: an explicit ssh.user, else the first component of the configured
+        principal, else of whatever principal is in the ambient cache, else the
+        local username.
+        """
+        configured = self.settings.get("ssh.user")
+        if configured:
+            return configured
+        principal = (self.settings.get("kerberos.principal")
+                     or self.ambient_principal())
+        if principal:
+            # anorman@FNAL.GOV -> anorman; anorman/root@FNAL.GOV -> anorman
+            return principal.split("@")[0].split("/")[0]
+        try:
+            return getpass.getuser()
+        except Exception:  # noqa: BLE001 - no controlling user; let ssh decide
+            return None
+
+    def ambient_principal(self) -> Optional[str]:
+        """The principal in the operator's default credential cache."""
+        if self._ambient is _UNSET:
+            self._ambient = self.tickets.default_principal()
+        return self._ambient
+
     def operator_credential(self, root: bool = False) -> Credential:
         """The operator's own credential, for the general or root role."""
         role = "root" if root else "general"
         principal = self.settings.get(
             "kerberos.root_principal" if root else "kerberos.principal")
+        if not principal and not root:
+            principal = self.ambient_principal()
         login = self.settings.get("ssh.root_user", "root") if root else \
-            self.settings.get("ssh.user")
+            self.operator_login()
         return Credential(name=role, login=login,
                           cache=self._caches.get(role), principal=principal,
                           source="operator ticket", primary=True)

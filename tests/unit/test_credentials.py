@@ -33,7 +33,11 @@ from mu2edaq_power_recovery.transport.ssh import (SSHError, SSHFactory,
     ("ssh: connect to host h port 22: Connection refused", "unreachable"),
     ("ssh: connect to host h port 22: Operation timed out", "unreachable"),
     ("ssh: Could not resolve hostname h", "unreachable"),
-    ("kex_exchange_identification: read: Connection reset by peer", "unknown"),
+    # sshd dropping us during key exchange is MaxStartups or a rate limiter,
+    # not a credential problem: sending six more identities at a server that is
+    # already refusing connections makes it worse.
+    ("kex_exchange_identification: read: Connection reset by peer", "unreachable"),
+    ("Too many authentication failures", "unreachable"),
 ])
 def test_classification(stderr, expected):
     assert classify_ssh_failure(stderr) == expected
@@ -213,6 +217,12 @@ class FakeTicketSource:
     def unavailable_reason(self):
         return "not installed"
 
+    @staticmethod
+    def default_principal():
+        # A stable ambient principal, so operator_login() resolves without
+        # shelling out to klist.
+        return "anorman@FNAL.GOV"
+
 
 @pytest.fixture
 def manager(settings, tmp_path):
@@ -367,3 +377,105 @@ def test_root_transports_get_the_root_chain(settings, topology, manager,
 def test_without_a_kerberos_manager_there_is_no_chain(settings, topology):
     factory = SSHFactory(settings, topology)
     assert factory.credentials_for("any-host") == []
+
+
+# ---------------------------------------------------------------------------
+# the operator's default credential cache must never be touched
+# ---------------------------------------------------------------------------
+
+
+def test_the_login_is_derived_from_the_principal_not_left_to_ssh(manager):
+    """ssh_config legitimately sets `User mu2edaq` for the DAQ hosts.
+
+    Leaving the login unset therefore authenticated the *personal* ticket into
+    the *service* account, which is refused -- and looks like a bad ticket.
+    """
+    assert manager.operator_login() == "anorman"          # from anorman@FNAL.GOV
+    assert manager.chain()[0].login == "anorman"
+
+
+def test_an_explicit_ssh_user_still_wins(manager):
+    manager.settings.set("ssh.user", "someoneelse")
+    assert manager.operator_login() == "someoneelse"
+
+
+def test_a_root_instance_principal_reduces_to_the_account(manager):
+    manager.settings.set("kerberos.principal", "anorman/root@FNAL.GOV")
+    assert manager.operator_login() == "anorman"
+
+
+def test_the_ticket_cache_is_requested_with_an_explicit_FILE_type(settings, tmp_path,
+                                                                  monkeypatch):
+    """macOS ships Heimdal, whose default cache type is API:.
+
+    A bare path in KRB5CCNAME is not read as a file cache there, so the ticket
+    lands in the operator's *default* cache and destroys their credentials --
+    which is exactly what happened, seven times in a row.
+    """
+    from mu2edaq_power_recovery.creds import ticketsource as ts_module
+
+    seen = {}
+
+    def fake_run(self, command, args, timeout=120, env=None):
+        seen["args"] = list(args)
+        seen["env"] = env or {}
+        cache = Path(str(args[args.index("--cache") + 1]).replace("FILE:", ""))
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        cache.write_text("ticket")
+        return type("R", (), {"returncode": 0, "stdout": b"", "stderr": b""})()
+
+    source = ts_module.TicketSource(settings)
+    monkeypatch.setattr(ts_module.TicketSource, "_run", fake_run)
+    monkeypatch.setattr(ts_module.TicketSource, "resolve",
+                        lambda self, command: Path("/bin/true"))
+    monkeypatch.setattr(ts_module.TicketSource, "default_principal",
+                        staticmethod(lambda: "anorman@FNAL.GOV"))
+    monkeypatch.setattr(ts_module.TicketSource, "_principal_of",
+                        staticmethod(lambda cache: "mu2edaq/mu2e@FNAL.GOV"))
+
+    cache = tmp_path / "krb5cc_svc-mu2edaq"
+    source.ticket("mu2edaq", cache)
+
+    assert f"FILE:{cache}" in seen["args"], "--cache must carry an explicit type"
+    assert seen["env"].get("KRB5CCNAME") == f"FILE:{cache}", \
+        "KRB5CCNAME must also be set, for any path that ignores --cache"
+
+
+def test_a_clobbered_default_cache_is_refused_loudly(settings, tmp_path, monkeypatch):
+    from mu2edaq_power_recovery.creds import ticketsource as ts_module
+
+    principals = iter(["anorman@FNAL.GOV", "mu2eraw/mu2e@FNAL.GOV"])
+
+    def fake_run(self, command, args, timeout=120, env=None):
+        return type("R", (), {"returncode": 0, "stdout": b"", "stderr": b""})()
+
+    source = ts_module.TicketSource(settings)
+    monkeypatch.setattr(ts_module.TicketSource, "_run", fake_run)
+    monkeypatch.setattr(ts_module.TicketSource, "resolve",
+                        lambda self, command: Path("/bin/true"))
+    monkeypatch.setattr(ts_module.TicketSource, "default_principal",
+                        staticmethod(lambda: next(principals)))
+
+    with pytest.raises(TicketSourceError) as excinfo:
+        source.ticket("mu2eraw", tmp_path / "cache")
+    message = str(excinfo.value)
+    assert "default credential cache" in message
+    assert "kinit anorman@FNAL.GOV" in message, "must say how to recover"
+
+
+def test_a_clobbered_cache_disables_service_identities_for_the_run(manager):
+    class Clobbering:
+        available = True
+        def identities(self): return ["mu2edaq", "mu2eshift"]
+        def unavailable_reason(self): return ""
+        @staticmethod
+        def default_principal(): return "anorman@FNAL.GOV"
+        def ticket(self, identity, cache, timeout=120):
+            raise TicketSourceError(
+                "minting a ticket for x replaced the default credential cache")
+
+    manager.tickets = Clobbering()
+    assert manager.service_credential("mu2edaq") is None
+    # ...and no further identity is attempted, because the damage is done.
+    assert manager.settings.get("kerberos.use_service_keytabs") is False
+    assert [c.name for c in manager.chain()] == ["general"]

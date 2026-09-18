@@ -64,7 +64,6 @@ _AUTH_FAILURE_PATTERNS = (
     "gssapi",
     "server not found in kerberos database",
     "authentication failed",
-    "too many authentication failures",
     "no supported authentication methods",
     "user does not exist",
     "invalid user",
@@ -77,6 +76,12 @@ _UNREACHABLE_PATTERNS = (
     "connection refused",
     "connection timed out",
     "connection closed",
+    # sshd dropping the connection during key exchange means MaxStartups or a
+    # rate limiter, not a credential problem. Advancing the chain here would
+    # send six more connections at a server that is already refusing them.
+    "connection reset by peer",
+    "kex_exchange_identification",
+    "too many authentication failures",
     "no route to host",
     "network is unreachable",
     "host is down",

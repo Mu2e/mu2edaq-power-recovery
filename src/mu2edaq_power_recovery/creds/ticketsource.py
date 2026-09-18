@@ -124,12 +124,31 @@ class TicketSource:
 
     # -- running the commands -------------------------------------------------
 
-    def _run(self, command: Path, args: Sequence[str],
-             timeout: int = 120) -> subprocess.CompletedProcess:
+    def _run(self, command: Path, args: Sequence[str], timeout: int = 120,
+             env: Optional[dict] = None) -> subprocess.CompletedProcess:
         argv = [str(command), *args]
         log.debug("running %s", " ".join(argv))
         return subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                              timeout=timeout, check=False)
+                              timeout=timeout, check=False, env=env)
+
+    @staticmethod
+    def default_principal() -> Optional[str]:
+        """The principal in the *default* credential cache, whatever it is.
+
+        Read with KRB5CCNAME removed from the environment, so this reports the
+        operator's own cache rather than whichever one a caller has selected.
+        """
+        env = {k: v for k, v in os.environ.items() if k != "KRB5CCNAME"}
+        try:
+            result = subprocess.run(["klist"], env=env, stdout=subprocess.PIPE,
+                                    stderr=subprocess.DEVNULL, timeout=20,
+                                    check=False)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        for line in result.stdout.decode("utf-8", "replace").splitlines():
+            if "principal:" in line.lower():
+                return line.split(":", 1)[1].strip()
+        return None
 
     def identities(self) -> List[str]:
         """Every service identity mu2edaq-kerberos knows about.
@@ -172,9 +191,25 @@ class TicketSource:
 
         cache.parent.mkdir(parents=True, exist_ok=True)
         extra = list(self.settings.get("kerberos.vault_client_args", []) or [])
+
+        # An explicit FILE: type, not a bare path. macOS ships Heimdal, whose
+        # default cache type is API:, and which does not read a bare path as a
+        # file cache -- so a bare KRB5CCNAME sends the ticket to the operator's
+        # *default* cache and overwrites their own credentials. That is exactly
+        # what happened before this was fixed: seven service identities in a
+        # row each clobbered the personal ticket.
+        target = f"FILE:{cache}"
+
+        # Belt and braces. --cache is what the tool documents, and KRB5CCNAME
+        # in its environment catches any path through it that does not honour
+        # the flag. Neither alone is enough to guarantee the default cache is
+        # left alone, and that guarantee is the point.
+        env = {**os.environ, "KRB5CCNAME": target}
+        before = self.default_principal()
+
         try:
-            result = self._run(command, [identity, "--cache", str(cache), *extra],
-                               timeout=timeout)
+            result = self._run(command, [identity, "--cache", target, *extra],
+                               timeout=timeout, env=env)
         except subprocess.TimeoutExpired as exc:
             raise TicketSourceError(
                 f"get-kerberos-ticket timed out after {timeout}s for {identity}"
@@ -182,6 +217,18 @@ class TicketSource:
         except OSError as exc:
             raise TicketSourceError(
                 f"could not run {command} for {identity}: {exc}") from exc
+
+        after = self.default_principal()
+        if before != after:
+            # Refuse to carry on quietly: the operator's own ticket has just
+            # been replaced, every later login would run as the wrong identity,
+            # and no amount of retrying fixes a destroyed TGT.
+            raise TicketSourceError(
+                f"minting a ticket for {identity} replaced the default "
+                f"credential cache ({before!r} -> {after!r}). Refusing to use "
+                f"service identities. Run 'kinit {before or '<your principal>'}' "
+                f"to restore your own ticket, and report this -- "
+                f"get-kerberos-ticket is not honouring --cache.")
 
         if result.returncode != 0:
             detail = (result.stderr or result.stdout).decode("utf-8", "replace")
@@ -192,7 +239,8 @@ class TicketSource:
         if not cache.exists():
             raise TicketSourceError(
                 f"get-kerberos-ticket reported success for {identity} but wrote "
-                f"no credential cache at {cache}")
+                f"no credential cache at {cache}. The ticket went somewhere "
+                f"else -- check that kinit honours KRB5CCNAME={target}.")
         return ServiceTicket(identity=identity, cache=cache,
                              principal=self._principal_of(cache))
 
@@ -201,7 +249,7 @@ class TicketSource:
         """Read the principal back out of a credential cache, for the report."""
         try:
             result = subprocess.run(
-                ["klist"], env={**os.environ, "KRB5CCNAME": f"FILE:{cache}"},
+                ["klist"], env={**os.environ, "KRB5CCNAME": f"FILE:{cache}"},  # noqa: E501
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                 timeout=20, check=False)
         except (OSError, subprocess.SubprocessError):
