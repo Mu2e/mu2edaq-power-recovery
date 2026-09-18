@@ -14,6 +14,7 @@ import sys
 from typing import List, Optional, Sequence
 
 from .. import console
+from ..creds import KerberosManager
 from ..transport import LocalTransport, SSHFactory
 from ..transport.base import TransportError
 from ._common import add_common_arguments, bootstrap
@@ -48,6 +49,9 @@ examples
                         help="actually run this command and show the result")
     parser.add_argument("--timeout", type=int, metavar="SECONDS",
                         help="override the command timeout")
+    parser.add_argument("--no-chain", action="store_true",
+                        help="use only the ambient ticket, instead of the full "
+                             "credential chain a real run would try")
     return add_common_arguments(parser)
 
 
@@ -68,7 +72,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 2
 
     local = LocalTransport(default_timeout=settings.get("ssh.command_timeout", 120))
-    factory = SSHFactory(settings, topology, local=local)
+    # With the credential chain, because the point of this tool is to reproduce
+    # what a real run does. Without it the probe tests only the ambient ticket
+    # and ssh_config's login, which is how a probe can succeed against a host
+    # the actual run cannot reach -- exactly the confusion it exists to prevent.
+    kerberos = None if args.no_chain else KerberosManager(settings, local=local)
+    if kerberos is not None:
+        warning = kerberos.ambient_warning()
+        if warning:
+            print(f"  note: {warning}\n")
+    factory = SSHFactory(settings, topology, local=local, kerberos=kerberos)
     command = args.run or "true"
 
     rows: List[List[str]] = []
@@ -85,31 +98,45 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 result = transport.run(command, timeout=args.timeout)
                 entry.update({"rc": result.rc, "stdout": result.stdout.strip(),
                               "stderr": result.stderr.strip(),
+                              "credential": result.meta.get("credential"),
                               "duration": round(result.duration, 2)})
                 rows.append([node.short, transport.jump or "(direct)",
                              f"rc={result.rc}",
-                             (result.output.strip().splitlines() or [""])[0][:70]])
+                             result.meta.get("credential") or "ambient",
+                             (result.output.strip().splitlines() or [""])[0][:52]])
                 if not result.ok:
                     failures += 1
             except TransportError as exc:
-                entry.update({"rc": None, "error": str(exc)})
+                entry["rc"] = None
+                entry["error"] = str(exc)
+                entry["attempts"] = list(getattr(transport, "attempts", []))
                 rows.append([node.short, transport.jump or "(direct)", "ERROR",
-                             str(exc)[:70]])
+                             "-", str(exc)[:52]])
                 failures += 1
+                # Say which login/ticket pairs were refused and why, rather
+                # than one opaque error for the whole chain.
+                for attempt in entry["attempts"]:
+                    rows.append(["", "", f"  {attempt['reason']}",
+                                 attempt.get("credential", "?"),
+                                 (attempt.get("detail") or "")[:52]])
         else:
             rows.append([node.short, transport.jump or "(direct)", "",
                          entry["command"]])
+            for credential in getattr(transport, "credentials", []) or []:
+                rows.append(["", "", "", f"  would try: {credential.describe()}"])
         payload.append(entry)
 
     if args.json:
         print(json.dumps(payload, indent=2))
         return 1 if failures else 0
 
-    headers = ["NODE", "VIA", "RESULT", "OUTPUT"] if args.run \
+    headers = ["NODE", "VIA", "RESULT", "CREDENTIAL", "OUTPUT"] if args.run \
         else ["NODE", "VIA", "", "COMMAND"]
     print(console.table(rows, headers))
     if args.run:
-        print(f"\n  {len(rows) - failures}/{len(rows)} succeeded")
+        # Counted over nodes, not table rows: a failed node contributes extra
+        # rows describing each refused credential.
+        print(f"\n  {len(payload) - failures}/{len(payload)} succeeded")
     else:
         print("\n  nothing was run. Add --run COMMAND to execute.")
     return 1 if failures else 0

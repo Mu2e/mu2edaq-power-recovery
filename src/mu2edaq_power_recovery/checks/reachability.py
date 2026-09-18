@@ -95,6 +95,23 @@ def ssh_login(ctx: CheckContext) -> CheckResult:
             detail += "\n" + "\n".join(
                 f"  {a['credential']}: {a['reason']} -- {a['detail']}"
                 for a in attempts)
+
+        # A changed host key is not a login failure and must not be reported as
+        # one. After a power event it usually means the node was reimaged, and
+        # it needs verifying out of band before anyone updates known_hosts --
+        # the alternative reading is a machine-in-the-middle.
+        if any(a.get("reason") == "hostkey" for a in attempts):
+            return result(
+                ctx, "ssh.login", Status.FAIL,
+                "the host key has CHANGED -- ssh refused before authenticating",
+                detail + "\n\nNo credential can get past this. Either the node "
+                "was reimaged (common after an outage) or the connection is "
+                "being intercepted. Verify the new fingerprint out of band -- "
+                "from a gateway, 'ssh-keyscan <node>' -- before updating "
+                "~/.ssh/known_hosts.",
+                {"user": None, "attempts": attempts, "hostkey_changed": True},
+                started)
+
         return result(ctx, "ssh.login", Status.FAIL, "SSH login failed", detail,
                       {"user": None, "attempts": attempts}, started)
 

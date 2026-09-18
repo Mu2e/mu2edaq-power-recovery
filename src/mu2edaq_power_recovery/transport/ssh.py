@@ -92,6 +92,18 @@ _UNREACHABLE_PATTERNS = (
 )
 
 
+#: A changed host key. Its own category because no credential can fix it, and
+#: because after a power outage it usually means the node was reimaged -- which
+#: an operator needs told plainly, not buried as "login failed".
+_HOSTKEY_PATTERNS = (
+    "remote host identification has changed",
+    "host key verification failed",
+    "host key for",
+    "possible dns spoofing",
+    "man-in-the-middle",
+)
+
+
 def classify_ssh_failure(stderr: str) -> str:
     """'auth', 'unreachable' or 'unknown' for a failed ssh invocation.
 
@@ -105,6 +117,10 @@ def classify_ssh_failure(stderr: str) -> str:
     that might have worked because ssh phrased its complaint unexpectedly.
     """
     lowered = (stderr or "").lower()
+    # Host key first: it aborts before authentication, so any credential
+    # message further down the output is noise.
+    if any(pattern in lowered for pattern in _HOSTKEY_PATTERNS):
+        return "hostkey"
     if any(pattern in lowered for pattern in _UNREACHABLE_PATTERNS):
         return "unreachable"
     if any(pattern in lowered for pattern in _AUTH_FAILURE_PATTERNS):
@@ -283,9 +299,11 @@ class SSHTransport(Transport):
                     "reason": reason,
                     "detail": last_error,
                 })
-            if reason == "unreachable":
-                # The host is down. Another identity cannot change that, and
-                # each further attempt costs a full connect timeout.
+            if reason in ("unreachable", "hostkey"):
+                # Down, rate-limiting, or refusing on the host key. None of
+                # these is a credential problem, so the remaining identities
+                # would fail identically -- and each attempt costs a full
+                # connect timeout against a host already saying no.
                 break
             if credential is not None and index + 1 < len(chain):
                 log.debug("%s: %s refused (%s); trying the next identity",
