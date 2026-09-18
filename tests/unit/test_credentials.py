@@ -479,3 +479,69 @@ def test_a_clobbered_cache_disables_service_identities_for_the_run(manager):
     # ...and no further identity is attempted, because the damage is done.
     assert manager.settings.get("kerberos.use_service_keytabs") is False
     assert [c.name for c in manager.chain()] == ["general"]
+
+
+# ---------------------------------------------------------------------------
+# credential visibility -- what an operator needs to see when a login fails
+# ---------------------------------------------------------------------------
+
+
+def test_describe_names_the_login_the_ticket_and_the_cache():
+    """The login/ticket pair is what decides a GSSAPI login, and an ssh
+    "Permission denied (gssapi)" names neither."""
+    c = Credential(name="mu2edaq", login="mu2edaq", cache=Path("/tmp/cc"),
+                   principal="mu2edaq/mu2e@FNAL.GOV")
+    described = c.describe()
+    assert "mu2edaq" in described                  # the login
+    assert "mu2edaq/mu2e@FNAL.GOV" in described    # the ticket
+    assert "/tmp/cc" in described                  # where the ticket lives
+
+
+def test_describe_marks_the_ambient_cache():
+    c = Credential(name="general", login="anorman", principal="anorman@FNAL.GOV")
+    assert "ambient cache" in c.describe()
+
+
+def test_a_service_identity_in_the_default_cache_is_flagged(manager, monkeypatch):
+    """The failure mode that cost an evening.
+
+    On macOS the credential cache is a collection, and a service ticket minted
+    into it can become the default -- after which every login runs as that
+    identity and is refused, with nothing in the ssh error to say why.
+    """
+    monkeypatch.setattr(manager, "ambient_principal",
+                        lambda: "mu2eraw/mu2edaq/mu2e.fnal.gov@FNAL.GOV")
+    warning = manager.ambient_warning()
+    assert warning and "SERVICE identity" in warning
+    assert "kswitch" in warning, "must say how to fix it"
+
+
+def test_a_personal_principal_in_the_default_cache_is_not_flagged(manager,
+                                                                  monkeypatch):
+    monkeypatch.setattr(manager, "ambient_principal", lambda: "anorman@FNAL.GOV")
+    assert manager.ambient_warning() is None
+
+
+def test_a_mismatch_with_the_configured_principal_is_flagged(manager, monkeypatch):
+    monkeypatch.setattr(manager, "ambient_principal", lambda: "someoneelse@FNAL.GOV")
+    manager.settings.set("kerberos.principal", "anorman@FNAL.GOV")
+    warning = manager.ambient_warning()
+    assert warning and "someoneelse@FNAL.GOV" in warning
+
+
+def test_no_ambient_ticket_is_not_itself_a_warning(manager, monkeypatch):
+    # "No ticket at all" is caught by ensure(), with its own message.
+    monkeypatch.setattr(manager, "ambient_principal", lambda: None)
+    assert manager.ambient_warning() is None
+
+
+def test_refused_attempts_record_the_login_and_ticket(monkeypatch):
+    """A refused chain must say which pairs were tried, not just that it failed."""
+    local = ScriptedLocal(allow=set())
+    chain = [credential("general", "anorman"), credential("mu2edaq")]
+    t = SSHTransport("gw", credentials=chain, local=local)
+    with pytest.raises(SSHError):
+        t.run(["true"])
+    assert [a["login"] for a in t.attempts] == ["anorman", "mu2edaq"]
+    assert all(a["described"] for a in t.attempts), \
+        "each attempt must carry a human-readable login/ticket description"

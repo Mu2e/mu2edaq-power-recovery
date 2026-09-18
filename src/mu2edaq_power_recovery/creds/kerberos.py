@@ -93,6 +93,19 @@ class Credential:
     def __str__(self) -> str:
         return f"{self.name} ({self.principal or self.login or 'ambient'})"
 
+    def describe(self) -> str:
+        """One line naming the login, the ticket and where the ticket lives.
+
+        This is the pair that actually decides whether a login succeeds, and
+        the pair that is invisible in an ordinary ssh failure -- "Permission
+        denied (gssapi)" says nothing about which principal was offered to
+        which account.
+        """
+        login = self.login or "(ssh default)"
+        principal = self.principal or "(principal unknown)"
+        cache = f"FILE:{self.cache}" if self.cache else "ambient cache"
+        return f"login {login:<16} ticket {principal:<34} [{cache}]"
+
 
 @dataclass
 class TicketInfo:
@@ -443,6 +456,38 @@ class KerberosManager:
         """
         promoted = [i for i in self._successful if i in identities]
         return promoted + [i for i in identities if i not in promoted]
+
+    #: Principals that are service identities rather than a person. Used only
+    #: to warn: a run driven by one of these is almost always an accident.
+    SERVICE_PREFIXES = ("mu2edaq", "mu2eshift", "mu2edcs", "mu2edqm", "mu2eraw",
+                        "mu2e-controlroom", "mu2e-teststand")
+
+    def ambient_warning(self) -> Optional[str]:
+        """A warning when the default credential cache is not the operator's.
+
+        On macOS the credential cache is a *collection*, and a ticket minted
+        for a service identity can become its default -- so a later run picks
+        up that identity silently and every login is refused as the wrong
+        principal. That is unreadable from the ssh error alone, so say it
+        plainly before any connection is attempted.
+        """
+        ambient = self.ambient_principal()
+        if not ambient:
+            return None
+        configured = self.settings.get("kerberos.principal")
+        short = ambient.split("@")[0].split("/")[0]
+        if short in self.SERVICE_PREFIXES:
+            return (f"the default Kerberos cache holds the SERVICE identity "
+                    f"{ambient!r}, not a personal principal. Every login will "
+                    f"be attempted as that identity and will almost certainly "
+                    f"be refused.\n"
+                    f"    Fix it with:  kswitch -p <you>@FNAL.GOV   "
+                    f"(or kdestroy --all && kinit <you>@FNAL.GOV)")
+        if configured and ambient != configured:
+            return (f"the default Kerberos cache holds {ambient!r} but "
+                    f"kerberos.principal is {configured!r}; the run will use "
+                    f"the configured one.")
+        return None
 
     def restore_primary(self) -> Credential:
         """Return to the operator's own principal.

@@ -14,7 +14,7 @@ with the phase-0 self-update, the static report site, the logbook integration,
 the diagnostics utilities, the optional C/C++ probe library and its Python
 bindings, and the documentation set.
 
-271 automated tests pass, plus 7 C++ test groups and an end-to-end simulated
+278 automated tests pass, plus 7 C++ test groups and an end-to-end simulated
 four-phase run. **Nothing has yet been run against the real cluster** — the
 tests and the rehearsal deliberately contact nothing, so what is verified is
 the logic, not the environment. Two items remain open (§6): the MC-1 node list,
@@ -107,7 +107,7 @@ Every requirement from `Project-Description.md`, and where it is met.
 
 ## 4. Test matrix
 
-`pytest` — **271 passed**, no cluster, no credentials, no network.
+`pytest` — **278 passed**, no cluster, no credentials, no network.
 
 | Suite | Tests | Covers |
 |---|---|---|
@@ -118,7 +118,7 @@ Every requirement from `Project-Description.md`, and where it is met.
 | `unit/test_ipmi.py` | 39 | **Safety gates**, credentials, invocation shape, failure diagnosis |
 | `unit/test_state.py` | 8 | Round-trip, refusal auditing, append-not-overwrite |
 | `unit/test_vault.py` | 11 | KV path resolution, folder-vs-secret, synonyms, file fallback |
-| `unit/test_credentials.py` | 44 | Primary-first chains, root fallback, ssh-failure classification, KRB5CCNAME |
+| `unit/test_credentials.py` | 51 | Primary-first chains, root fallback, ssh-failure classification, KRB5CCNAME |
 | `unit/test_network_guard.py` | 1 | The suite's "contacts nothing" claim is enforced, not just asserted |
 | `unit/test_sweep.py` | 8 | Both backends, identical semantics |
 | `unit/test_selfupdate.py` | 13 | Dirty tree, divergence, fast-forward, re-exec guard |
@@ -209,7 +209,14 @@ Both remain configurable, and the synonym fallback is kept, because the secret
 is maintained outside this repository and could be re-keyed without anything
 here noticing until a recovery needs it. That is a fallback, not a doubt.
 
-### 6.2a BMC username case — **needs a config line**
+### 6.2a BMC username case — ✅ **resolved 2026-09-18**
+`mu2e-ipmi-tool --diagnose` against a live BMC returned `username 'MU2E',
+cipher suite 3` on the first attempt, reading `Chassis Power is on`. The Vault
+secret now returns `MU2E`, so `ipmi.username` stays null (take it from Vault)
+and no config change is needed. The `--diagnose` mode and the `ipmi.username`
+override remain for the next time the two disagree.
+
+### 6.2b (superseded) BMC username case — needs a config line
 The Vault secret's `username` field holds `mu2e`; the working upstream
 `mu2e_ipmi.sh` hard-codes `MU2E`, and IPMI usernames are case sensitive. A BMC
 therefore refuses the session with "Unable to establish IPMI v2 / RMCP+

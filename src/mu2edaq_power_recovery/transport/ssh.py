@@ -223,8 +223,18 @@ class SSHTransport(Transport):
             "jump": self.jump,
             "user": user or getattr(credential, "login", None) or self.user,
             "credential": getattr(credential, "name", None),
+            "principal": getattr(credential, "principal", None),
+            "cache": str(getattr(credential, "cache", "") or "ambient"),
             "via": "ssh",
         })
+        # The login/ticket pair is what decides whether this succeeds, and it
+        # is exactly what an ssh "Permission denied (gssapi)" does not tell
+        # you. Log it for every attempt.
+        described = (credential.describe() if hasattr(credential, "describe")
+                     else f"login {user or self.user or '(ssh default)'} "
+                          f"ticket (ambient)")
+        log.debug("%s: %s -> %s", self.host, described,
+                  "ok" if result.rc != SSH_FAILURE_RC else "refused")
         return result
 
     def run(self, command: Command, timeout: Optional[float] = None,
@@ -262,8 +272,16 @@ class SSHTransport(Transport):
             last_error = detail[-1] if detail else "connection error"
             reason = classify_ssh_failure(result.stderr)
             if credential is not None:
-                self.attempts.append({"credential": getattr(credential, "name", "?"),
-                                      "reason": reason, "detail": last_error})
+                self.attempts.append({
+                    "credential": getattr(credential, "name", "?"),
+                    "login": getattr(credential, "login", None),
+                    "principal": getattr(credential, "principal", None),
+                    "cache": str(getattr(credential, "cache", "") or "ambient"),
+                    "described": (credential.describe()
+                                  if hasattr(credential, "describe") else ""),
+                    "reason": reason,
+                    "detail": last_error,
+                })
             if reason == "unreachable":
                 # The host is down. Another identity cannot change that, and
                 # each further attempt costs a full connect timeout.
@@ -384,7 +402,17 @@ class SSHFactory:
                 # the one that opens the nodes behind it.
                 chosen = gw
                 break
-            log.warning("gateway %s did not answer ssh", gw)
+            # "did not answer ssh" is useless on its own: it covers a dark
+            # machine and a refused credential equally. Say which login/ticket
+            # pairs were tried and what each was refused for.
+            log.warning("gateway %s refused every credential:", gw)
+            for attempt in getattr(probe, "attempts", []) or []:
+                log.warning("    %s -- %s: %s",
+                            attempt.get("described") or attempt.get("credential"),
+                            attempt.get("reason"), attempt.get("detail"))
+            if not getattr(probe, "attempts", None):
+                log.warning("    (no credential chain configured; ssh used the "
+                            "ambient ticket and its own default login)")
         if chosen is None:
             log.error("no gateway answered for location %s", location)
         self._gateway_cache[location] = chosen
