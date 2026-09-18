@@ -14,7 +14,7 @@ with the phase-0 self-update, the static report site, the logbook integration,
 the diagnostics utilities, the optional C/C++ probe library and its Python
 bindings, and the documentation set.
 
-278 automated tests pass, plus 7 C++ test groups and an end-to-end simulated
+284 automated tests pass, plus 7 C++ test groups and an end-to-end simulated
 four-phase run. **Nothing has yet been run against the real cluster** — the
 tests and the rehearsal deliberately contact nothing, so what is verified is
 the logic, not the environment. Two items remain open (§6): the MC-1 node list,
@@ -107,7 +107,7 @@ Every requirement from `Project-Description.md`, and where it is met.
 
 ## 4. Test matrix
 
-`pytest` — **278 passed**, no cluster, no credentials, no network.
+`pytest` — **284 passed**, no cluster, no credentials, no network.
 
 | Suite | Tests | Covers |
 |---|---|---|
@@ -118,7 +118,7 @@ Every requirement from `Project-Description.md`, and where it is met.
 | `unit/test_ipmi.py` | 39 | **Safety gates**, credentials, invocation shape, failure diagnosis |
 | `unit/test_state.py` | 8 | Round-trip, refusal auditing, append-not-overwrite |
 | `unit/test_vault.py` | 11 | KV path resolution, folder-vs-secret, synonyms, file fallback |
-| `unit/test_credentials.py` | 51 | Primary-first chains, root fallback, ssh-failure classification, KRB5CCNAME |
+| `unit/test_credentials.py` | 50 | Primary-first chains, root fallback, ssh-failure classification, KRB5CCNAME |
 | `unit/test_network_guard.py` | 1 | The suite's "contacts nothing" claim is enforced, not just asserted |
 | `unit/test_sweep.py` | 8 | Both backends, identical semantics |
 | `unit/test_selfupdate.py` | 13 | Dirty tree, divergence, fast-forward, re-exec guard |
@@ -243,6 +243,32 @@ mu2egateway01 --run true` → `mu2e-ipmi-tool -n <one node> chassis power status
 --execute --until manager` on a maintenance day.
 
 ### 6.4 Fixed during development, worth knowing
+- **macOS keeps credential caches in a collection, and minting displaces the
+  default.** The earlier diagnosis ("the operator's ticket was destroyed") was
+  wrong: Heimdal never destroyed it. It keeps caches in an API: *collection*
+  and makes each newly minted cache the collection default, so the personal
+  ticket is displaced, not deleted — `klist -l` still listed it throughout, and
+  `kswitch -p <principal>` restores it instantly. The tool now records the
+  default before each mint and puts the pointer back after, aborting the whole
+  chain only if a restore fails.
+- **Heimdal ignores `KRB5CCNAME=FILE:` for kinit.** So the private cache file
+  we asked for never appeared and every service identity was rejected as
+  unusable. The ticket is perfectly good, it just has a ccache *name*
+  (`API:<uuid>`) rather than a path; the tool now looks it up in the collection
+  by identity and uses that name. All seven identities resolve on macOS.
+- **The login must NOT be derived from the principal.** Deriving it
+  (`anorman@FNAL.GOV` → `anorman`) was a wrong fix for a misdiagnosed symptom:
+  verified against the live cluster, `mu2edaq` and `root` both log in fine with
+  the personal ticket, while `anorman` is refused because no such account
+  exists on those hosts. ssh_config was right; the original failure was the
+  displaced ticket alone. Reverted, with the reasoning recorded in the code.
+- **A failed helper reported the wrong cause.** `get-kerberos-ticket` appends a
+  "Known identities:" listing after an error, so taking the last line of its
+  output reported `nova:` as the failure. `summarise_tool_error` now skips the
+  hint block and surfaces the real line — which immediately exposed that the
+  helper takes `python3` from the ambient PATH (the system Python, with no
+  hvac, unless a venv happens to be active). That interpreter is now pinned to
+  ours, which has hvac by construction.
 - **Service-identity minting destroyed the operator's Kerberos ticket.** Found
   on the first live run. macOS ships Heimdal, whose default cache type is
   `API:`; `get-kerberos-ticket` sets `KRB5CCNAME=<bare path>`, which Heimdal

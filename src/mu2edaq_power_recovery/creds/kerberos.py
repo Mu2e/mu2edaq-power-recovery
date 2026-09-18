@@ -21,7 +21,6 @@ which identity it runs under simply by which environment it is given.
 """
 from __future__ import annotations
 
-import getpass
 import logging
 import os
 import re
@@ -40,6 +39,18 @@ log = logging.getLogger(__name__)
 
 #: Sentinel for "not looked up yet", so a genuine None is cached too.
 _UNSET = object()
+
+#: Credential-cache types that KRB5CCNAME understands. A value already
+#: carrying one of these is a complete ccache name and must be passed through
+#: untouched -- on macOS a service ticket lands in the API: collection, not in
+#: a file, so assuming FILE: would point ssh at a path that does not exist.
+CCACHE_TYPES = ("FILE:", "API:", "DIR:", "KEYRING:", "KCM:", "MEMORY:")
+
+
+def ccache_name(cache: Any) -> str:
+    """The KRB5CCNAME value for *cache*, which may be a path or a ccache name."""
+    text = str(cache)
+    return text if text.startswith(CCACHE_TYPES) else f"FILE:{text}"
 
 
 class KerberosError(RuntimeError):
@@ -74,7 +85,7 @@ class Credential:
 
     def environ(self) -> Dict[str, str]:
         """Environment additions selecting this credential's cache."""
-        return {"KRB5CCNAME": f"FILE:{self.cache}"} if self.cache else {}
+        return {"KRB5CCNAME": ccache_name(self.cache)} if self.cache else {}
 
     def for_login(self, login: Optional[str]) -> "Credential":
         """This credential's ticket, used to log in as a different account.
@@ -103,7 +114,7 @@ class Credential:
         """
         login = self.login or "(ssh default)"
         principal = self.principal or "(principal unknown)"
-        cache = f"FILE:{self.cache}" if self.cache else "ambient cache"
+        cache = ccache_name(self.cache) if self.cache else "ambient cache"
         return f"login {login:<16} ticket {principal:<34} [{cache}]"
 
 
@@ -371,28 +382,24 @@ class KerberosManager:
     def operator_login(self) -> Optional[str]:
         """The account the operator's own principal logs in as.
 
-        Resolved explicitly rather than left to ssh, because the site
-        ssh_config legitimately sets ``User mu2edaq`` for the DAQ hosts. An
-        unqualified ssh then authenticates the *personal* ticket into the
-        *service* account and is refused -- which looks like "your ticket is
-        bad" and is nothing of the kind.
+        ``ssh.user`` when set, and otherwise **None** -- meaning "let ssh
+        decide", from ssh_config and then its own default of the local
+        username.
 
-        Order: an explicit ssh.user, else the first component of the configured
-        principal, else of whatever principal is in the ambient cache, else the
-        local username.
+        This deliberately does NOT derive the account from the principal. That
+        was tried, on the reasoning that ssh_config's ``User mu2edaq`` for the
+        DAQ hosts was sending the personal ticket into the service account. The
+        cluster disagrees: with a valid ``anorman@FNAL.GOV`` ticket, logging in
+        as ``mu2edaq`` succeeds (that account's ``.k5login`` authorises the
+        personal principal) and so does ``root``, while ``anorman`` is refused
+        because no such account exists there. Deriving the login broke every
+        host whose account name is not the principal's first component -- which
+        is all of them here.
+
+        The original symptom that prompted the derivation was the clobbered
+        credential cache, nothing to do with the login.
         """
-        configured = self.settings.get("ssh.user")
-        if configured:
-            return configured
-        principal = (self.settings.get("kerberos.principal")
-                     or self.ambient_principal())
-        if principal:
-            # anorman@FNAL.GOV -> anorman; anorman/root@FNAL.GOV -> anorman
-            return principal.split("@")[0].split("/")[0]
-        try:
-            return getpass.getuser()
-        except Exception:  # noqa: BLE001 - no controlling user; let ssh decide
-            return None
+        return self.settings.get("ssh.user")
 
     def ambient_principal(self) -> Optional[str]:
         """The principal in the operator's default credential cache."""
@@ -405,7 +412,10 @@ class KerberosManager:
         role = "root" if root else "general"
         principal = self.settings.get(
             "kerberos.root_principal" if root else "kerberos.principal")
-        if not principal and not root:
+        if not principal:
+            # No principal designated for this role, so the ambient ticket is
+            # what will actually authenticate -- name it, rather than printing
+            # "(principal unknown)" for the credential the run leads with.
             principal = self.ambient_principal()
         login = self.settings.get("ssh.root_user", "root") if root else \
             self.operator_login()
@@ -434,6 +444,11 @@ class KerberosManager:
             return chain
 
         for identity in self.order_chain(self.available_identities()):
+            if not self.settings.get("kerberos.use_service_keytabs", True):
+                # An earlier identity repointed the default cache and could not
+                # be put back. Stop the whole chain rather than working through
+                # the remaining six doing the same damage.
+                break
             credential = self.service_credential(identity)
             if credential is None:
                 continue
