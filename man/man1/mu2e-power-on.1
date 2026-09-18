@@ -1,4 +1,4 @@
-.TH MU2E-POWER-ON 1 "2026-09-17" "mu2edaq-power-recovery 0.1.0" "Mu2e DAQ Operations"
+.TH MU2E-POWER-ON 1 "2026-09-18" "mu2edaq-power-recovery 0.1.0" "Mu2e DAQ Operations"
 .SH NAME
 mu2e-power-on \- phase 2: bring the Mu2e DAQ cluster up in dependency order
 .SH SYNOPSIS
@@ -74,17 +74,30 @@ and
 .BR \-\-execute .
 The gateway stage never issues a power command at all; it verifies only.
 .PP
+All the BMCs share one credential set, so a refused BMC credential is not
+retried and not repeated: the first rejection stops the run issuing IPMI and
+produces one diagnosis naming the username that was refused, instead of walking
+the same wrong credential through every chassis and locking the account on
+each. Only a RAKP failure or
+.I "unauthorized name"
+counts;
+.I "Unable to establish IPMI v2 / RMCP+ session"
+does not, because that is also what a chassis with no standby power says, and
+after an outage that is the expected case. Set
+.I ipmi.stop_on_auth_failure: false
+to override.
+.PP
 Every attempt, including every refusal, is recorded in the run store before the
 command is issued, so a tool that dies mid-action still leaves evidence of what
 it was doing.
 .SH OPTIONS
-As
-.BR mu2e-power-recovery (1),
-with
-.B \-\-phase
-fixed to
+Every option of
+.BR mu2e-power-recovery (1)
+is accepted except
+.BR \-\-phase ,
+which is fixed to
 .BR poweron .
-The stage-selection options are specific to this phase:
+.SS Sequence control
 .TP
 .BI \-\-from " STAGE"
 Start at this stage. Use it to resume after fixing whatever stopped a previous
@@ -94,8 +107,142 @@ attempt.
 Stop after this stage. Useful for bringing up the infrastructure nodes and
 pausing before the detector readout.
 .TP
+.B "Spelling, for both of the above"
+A stage name that matches nothing is
+.I silently ignored,
+not rejected:
+.B \-\-from
+falls back to the first stage and
+.B \-\-until
+to the last. So
+.B "mu2e-power-on \-\-execute \-\-from manger"
+\(em one letter wrong \(em powers on the
+.I whole
+sequence, readout included, with no error and no note in the report. For a flag
+whose purpose is to bound what gets switched on, check the name took: the stage
+names are the
+.I name:
+keys in
+.BR mu2edaq-power-sequence.yaml (5)
+.RB ( gateways ", " manager ", " dataloggers ", " dcs ", " cfo ", " readout ),
+and a dry run without
+.B \-\-execute
+lists the stages it would act on.
+.TP
 .B \-\-continue\-on\-error
 Do not stop at the first stage that fails its requirement.
+.SS Run control
+.TP
+.BI \-\-label " TEXT"
+Label for this run, shown in the report header and the logbook subject.
+.TP
+.B \-\-execute
+Required for this phase to switch anything on. Without it nothing is issued.
+.TP
+.B \-\-simulate
+Contact nothing at all; answer every command from the built-in script. It
+overrides
+.B \-\-execute
+on the same command line, so a rehearsal cannot become a real power-on by
+leaving a flag behind.
+.TP
+.BI \-\-location " NAME"
+Repeatable. Accepted, but it does not narrow this phase: each stage in
+.BR mu2edaq-power-sequence.yaml (5)
+carries its own
+.I location:
+and its node list is expanded against that.
+.TP
+.BI \-\-node " HOST"
+Repeatable. Accepted, and likewise does not narrow this phase \(em stage
+membership comes from the sequence file, not from the command line. To bound
+what is powered on, use
+.BR \-\-from " and " \-\-until ,
+or edit the sequence file.
+.TP
+.B \-\-include\-failed
+Accepted; it governs phase 3 and has no effect here.
+.SS Credentials
+.TP
+.BI \-\-principal " PRINCIPAL"
+Kerberos principal for ordinary logins, used for the post-boot checks and for
+reaching the gateway that runs
+.BR ipmitool (1).
+.TP
+.BI \-\-root\-principal " PRINCIPAL"
+Kerberos principal with root access on the nodes, for the checks that need a
+root session.
+.TP
+.B \-\-no\-prompt
+Never prompt for a password; fail with instructions instead.
+.TP
+.BI \-\-vault\-addr " URL"
+HashiCorp Vault address. The BMC credentials come from it, so this phase cannot
+run without either Vault or the configured file fallback.
+.SS Report
+.TP
+.BI \-\-output\-dir " DIR"
+Where the report pages are written. Default:
+.IR html/ .
+.TP
+.B \-\-publish
+Copy the report to
+.I report.publish.target
+afterwards.
+.TP
+.BI \-\-publish\-target " DEST"
+Override the publication target. Implies
+.BR \-\-publish .
+.TP
+.B \-\-no\-report
+Do not write the HTML pages; console output only.
+.TP
+.B \-\-post\-ecl
+Accepted; the logbook entry is written by phase 4. See
+.BR mu2e-power-report (1).
+.TP
+.BI \-\-run\-id " N"
+Accepted; only phase 4 reads it.
+.SS General
+.TP
+.BR \-h ", " \-\-help
+Print the option summary and exit.
+.TP
+.B \-\-version
+Print
+.I mu2edaq-power-recovery 0.1.0
+and exit.
+.TP
+.BI \-\-config " FILE"
+Main configuration file. Default:
+.IR config/power-recovery.yaml .
+.TP
+.BI \-\-env\-file " FILE"
+Dotenv file. Default:
+.IR config/.env .
+.TP
+.BI \-\-database\-url " URL"
+SQLAlchemy URL for the run store.
+.TP
+.B \-\-no\-self\-update
+Skip the phase-0 check for a newer revision.
+.TP
+.B \-\-list\-checks
+Print every registered check and exit.
+.TP
+.B \-\-list\-nodes
+Print the node inventory and exit.
+.TP
+.B \-\-json
+Print the result as JSON on stdout instead of tables.
+.TP
+.BR \-v ", " \-\-verbose
+Debug logging, including the exact
+.B ipmitool
+invocation and one line per credential attempted.
+.TP
+.BR \-q ", " \-\-quiet
+Warnings and errors only.
 .SH EXIT STATUS
 .TP
 .B 0
@@ -127,10 +274,18 @@ Resume at the DCS stage after repairing it:
 mu2e-power-on \-\-execute \-\-from dcs
 .EE
 .RE
+.PP
+Rehearse the sequence with nothing attached:
+.RS
+.EX
+mu2e-power-on \-\-simulate \-v
+.EE
+.RE
 .SH SEE ALSO
 .BR mu2e-power-recovery (1),
 .BR mu2e-power-state (1),
 .BR mu2e-ipmi-tool (1),
+.BR mu2e-vault-ipmi (1),
 .BR mu2edaq-power-sequence.yaml (5),
 .BR mu2edaq-topology.yaml (5)
 .SH AUTHOR

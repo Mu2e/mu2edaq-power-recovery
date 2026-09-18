@@ -1,4 +1,4 @@
-.TH MU2E-SSH-PROBE 1 "2026-09-17" "mu2edaq-power-recovery 0.1.0" "Mu2e DAQ Operations"
+.TH MU2E-SSH-PROBE 1 "2026-09-18" "mu2edaq-power-recovery 0.1.0" "Mu2e DAQ Operations"
 .SH NAME
 mu2e-ssh-probe \- show, or run, the exact ssh command the recovery tools use
 .SH SYNOPSIS
@@ -9,25 +9,119 @@ mu2e-ssh-probe \- show, or run, the exact ssh command the recovery tools use
 .RB [ \-\-root ]
 .RB [ \-\-run
 .IR COMMAND ]
+.RB [ \-\-no\-chain ]
+.RI [ options ]
 .SH DESCRIPTION
 When a check reports that a node could not be reached, the next question is
-always what command was actually issued, and through which gateway. This prints
-that command verbatim so it can be pasted into a shell and debugged by hand,
-and with
+always what command was actually issued, through which gateway, and with which
+credential. This prints that command verbatim so it can be pasted into a shell
+and debugged by hand, and with
 .B \-\-run
 executes it and shows what came back.
+.PP
+.B "Without \-\-run nothing is executed and no connection is opened."
+The tool prints the argument vector and the credentials it would try, reports
+that nothing was run, and exits 0 \(em whether or not the host would have
+answered. A bare invocation is therefore useless as a test of access: use
+.B \-\-run true
+whenever the question is whether a login succeeds.
 .PP
 It builds the command through the same code path the phases use \(em the same
 jump-host selection, the same
 .B ssh
 options, the same root login \(em so what it prints is what a real run does.
+.SH THE CREDENTIAL CHAIN
+By default the probe builds the
+.I full
+credential chain a real run would try, not just whatever ticket happens to be
+in the operator's shell. That distinction is the reason the tool exists in its
+present form: with only the ambient ticket, a probe can succeed against a host
+the real run cannot reach, which is exactly the confusion it is meant to
+prevent.
+.PP
+The chain is ordered. The operator's own principal is always at its head, for
+root sessions as much as for ordinary ones. Only if a host refuses that are the
+Mu2e service identities tried \(em
+.IR mu2edaq " and " mu2eshift
+first, then the remaining identities from Vault. A root session keeps the
+.B root
+login and varies only the ticket, because a node's
+.I root/.k5login
+can authorise
+.IR mu2edaq ;
+.I kerberos.root_fallback
+turns that off.
+.PP
+The login name is taken from
+.IR ssh.user " (or " ssh.root_user
+for a root session) for the operator's own credential and for every root
+credential, and is not derived from the principal. The non-root service
+fallbacks are the exception: each carries its own login equal to its identity,
+so an ordinary-session fallback logs in as
+.IR mu2edaq ", " mu2eshift
+and so on whatever
+.I ssh.user
+says. That is deliberate \(em it is the account the service identity owns \(em
+but it means the login can change as the chain advances.
+.PP
+The chain it builds is the same
+.I list
+a run builds, but the
+.I tickets
+are not the same. The probe never calls the run's Kerberos preparation step, so
+it mints nothing: the operator credential it reports carries the principal named
+by
+.I kerberos.principal
+while pointing at the
+.B ambient
+credential cache, and the service identities are listed rather than acquired. A
+real run kinits each principal into a cache private to the run and hands
+.BR ssh (1)
+a
+.B KRB5CCNAME
+for it. So a line reading
+.B "ticket you@FNAL.GOV [ambient cache]"
+names the configured principal, not necessarily the one actually in the default
+cache \(em confirm that with
+.BR klist (1),
+or
+.B klist \-l
+on macOS. There is no option to make the probe mint a ticket.
+.PP
+Without
+.BR \-\-run ,
+each node's row is followed by the credentials that
+.I would
+be tried, in order. With
+.BR \-\-run ,
+the
+.B CREDENTIAL
+column names the one that actually got in. When every credential is refused,
+each login and ticket pair is listed with its own reason rather than collapsed
+into one error for the whole chain.
+.PP
+Before any connection is attempted the probe checks the default credential
+cache and warns when it holds a service identity instead of a personal
+principal \(em on macOS, where Heimdal makes each newly minted cache the
+collection default, that is the usual residue of an earlier run. The warning
+carries the
+.B "kswitch \-p"
+line that restores the operator's own ticket.
+.PP
+A changed host key is reported as its own failure rather than as a refused
+login, and it stops the chain at the first attempt: no identity gets past it.
+Verify the new fingerprint out of band \(em from a gateway,
+.BI "ssh\-keyscan " node
+\(em before updating
+.IR ~/.ssh/known_hosts .
 .SH OPTIONS
 .TP
 .I HOST
-Nodes to probe, short or fully qualified. Repeatable.
+Nodes to probe, short or fully qualified. Repeatable. Name at least one, or use
+.BR \-c .
 .TP
 .BI \-c " CLASS" "\fR, \fP" \-\-class " CLASS"
-Probe every node of this host class.
+Probe every node of this host class. Repeatable.
 .TP
 .BI \-l " NAME" "\fR, \fP" \-\-location " NAME"
 Location to resolve names in.
@@ -43,10 +137,36 @@ Actually run this command and show the result. Without it, nothing is executed.
 .BI \-\-timeout " SECONDS"
 Override the command timeout.
 .TP
+.B \-\-no\-chain
+Use only the ambient ticket and the login
+.BR ssh_config (5)
+would choose, instead of the credential chain a real run would try. Use it to
+answer the narrower question "does my own ticket reach this host", and to
+confirm that a difference between the probe and a run is the chain rather than
+the network.
+.TP
+.BI \-\-config " FILE"
+Main configuration file. Default:
+.IR config/power-recovery.yaml .
+.TP
+.BI \-\-env\-file " FILE"
+Dotenv file. Default:
+.IR config/.env .
+.TP
 .B \-\-json
-Emit the argument vectors and results as JSON.
+Emit the argument vectors and results as JSON, including, for a failure, the
+list of attempts with the login, principal and cache of each.
+.TP
+.BR \-v ", " \-\-verbose
+Debug logging, including one line per credential attempted.
+.TP
+.BR \-q ", " \-\-quiet
+Warnings and errors only.
+.TP
+.BR \-h ", " \-\-help
+Print the option summary and exit.
 .SH EXAMPLES
-What would be run, without running it:
+What would be run, and with which credentials, without running it:
 .RS
 .EX
 mu2e-ssh-probe mu2e-trk-03
@@ -66,6 +186,15 @@ Confirm every tracker node answers at all:
 mu2e-ssh-probe \-c tracker \-\-run true
 .EE
 .RE
+.PP
+Does the run's chain get in where the operator's own ticket does not, or the
+other way round?
+.RS
+.EX
+mu2e-ssh-probe mu2egateway01 \-\-run true
+mu2e-ssh-probe mu2egateway01 \-\-run true \-\-no\-chain
+.EE
+.RE
 .SH EXIT STATUS
 .TP
 .B 0
@@ -78,8 +207,10 @@ At least one node failed.
 No node was named.
 .SH SEE ALSO
 .BR mu2e-power-recovery (1),
+.BR mu2e-power-state (1),
 .BR mu2e-node-inventory (1),
 .BR ssh (1),
-.BR ssh_config (5)
+.BR ssh_config (5),
+.BR kinit (1)
 .SH AUTHOR
 A. Norman <anorman@fnal.gov>, Mu2e DAQ Operations.

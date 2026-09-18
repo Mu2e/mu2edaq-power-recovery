@@ -160,15 +160,49 @@ if(Python3_Interpreter_FOUND)
       WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
       COMMENT "Bootstrapping the mu2edaq-power-recovery virtual environment")
     add_custom_target(venv ALL DEPENDS "${VENV_PY}")
+    set(VENV_TARGET venv)
+  else()
+    set(VENV_TARGET "")
+  endif()
 
+  # The Python targets and tests need ${VENV_PY} to *exist*; they do not need
+  # this build to have created it.  Registering them only under BOOTSTRAP_VENV
+  # was wrong in exactly the case that matters: bootstrap.sh and bootstrap.ps1
+  # make the venv themselves and then configure this tree with
+  # -DBOOTSTRAP_VENV=OFF, so the only build tree an operator actually creates
+  # was the one with no 'docs' target and no docs-check -- the drift check was
+  # absent from the tree it was written to guard.  Register them whenever the
+  # interpreter will be there: either this build makes it, or it is on disk
+  # already.  A tree configured with OFF against no venv still skips them,
+  # rather than registering tests that cannot run.
+  if(BOOTSTRAP_VENV OR EXISTS "${VENV_PY}")
     add_custom_target(pytest
       COMMAND "${VENV_PY}" -m pytest -q
       WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-      DEPENDS venv
+      DEPENDS ${VENV_TARGET}
       COMMENT "Running the pytest suite")
+
+    # The check reference in the section-7 page is generated from the live
+    # check registry.  `cmake --build build --target docs` rewrites it; the
+    # docs-check test below fails the suite if the committed page has drifted
+    # away from the code, which is what happened when the table was produced
+    # by a throwaway script nobody kept.
+    add_custom_target(docs
+      COMMAND "${VENV_PY}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/generate-docs.py"
+              --write
+      WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+      DEPENDS ${VENV_TARGET}
+      COMMENT "Regenerating the generated man page sections")
 
     if(BUILD_TESTING)
       add_test(NAME pytest COMMAND "${VENV_PY}" -m pytest -q
+               WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+      # Documentation drift: the generated section against the registry, a man
+      # page for every console script, a man5 entry for every configuration
+      # key, and no groff warnings anywhere.
+      add_test(NAME docs-check
+               COMMAND "${VENV_PY}"
+                       "${CMAKE_CURRENT_SOURCE_DIR}/tools/generate-docs.py" --check
                WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
       # A simulated end-to-end run: proves the four phases, the check bodies and
       # the report generator all still work together, with no cluster attached.
@@ -178,6 +212,11 @@ if(Python3_Interpreter_FOUND)
                        --output-dir "${CMAKE_CURRENT_BINARY_DIR}/report-test"
                WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
     endif()
+  else()
+    message(STATUS "mu2edaq-power-recovery: no venv at ${VENV_PY} and "
+                   "BOOTSTRAP_VENV=OFF -- skipping the docs/pytest targets and "
+                   "the Python ctest entries. Run ./bootstrap.sh and "
+                   "re-configure to get them.")
   endif()
 endif()
 

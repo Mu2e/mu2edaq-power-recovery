@@ -1,4 +1,4 @@
-.TH MU2E-PROBE 1 "2026-09-17" "mu2edaq-power-recovery 0.1.0" "Mu2e DAQ Operations"
+.TH MU2E-PROBE 1 "2026-09-18" "mu2edaq-power-recovery 0.1.0" "Mu2e DAQ Operations"
 .SH NAME
 mu2e-probe \- parallel TCP reachability sweep of DAQ hosts
 .SH SYNOPSIS
@@ -28,17 +28,33 @@ which is also what
 .BR mu2e-power-recovery (1)
 uses to choose a responsive gateway quickly. The library is optional; when it
 is not built, the Python tools fall back to their own implementation and this
-command is simply not installed.
+command is simply absent. It is not a Python console script: build it with
+.RS
+.EX
+\&./bootstrap.sh \-\-with\-cpp
+.EE
+.RE
+which leaves the binary at
+.IR build/mu2e-probe .
 .SH OPTIONS
 .TP
 .BI \-p " PORT" "\fR, \fP" \-\-port " PORT"
-TCP port to probe. Default: 22. Use 623 for a BMC's RMCP port.
+TCP port to probe. Default: 22. 623 reaches a BMC, but note the limitation: IPMI
+RMCP+ is a UDP protocol, and this command only ever opens a TCP connection, so
+a sweep of port 623 says whether the BMC has a TCP listener there \(em not
+whether it will answer an IPMI session. For that question use
+.BR mu2e-ipmi-tool (1)
+with
+.BR "chassis power status" .
 .TP
 .BI \-t " MS" "\fR, \fP" \-\-timeout " MS"
 Per-host connect budget in milliseconds. Default: 2000.
 .TP
 .BI \-j " N" "\fR, \fP" \-\-threads " N"
-Worker threads. Default: the hardware thread count, via OpenMP.
+Worker threads. Default: the hardware thread count, via OpenMP. In a build
+without OpenMP the sweep is serial and this option is ignored;
+.B \-\-version
+says which build this is.
 .TP
 .BR \-r ", " \-\-resolve\-only
 Resolve names and stop; do not connect.
@@ -51,6 +67,26 @@ Print nothing; use the exit status.
 .TP
 .B \-\-version
 Print the library version, and whether it was built with OpenMP.
+.TP
+.BR \-h ", " \-\-help
+Print the usage summary and exit.
+.SH ENVIRONMENT
+This command is a C++ binary and reads none of the project's configuration: no
+YAML file, no
+.IR .env ,
+no
+.B MU2E_POWER_RECOVERY_*
+variable. It takes its hosts from the command line or standard input and
+nothing else, and it does not know the topology, so pipe
+.BR mu2e-node-inventory (1)
+into it when you want a named set of hosts.
+.PP
+.B OMP_NUM_THREADS
+is honoured in an OpenMP build, because without
+.B \-j
+the worker count is left to OpenMP;
+.B \-j
+overrides it. Neither has any effect in a serial build.
 .SH EXIT STATUS
 .TP
 .B 0

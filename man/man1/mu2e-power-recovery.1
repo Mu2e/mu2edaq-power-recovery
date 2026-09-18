@@ -1,4 +1,4 @@
-.TH MU2E-POWER-RECOVERY 1 "2026-09-17" "mu2edaq-power-recovery 0.1.0" "Mu2e DAQ Operations"
+.TH MU2E-POWER-RECOVERY 1 "2026-09-18" "mu2edaq-power-recovery 0.1.0" "Mu2e DAQ Operations"
 .SH NAME
 mu2e-power-recovery \- assess, power on, verify and report on the Mu2e DAQ clusters after a power outage
 .SH SYNOPSIS
@@ -46,10 +46,14 @@ healthy while the DAQ cannot move data.
 The consolidated narrative, assembled from the stored run and optionally posted
 to the electronic logbook. It probes nothing and can be re-run at any time.
 .PP
-Before any phase, the tool checks its GitHub remote for a newer revision,
-fast-forwards if it is behind, rebuilds if the pull touched a build input, and
-restarts itself. It then prints the version, revision and configuration digest
-in force. See
+Before any phase, a run that will contact the cluster checks its GitHub remote
+for a newer revision, fast-forwards if it is behind, rebuilds if the pull
+touched a build input, and restarts itself. It then prints the version,
+revision and configuration digest in force.
+.B \-\-simulate
+and
+.B \-\-list\-checks
+skip the check. See
 .B PHASE 0
 below.
 .SH OPTIONS
@@ -92,7 +96,11 @@ both accepted, as is a name that is not in the inventory.
 .TP
 .B \-\-continue\-on\-error
 In phase 2, carry on to the next stage even when a stage does not meet its
-requirement.
+requirement. Under
+.B \-\-phase all
+it also keeps the run going into the later phases after
+.BR assess " or " poweron
+has failed, which is otherwise where it stops.
 .TP
 .BI \-\-from " STAGE" ", " \-\-until " STAGE"
 Start and stop the power-on sequence at these stage names, inclusive. Use
@@ -146,11 +154,69 @@ can authorise.
 .I kerberos.root_fallback
 turns that off.
 .IP
+The login name and the ticket are independent. The login comes from
+.IR ssh.user " and " ssh.root_user ;
+it is never derived from the principal. On these nodes
+.IR mu2edaq " and " root
+are the accounts that exist, and both are entered with the operator's own
+ticket \(em an account named after the operator generally is not present.
+.IP
 Only an authentication failure advances the chain: a refused connection or a
 timeout stops it, because a host that is down refuses every identity equally
 and each attempt costs a full connect timeout. The report records which
 identity opened each node. Nothing mutates the default credential cache or the
 process environment.
+.IP
+A working credential is remembered per host, but only among the fallbacks: the
+operator's own principal stays at the head of the chain for every host and is
+never displaced by something that worked earlier.
+.TP
+.B credential caches
+Tickets the run mints for service identities go into caches private to the run,
+which are destroyed when it ends. On macOS the Kerberos implementation is
+Heimdal, where a credential cache is a
+.I collection
+and each newly minted cache becomes the collection's default \(em so minting a
+service ticket
+.I displaces
+the operator's personal ticket rather than destroying it. The tools record the
+default cache's principal before every mint and restore the pointer after it,
+and the service chain is abandoned outright if a restore actually fails, rather
+than leaving the operator's shell pointing at a service identity.
+.IP
+The guard is best-effort, not a precondition. When the default cache reports no
+principal at all the guard cannot be taken, and the mint proceeds
+.I unguarded
+\(em a debug line says so, and the restore afterwards is skipped because there
+is no principal to restore. That is the one case where a mint can displace a
+default this tool will not put back.
+.IP
+A Heimdal cache has a
+.I name
+.RI ( API : uuid )
+rather than a path, and Heimdal ignores
+.B KRB5CCNAME=FILE:
+for
+.BR kinit (1),
+so the identity is looked up in the collection and the name found there is what
+the session is given. Caches are destroyed by name with
+.BR kdestroy (1)
+.BR \-c ,
+and a file cache whose path is not inside the run's own temporary directory is
+refused rather than destroyed.
+.IP
+Before any connection is attempted the run inspects the default cache. When it
+holds a service identity instead of a personal principal \(em usually the
+residue of an earlier interrupted run \(em the run
+.I warns
+and prints the line that fixes it. It is a warning only: the run continues into
+every phase, so act on it rather than expecting to be stopped. The line is
+.B "kswitch \-p"
+.IR you @FNAL.GOV,
+or
+.B "kdestroy \-\-all"
+followed by a fresh
+.BR kinit (1).
 .TP
 .BI \-\-vault\-addr " URL"
 HashiCorp Vault address. Default:
@@ -186,6 +252,21 @@ Operate on an existing run rather than starting a new one. Used with
 to regenerate or repost an earlier run's report.
 .SS General
 .TP
+.BR \-h ", " \-\-help
+Print the option summary, the worked examples and the exit status table, and
+exit.
+.TP
+.B \-\-version
+Print
+.I mu2edaq-power-recovery 0.1.0
+and exit. The same flag is accepted by
+.BR mu2e-power-state (1),
+.BR mu2e-power-on (1),
+.BR mu2e-power-netcheck (1)
+and
+.BR mu2e-power-report (1);
+they all report the package version, not a per-command one.
+.TP
 .BI \-\-config " FILE"
 Main configuration file. Default:
 .IR config/power-recovery.yaml .
@@ -219,24 +300,80 @@ Debug logging.
 .BR \-q ", " \-\-quiet
 Warnings and errors only.
 .SH PHASE 0
-Every invocation begins by checking
+A run that will contact the cluster begins by checking
 .I origin
-for a newer revision. The update is
+for a newer revision.
+.B \-\-simulate
+skips it, so a rehearsal cannot change the code it is rehearsing, and
+.B \-\-list\-checks
+returns before this phase is reached.
+.B \-\-list\-nodes
+does run it. The update is
 .I fast-forward only:
 if the working tree has local modifications, or the local branch has commits
 the remote does not, the tool says so and runs the code that is checked out
 rather than reconciling anything itself. A fetch that fails or times out is a
 warning, never a stop. When an update is applied, the process re-executes once
 so the new code is actually the code that runs.
+.SH DIAGNOSING A REFUSED LOGIN
+The primary login and ticket are logged before anything is attempted, and each
+attempt is logged at debug level in the form
+.I "login X ticket Y [cache Z] \-> ok/refused"
+\(em so a run that got in nowhere still says which identities it actually
+offered. A gateway that refuses every credential lists each login/ticket pair
+with its reason, rather than reporting only that the gateway did not answer,
+and the refused pairs are recorded in the run store, so the report carries
+them. Use
+.B \-v
+to see them as the run proceeds, and
+.BR mu2e-ssh-probe (1)
+to reproduce one by hand.
+.PP
+A
+.I changed host key
+is classified as its own kind of failure, not as an authentication failure, and
+it stops the credential chain at the first attempt: no identity can get past
+it, so offering the rest would only spend time. The
+.I ssh.login
+check reports that the host key has changed and that ssh refused before
+authenticating. After an outage the usual cause is that the node was reimaged;
+the alternative reading is an intercepted connection, so verify the new
+fingerprint out of band \(em from a gateway,
+.BI "ssh\-keyscan " node
+\(em before anything updates
+.IR ~/.ssh/known_hosts .
+.PP
+A refused connection, a connection reset, a
+.I kex_exchange_identification
+failure or "too many authentication failures" are read as
+.IR unreachable ,
+not as a credential problem: they are what a host that is down or rate-limiting
+says, and they stop the chain for the same reason. Only an authentication
+failure advances it. Once
+.I ssh.login
+has been refused, the remaining SSH checks for that node are skipped rather
+than each opening its own connection to be refused again.
 .SH SAFETY
 .TP
 .B Dry run by default
-Power commands require both
-.I run.dry_run: false
-(or
-.BR \-\-execute )
-and a non-simulated run. Two independent gates, so a configuration edit alone
-cannot arm the destructive path.
+No power command is issued while
+.I run.dry_run
+is true, which is the default.
+.B \-\-execute
+is the supported way to set it false, but it is not a separate gate:
+.I run.dry_run
+is an ordinary configuration key, so setting it false in
+.IR config/power\-recovery.yaml ", " config/.env
+or as
+.B MU2E_POWER_RECOVERY_RUN_DRY_RUN=false
+arms the destructive path with no flag on the command line. The run says which
+it is \(em
+.B "LIVE RUN \-\- power commands WILL be issued."
+\(em before the first phase.
+.B \-\-simulate
+is the gate no configuration file can open: it forces
+.I run.dry_run
+back to true whatever else was asked for.
 .TP
 .B Protected hosts
 .BR "chassis power off" ", " cycle " and " reset
@@ -250,6 +387,32 @@ recovering, or stop the NFS server everything else mounts from. The list is
 in
 .BR mu2edaq-topology.yaml (5).
 .TP
+.B A simulated run contacts nothing
+Under
+.B \-\-simulate
+the SSH factory, the IPMI client
+.I and
+the local shell are all answered from the built-in script, so a check that
+falls back to running a command locally \(em the gateways' own ICMP probe, for
+one \(em cannot reach a real machine either. The publisher refuses before any
+other test and reports that the report was written locally but nothing was
+published: the publish step copies the tree directly rather than through a
+transport, so scripting the transports would not have covered it.
+.TP
+.B One refused BMC credential stops IPMI
+All the BMCs share a single credential set, so the first rejection settles the
+matter. The run stops issuing IPMI commands and reports one diagnosis naming
+the username that was refused and how to find the right one, instead of
+walking the same wrong credential through all forty-five BMCs and locking the
+account on each. Only a RAKP failure or
+.I "unauthorized name"
+counts as a rejection;
+.I "Unable to establish IPMI v2 / RMCP+ session"
+deliberately does not, because a dark chassis says exactly that and after an
+outage a dark chassis is the expected case. Set
+.I ipmi.stop_on_auth_failure: false
+to carry on regardless.
+.TP
 .B Credentials
 BMC passwords are read from Vault and delivered to the gateway on standard
 input, never as a command-line argument, so they appear in no process table on
@@ -260,6 +423,21 @@ on standard input and are not retained.
 .B Audit trail
 Every state-changing attempt, including every refusal, is written to the run
 store before the command is issued.
+.SH NOTES
+The driver need not run on Linux. Where a probe's syntax differs by platform it
+is chosen for the host that will actually execute it, not for the host the
+operator is sitting at: iputils
+.BR ping (8)
+reads
+.B \-W
+as seconds, BSD
+.B ping
+reads it as milliseconds, and Windows spells the pair
+.BR \-n / \-w .
+Driving a recovery from a Mac therefore does not silently reduce a five-second
+per-packet wait to five milliseconds, which would report a healthy gateway as
+answering no ICMP. The jumbo-frame probe is the exception: it uses iputils-only
+options, and only phase 3 asks for it, which always runs on a gateway.
 .SH FILES
 .TP
 .I config/power-recovery.yaml
@@ -304,6 +482,27 @@ are honoured in their conventional form.
 Priority, lowest first: built-in defaults, the YAML config file,
 .IR config/.env ,
 the environment, the command line.
+.PP
+Three further variables are read directly rather than as configuration keys:
+.TP
+.B NO_COLOR
+When set to any non-empty value, output is not coloured, whatever the terminal
+is.
+.TP
+.B FORCE_COLOR
+When set, output is coloured even when stdout is not a terminal \(em for
+capturing a coloured transcript into a file or a pipe.
+.B NO_COLOR
+wins if both are set.
+.TP
+.B MU2E_POWER_RECOVERY_UPDATED
+Set to
+.B 1
+by phase 0 across its re-execution, so the new process does not check for
+updates again. It exists to make an update loop impossible and is not intended
+to be set by hand. Setting it does skip the check, like
+.BR \-\-no\-self\-update ,
+but the run reports it as having already updated rather than as disabled.
 .SH EXIT STATUS
 .TP
 .B 0

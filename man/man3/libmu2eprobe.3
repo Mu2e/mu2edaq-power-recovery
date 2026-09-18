@@ -1,4 +1,4 @@
-.TH LIBMU2EPROBE 3 "2026-09-17" "mu2edaq-power-recovery 0.1.0" "Mu2e DAQ Operations"
+.TH LIBMU2EPROBE 3 "2026-09-18" "mu2edaq-power-recovery 0.1.0" "Mu2e DAQ Operations"
 .SH NAME
 libmu2eprobe \- parallel TCP reachability probing for the Mu2e DAQ recovery tools
 .SH SYNOPSIS
@@ -6,8 +6,15 @@ libmu2eprobe \- parallel TCP reachability probing for the Mu2e DAQ recovery tool
 .B #include <mu2eprobe/probe.hpp>   /* C++ */
 .B #include <mu2eprobe/probe.h>     /* C   */
 .PP
-.B cc ... \-lmu2eprobe
+.B c++ ... \-lmu2eprobe
+.PP
+.B cc  ... \-lmu2eprobe \-lstdc++
 .fi
+.PP
+The implementation is C++, so a C caller must pull in the C++ runtime as well;
+linking with
+.BR c++ (1)
+does it automatically.
 .SH DESCRIPTION
 .B libmu2eprobe
 answers one question quickly: of these hosts, which are up? Phase 1 of a
@@ -55,17 +62,55 @@ int threads = 0;         /* 0 = the OpenMP default              */
 bool resolve_only = false;
 .fi
 .RE
+.IP
+.I port
+0 and
+.I timeout_ms
+at or below 0 select 22 and 2000 rather than being used as written, so a
+zero-initialised
+.B Options
+behaves like a default-constructed one.
+.I threads
+is ignored entirely when the library was built without OpenMP; the sweep is
+then serial and
+.B has_openmp()
+says so.
+.IP
+.I resolve_only
+stops after
+.BR getaddrinfo (3)
+and reports a name that resolved as
+.BR Outcome::Open .
+It is
+.I not
+evidence the host is up: with this set,
+.B reachable()
+means "the name resolved".
 .SS Functions
 .TP
-.BI "Result mu2eprobe::probe_one(const std::string& " host ", const Options& " options );
+.BI "Result mu2eprobe::probe_one(const std::string& " host ", const Options& " options " = {});"
 Probe one host. Never throws; failures are reported in the
 .BR Result .
+Every address
+.BR getaddrinfo (3)
+returns for the name is tried in turn, so a host with both an A and a AAAA
+record is only
+.B Timeout
+when neither answered.
 .TP
-.BI "std::vector<Result> mu2eprobe::probe_many(const std::vector<std::string>& " hosts ", const Options& " options );
+.BI "std::vector<Result> mu2eprobe::probe_many(const std::vector<std::string>& " hosts ", const Options& " options " = {});"
 Probe many hosts in parallel. Results are returned
 .I in input order
 regardless of completion order, because the caller's node list is ordered
 meaningfully and should not have to be re-sorted.
+.IP
+Name resolution is serialised behind a mutex while the connects are not:
+.BR getaddrinfo (3)
+is not thread-safe on every libc in every configuration, and the resolver
+caches each name after the first lookup, so the lock costs little. A sweep of
+.I N
+hosts therefore costs about one timeout, not
+.IR N .
 .TP
 .BI "std::vector<std::string> mu2eprobe::reachable_hosts(const std::vector<Result>& " results );
 The hosts that answered, in input order.
@@ -75,6 +120,48 @@ The hosts that answered, in input order.
 .B bool mu2eprobe::has_openmp();
 Library version, and whether parallelism is actually compiled in.
 .SH C INTERFACE
+.SS Types
+.TP
+.B mu2e_probe_options_t
+.RS
+.nf
+uint16_t port;      /* TCP port; 0 selects 22               */
+int timeout_ms;     /* per-host budget; 0 selects 2000      */
+int threads;        /* 0 = OpenMP default                   */
+int resolve_only;   /* non-zero: stop after name resolution */
+.fi
+.RE
+.IP
+A
+.B NULL
+options pointer means the defaults, so a caller with nothing to change need not
+build one.
+.BR mu2e_probe_default_options ()
+fills a struct with the same values for a caller that wants to change one of
+them.
+.TP
+.B mu2e_probe_result_t
+.RS
+.nf
+char host[256];
+char address[64];   /* empty when unresolved                */
+uint16_t port;
+int outcome;        /* MU2E_PROBE_*                         */
+double elapsed_ms;
+char detail[128];   /* errno text for MU2E_PROBE_ERROR      */
+.fi
+.RE
+.IP
+The strings are fixed-size buffers inside the struct, always NUL-terminated,
+truncated rather than reallocated if a name or an error text does not fit.
+Nothing is ever freed by the caller. There is no
+.I reachable
+member: test
+.I outcome
+against
+.BR MU2E_PROBE_OPEN " and " MU2E_PROBE_REFUSED ,
+which are the two that mean the host answered.
+.SS Functions
 .nf
 .BI "void mu2e_probe_default_options(mu2e_probe_options_t* " options );
 .BI "int  mu2e_probe_one(const char* " host ", const mu2e_probe_options_t* " options ,
@@ -90,31 +177,111 @@ Library version, and whether parallelism is actually compiled in.
 .B mu2e_probe_one
 returns the outcome code
 .RB ( MU2E_PROBE_OPEN ", " MU2E_PROBE_REFUSED ", " MU2E_PROBE_TIMEOUT ,
-.BR MU2E_PROBE_UNRESOLVED ", " MU2E_PROBE_ERROR ).
+.BR MU2E_PROBE_UNRESOLVED ", " MU2E_PROBE_ERROR ,
+numerically 0 to 4) and fills
+.IR out ,
+which may be
+.BR NULL .
+A
+.B NULL
+.I host
+is
+.B MU2E_PROBE_ERROR
+and fills nothing.
+.PP
 .B mu2e_probe_many
-returns the number of hosts that answered, or \-1 on a bad argument; the caller
-supplies the results array, and the strings inside each result are fixed-size
-buffers, so nothing is ever freed by the caller.
+returns the number of hosts that answered, or
+.B \-1
+when
+.I hosts
+or
+.I results
+is
+.BR NULL .
+The caller supplies the
+.I results
+array and it must hold at least
+.I count
+entries; there is no way to ask how many were written, so size it from
+.I count
+rather than from the return value. A
+.B NULL
+entry inside
+.I hosts
+is
+.I not
+skipped: it is passed to
+.BR getaddrinfo (3)
+as an empty name, which most resolvers map to the loopback address, so it is
+probed as the local machine and can come back
+.B refused
+and be counted as reachable. Filter empty names before calling.
+.PP
+.BR mu2e_probe_outcome_name ()
+returns
+.BR open ", " refused ", " timeout ", " unresolved " or " error ,
+and
+.B error
+for any code it does not recognise. These are the same strings
+.B Result::outcome_name()
+returns, which is what makes the C and C++ output comparable.
 .PP
 All functions are safe to call from multiple threads.
 .B mu2e_probe_many
-runs its own parallelism internally.
+runs its own parallelism internally, so there is no reason to call it from
+several threads at once.
 .SH PYTHON INTERFACE
-When the pybind11 extension is built, the same sweep is available as:
+When the pybind11 extension is built:
 .RS
 .EX
 import mu2eprobe
-results = mu2eprobe.probe_many(hosts, port=22, timeout_ms=2000)
-up = [r.host for r in results if r.reachable]
+
+results = mu2eprobe.probe_many(hosts, port=22, timeout_ms=2000, threads=0)
+one     = mu2eprobe.probe_one(host, port=22, timeout_ms=2000)
+up      = mu2eprobe.reachable_hosts(results)
 mu2eprobe.has_openmp()
+mu2eprobe.__version__
 .EE
 .RE
 .PP
-The GIL is released for the duration of a sweep. The recovery tools do not
-import this directly \(em they use
-.I mu2edaq_power_recovery.sweep,
+A
+.B Result
+carries
+.IR host ", " address ", " port ", " outcome ", " elapsed_ms " and " detail ,
+plus
+.IR reachable " and " outcome_name ,
+which are
+.I properties
+here although
+.B outcome_name()
+is a method in C++.
+.I outcome
+is a
+.B mu2eprobe.Outcome
+.RB ( OPEN ", " REFUSED ", " TIMEOUT ", " UNRESOLVED ", " ERROR ),
+not the string.
+.PP
+Two limitations of the binding, not of the library:
+.B Options
+is exposed but no module function accepts one \(em the sweeps take keyword
+arguments \(em and there is consequently no way to reach
+.I resolve_only
+from Python. There is no
+.B version()
+function either; the version is
+.BR __version__ .
+.PP
+The GIL is released for the duration of a sweep, which is the point of the
+extension. The recovery tools do not import this directly \(em they use
+.IR mu2edaq_power_recovery.sweep ,
 which uses the extension when it is present and a thread-pool implementation
-with identical semantics when it is not.
+over
+.BR socket (7)
+when it is not, so a missing extension changes the speed of a sweep and nothing
+else.
+.I sweep.BACKEND
+names the one in use, and the report records it, so a timing difference between
+two runs has an explanation.
 .SH EXAMPLES
 .RS
 .EX
@@ -144,7 +311,21 @@ cmake \-\-install build \-\-prefix /usr/local
 .B \-DBUILD_BINDINGS=OFF
 skips the Python extension;
 .B \-DBUILD_PROBE=OFF
-skips the library entirely.
+skips both the library and
+.BR mu2e-probe (1).
+Neither is on the critical path for a recovery: the Python fallback covers the
+sweep either way.
+.PP
+The library builds static by default, as CMake does;
+.B \-DBUILD_SHARED_LIBS=ON
+gives a shared one, versioned from the project version. OpenMP is looked for
+with
+.B find_package(OpenMP QUIET)
+and its absence is a configure-time message, not an error \(em check the
+.B mu2eprobe:
+line in the cmake output, or call
+.BR has_openmp ()
+at run time.
 .SH SEE ALSO
 .BR mu2e-probe (1),
 .BR mu2e-power-recovery (1),

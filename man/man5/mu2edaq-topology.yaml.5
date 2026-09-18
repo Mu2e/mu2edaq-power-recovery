@@ -1,4 +1,4 @@
-.TH MU2EDAQ-TOPOLOGY.YAML 5 "2026-09-17" "mu2edaq-power-recovery 0.1.0" "File Formats"
+.TH MU2EDAQ-TOPOLOGY.YAML 5 "2026-09-18" "mu2edaq-power-recovery 0.1.0" "File Formats"
 .SH NAME
 topology.yaml \- Mu2e DAQ node inventory for the power-recovery tools
 .SH SYNOPSIS
@@ -43,15 +43,35 @@ Ordered list of
 mappings. The first regular expression matching a host's short name assigns its
 class; a host matching nothing lands in
 .BR other .
-Classes select check profiles and group the report tables.
+Classes group the report tables and select a check profile.
+.IP
+The shipped classes are
+.BR gateway ", " manager ", " datalogger ", " dcs ", " cfo ", " tracker ,
+.BR calorimeter ", " crv ", " stm ", " extmon ", " worker " and " teststand .
+A class is only used to pick a profile when
+.BR mu2edaq-checks.yaml (5)
+defines a profile of the same name; the detector classes do not have one, so in
+phase 1 they fall back to the
+.B other
+profile and it is phase 2 that applies
+.B readout
+to them, through the stage's
+.I checks
+key. Adding a class here without adding a profile of the same name is
+therefore silently a no-op for phase 1.
 .TP
 .I locations
 The sites, described below.
 .SH LOCATIONS
 Each location holds:
 .TP
-.IR label ", " description
-Human names used in the report.
+.I label
+Short human name, used as the heading of the location's report tables. It
+falls back to the upper-cased location key when absent.
+.TP
+.I description
+Longer human name. Recorded for the reader of this file only \(em nothing
+reads it.
 .TP
 .I aliases
 Alternative spellings accepted on the command line. The teststand accepts
@@ -73,7 +93,32 @@ naming \(em it looks for an address in the expected subnet, not for
 .IR eno1 .
 .TP
 .I networks
-Network name to entry list.
+Network name to entry list: which hosts are on each network, under the name
+used for that network's
+.I subnets
+entry.
+.IP
+Two of the names are not IP networks.
+.B pcie
+is a card inventory \(em membership means "this host carries a DTC or CFO
+card", and
+.IR pcie.devices " and " pcie.driver
+report
+.B skip
+on a host that is not in it rather than failing. The teststand's
+.B ctrl
+network has no
+.I subnets
+entry, and a network with no CIDR recorded is not interface-checked.
+.IP
+.I net.interfaces
+looks only at networks the node is in
+.I and
+for which a CIDR is recorded, and skips
+.BR ipmi " and " pcie
+in any case: a BMC address does not belong to the host's own stack, and
+.B pcie
+is not an address at all.
 .SH ENTRY SYNTAX
 Each entry in a network's list is either a fully-qualified hostname, used
 verbatim, or a mapping describing a run of numbered hosts:
@@ -103,29 +148,64 @@ is kept out of a list.
 printf-style format for the number. Default
 .BR %02d .
 .SH THE CURRENT INVENTORY
+65 hosts across three locations, as shipped.
+.BR "mu2e-node-inventory \-\-json"
+prints what this file actually expands to, which is the only answer that
+cannot go stale.
 .TP
 .B mc2
-MC-2, the primary DAQ room. Lab 131.225.245.0/24, data 10.226.9.0/24, IPMI
-192.168.157.0/24. Gateways
+MC-2, the primary DAQ room. Gateways
 .IR mu2egateway01 " and " mu2egateway02 .
+Subnets: lab 131.225.245.0/24, data 10.226.9.0/24, IPMI 192.168.157.0/24, mgmt
+131.225.245.0/24. 48 hosts, on five networks: lab 48, data 42, ipmi 37, pcie
+36, mgmt 5.
+.IP
+The lists are not parallel, and must not be assumed to be. The
+.B ipmi
+list excludes tracker chassis 5\(en8, 10 and 13 and calorimeter chassis 8\(en10
+and 12, which have no BMC entry; the
+.B data
+list omits the gateways, the manager and the DCS hosts altogether; the
+.B pcie
+list starts the STM range at 2, because only
+.I mu2e-stm-02
+carries a card; and
+.I mu2e-dcs-03
+appears on
+.BR lab " and " mgmt
+only. A host on the lab network therefore does not necessarily have a BMC this
+tool can reach, or a card for
+.I pcie.devices
+to look for.
 .TP
 .B mc1
 MC-1.
-.B Its node list is empty.
+.B Both of its node lists are empty.
 MC-1 is not carried in the upstream
 .I nodes_config.yaml,
-so no inventory could be imported. Its lab subnet (131.225.246.0/24) and the
-absence of a data network are recorded. Add hostnames to
+so no inventory could be imported. What is recorded is its lab subnet
+(131.225.246.0/24), the IPMI subnet it shares with MC-2 (192.168.157.0/24), the
+absence of a data network, and the two MC-2 gateways, which is how it is
+reached until it has its own. Add hostnames to
 .I locations.mc1.networks
 and every phase picks MC-1 up with no code change; until then the tools report
 it as having no nodes configured rather than as healthy.
 .TP
 .B teststand
-The Helen Edwards Engineering Center (HEERC) test stand. Lab 131.225.237.0/24,
-data 10.226.9.0/24, IPMI 192.168.150.0/24. Hosts are
+The Helen Edwards Engineering Center (HEERC) test stand, also accepted as
+.BR heerc .
+Gateway
+.IR mu2edaq-gateway .
+Subnets: lab 131.225.237.0/24, data 10.226.9.0/24, IPMI 192.168.150.0/24.
+Networks:
+.BR ctrl ", " lab ", " ipmi ", " data " and " pcie .
+Hosts are
 .IR mu2edaqNN ,
-with three overlapping exclusion sets \(em decommissioned nodes, nodes outside
-the HEERC cluster, and nodes with no DTC card \(em applied per network.
+with three overlapping exclusion sets \(em decommissioned or offline nodes
+(1, 3, 5, 6, 12, 15\(en17), nodes present but outside the HEERC cluster
+(2, 8, 9, 18\(en21, 23, 24), and nodes with no DTC card (13, 14) \(em combined
+differently per network. 17 hosts, counting the gateway: lab 17, pcie 14, ctrl
+8, ipmi 8, data 7.
 .SH EXAMPLES
 Add a tracker node and its interfaces:
 .RS
@@ -152,6 +232,7 @@ mu2e-node-inventory \-l mc2 \-c tracker
 .SH SEE ALSO
 .BR mu2e-node-inventory (1),
 .BR mu2e-power-recovery (1),
-.BR mu2edaq-power-sequence.yaml (5)
+.BR mu2edaq-power-sequence.yaml (5),
+.BR mu2edaq-checks.yaml (5)
 .SH AUTHOR
 A. Norman <anorman@fnal.gov>, Mu2e DAQ Operations.

@@ -21,8 +21,18 @@ Direct to the gateways; everything else through one with
 .BR ssh 's
 .B \-J
 ProxyJump. Authentication is Kerberos/GSSAPI with delegation, so the ticket
-that opened the gateway session authenticates the second hop. There is no
-password path.
+that opened the gateway session authenticates the second hop. There is no SSH
+password path; a password, when one is asked for at all, is for
+.BR kinit (1).
+A changed host key is classified separately from an authentication failure and
+stops the attempt at once rather than advancing to the next credential \(em no
+credential can get past it. After an outage the usual cause is a reimaged node,
+but the alternative reading is an intercepted connection, so the new
+fingerprint has to be verified out of band, with
+.B ssh\-keyscan
+run from a gateway, before
+.I known_hosts
+is touched.
 .TP
 .B IPMI
 .BR ipmitool (1)
@@ -33,16 +43,49 @@ This is also what the requirements ask for \(em IPMI commands issued from
 gateway01 or gateway02.
 .TP
 .B Credentials
-Kerberos tickets are minted into private credential caches and destroyed when
-the run ends. No single identity can log in to every node, so each host is
-tried against an ordered chain: the operator's own principal, then the Mu2e
-service identities \(em
+No single identity can log in to every node, so each host is tried against an
+ordered chain. The operator's own principal is always first, for root sessions
+as much as ordinary ones; then the Mu2e service identities \(em
 .IR mu2edaq ", " mu2eshift
 and the rest \(em whose tickets the
 .B mu2edaq-kerberos
 package mints from keytabs in Vault. Only an authentication failure advances
-the chain; an unreachable host stops it. BMC credentials come from HashiCorp
-Vault at
+the chain; an unreachable host, or a changed host key, stops it. A credential
+that works is remembered for that host, but only among the fallbacks: the
+operator's own principal is never displaced from the head of the chain.
+.IP
+Root sessions fall back too. What varies is the ticket, not the login: the root
+login stays
+.I root
+and a node's
+.I root/.k5login
+may well authorise
+.IR mu2edaq .
+Set
+.I kerberos.root_fallback
+false to try the root principal alone. The login is taken from the SSH
+configuration and is never derived from the principal \(em
+.I mu2edaq
+and
+.I root
+both log in with the operator's personal ticket, and an account named after
+the operator's principal does not exist on those hosts.
+.TP
+.B Credential caches
+Tickets are minted into caches private to the run and destroyed when it ends.
+On MIT Kerberos that is a file under the run's own temporary directory. On
+Heimdal \(em macOS \(em it is an entry in an
+.B API:
+collection, and each newly minted cache becomes the collection's default, so
+minting a service ticket displaces the operator's personal one rather than
+destroying it. The run records the default before each mint and restores the
+pointer afterwards; the service chain is abandoned only if a restore actually
+fails. A run that starts with a service identity already in the default cache
+says so and prints the
+.BR kswitch / kdestroy
+line that puts it right.
+.IP
+BMC credentials come from HashiCorp Vault at
 .I td/scd/experiments/mu2e/ipmi/config
 and are delivered to the gateway on standard input, so they appear in no
 process table on either host.
@@ -109,6 +152,26 @@ Every state-changing attempt, including every refusal, is written to the run
 store before the command is issued.
 .IP \(bu 2
 The gateway stage of phase 2 never issues a power command at all.
+.IP \(bu 2
+A simulated run contacts nothing: the SSH factory, the IPMI client
+.I and
+the workstation's own local transport are scripted, and the publisher refuses
+to copy the report anywhere, reporting
+.I "simulated run: the report was written locally but nothing was published."
+The publisher needs a refusal of its own because it copies with the filesystem
+rather than through a transport, so scripting the transports does not reach it.
+.IP \(bu 2
+The first IPMI credential rejection stops IPMI for the rest of the run. All the
+BMCs share one credential set, so the first refusal settles the matter, and
+repeating it only walks the BMC accounts towards lockout; the run reports one
+diagnosis naming the username that was refused. Only an RAKP failure or an
+.I "unauthorized name"
+counts.
+.I "Unable to establish IPMI v2 / RMCP+ session"
+deliberately does not: that is what a dark chassis says, and after an outage a
+dark chassis is the expected case. Set
+.I ipmi.stop_on_auth_failure
+false to carry on regardless.
 .SH REPORTS
 Each phase writes a static HTML page and a JSON companion into
 .I html/
@@ -117,12 +180,57 @@ Re-running a phase refreshes its page in place; each run is also archived under
 .IR html/runs/<id>/ .
 The pages are overview, initial state, power on, network, detailed report, run
 history, about, API and site map.
+.SH ENVIRONMENT
+.TP
+.BI MU2E_POWER_RECOVERY_ PATH
+Any configuration key, upper-cased with dots replaced by underscores:
+.B MU2E_POWER_RECOVERY_SSH_CONNECT_TIMEOUT
+sets
+.IR ssh.connect_timeout .
+Nothing has to be registered for this to work, so a key added to the YAML is
+immediately overridable. See
+.BR mu2edaq-power-recovery.yaml (5).
+.TP
+.B VAULT_ADDR
+Accepted in its conventional form as an alias for
+.IR vault.addr ,
+because the
+.BR vault (1)
+CLI and hvac already honour it.
+.TP
+.B NO_COLOR
+Set to anything: no ANSI colour, even on a terminal.
+.TP
+.B FORCE_COLOR
+Set to anything: colour even when the output is not a terminal, for a log that
+renders escapes.
+.B NO_COLOR
+wins if both are set.
+.TP
+.B MU2E_POWER_RECOVERY_UPDATED
+Set to
+.B 1
+by phase 0 across the re-exec that follows a self-update, so the restarted
+process does not check for updates again. It is documented because it is
+visible in the environment of everything the run starts, and because a process
+inheriting it skips phase 0 exactly as
+.B \-\-no\-self\-update
+does \(em which is a surprise if it was not meant. It is not the spelling an
+operator should reach for.
 .SH CHECK REFERENCE
 The checks below are registered by their dotted id and selected by profile in
 .BR mu2edaq-checks.yaml (5).
 Ids marked
 .B [root]
 need a root session.
+.PP
+This list is generated from the registry by
+.I tools/generate-docs.py
+.RB ( mu2edaq-generate-docs (1))
+and is verified against it by the test suite, so a check added to the code
+without a description here fails the build rather than going unmentioned.
+.\" BEGIN GENERATED CHECK REFERENCE
+.\" Generated by tools/generate-docs.py -- do not edit by hand.
 .TP
 .B disk.errors [root]
 no storage errors in the kernel log since boot
@@ -198,6 +306,7 @@ the NFS exports are published
 .TP
 .B svc.running
 the expected daemons are running
+.\" END GENERATED CHECK REFERENCE
 .SH FILES
 .TP
 .I config/
@@ -222,6 +331,7 @@ Rotating log.
 .BR mu2e-ssh-probe (1),
 .BR mu2e-vault-ipmi (1),
 .BR mu2e-probe (1),
+.BR mu2edaq-generate-docs (1),
 .BR libmu2eprobe (3),
 .BR mu2edaq-power-recovery.yaml (5),
 .BR mu2edaq-topology.yaml (5),

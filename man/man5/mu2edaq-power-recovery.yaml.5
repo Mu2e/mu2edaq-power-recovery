@@ -1,4 +1,4 @@
-.TH MU2EDAQ-POWER-RECOVERY.YAML 5 "2026-09-17" "mu2edaq-power-recovery 0.1.0" "File Formats"
+.TH MU2EDAQ-POWER-RECOVERY.YAML 5 "2026-09-18" "mu2edaq-power-recovery 0.1.0" "File Formats"
 .SH NAME
 power-recovery.yaml \- main configuration for the Mu2e DAQ power-recovery tools
 .SH SYNOPSIS
@@ -20,14 +20,84 @@ this file;
 the process environment;
 .IP 5. 4
 the command line.
-.PP
+.SS Environment names
 The environment-variable spelling of any key is mechanical:
 .BI MU2E_POWER_RECOVERY_ PATH
-with the dotted path upper-cased and dots replaced by underscores. A key added
-to this file is immediately overridable from the environment with no code
-change.
+with the dotted path upper-cased and dots replaced by underscores, so
+.I report.publish.target
+is
+.BR MU2E_POWER_RECOVERY_REPORT_PUBLISH_TARGET .
+A key added to this file is immediately overridable from the environment with
+no code change. A variable naming a key no section below defines is applied
+anyway, as a string: an operator running an older checkout against a newer
+.I .env
+is told nothing is wrong, rather than being stranded.
+.PP
 .B VAULT_ADDR
-is also honoured in its conventional form.
+is also honoured, overriding
+.IR vault.addr ,
+because it is the name the
+.BR vault (1)
+CLI and
+.I hvac
+already use.
+.B VAULT_TOKEN
+is read directly by the Vault client (see
+.I vault.auto_login
+below) and is not a settings key.
+.SS The .env file
+One
+.IR KEY = VALUE
+per line. Blank lines and lines beginning with
+.B #
+are ignored, a leading
+.B export
+is stripped, and a value wrapped in matching single or double quotes is
+unquoted. No interpolation is performed, deliberately: a password containing
+.B $
+must survive the round trip intact. Only
+.BI MU2E_POWER_RECOVERY_ PATH
+names are consumed from it.
+.SS Value types
+A value arriving from
+.I .env
+or the environment is a string, and is coerced to the type the key already
+holds:
+.IP \(bu 3
+boolean:
+.BR 1 ", " true ", " yes ", " on
+and
+.BR 0 ", " false ", " no ", " off ,
+case-insensitively; anything else is an error naming the key;
+.IP \(bu 3
+integer and floating point: as written, or an error;
+.IP \(bu 3
+list: comma-separated, with surrounding whitespace stripped, so
+.B MU2E_POWER_RECOVERY_TOPOLOGY_LOCATIONS=mc2,mc1
+is a two-element list and an empty string is an empty list;
+.IP \(bu 3
+a key whose current value is
+.B null
+has no type to coerce to, so the string is passed through unchanged.
+.PP
+A list written in this file
+.I replaces
+the built-in default rather than extending it. That applies to every list key,
+not just
+.IR ssh.options :
+an operator who writes a list means "these", not "these as well as whatever
+was already there".
+.SS What is recorded
+The whole effective configuration \(em after every layer has been applied \(em
+is written into the run record and into the report, so a run can be explained
+months later without guessing which file was in place. Before it is written,
+any value whose key ends in
+.BR pass ", " passwd ", " password ", " token ", " secret " or " key
+is replaced by
+.BR <redacted> ,
+rather than dropped, so the report still shows that a credential was
+configured. Nothing else is filtered: a secret put under a key not matching
+that pattern will appear in the report and in the logbook entry.
 .SH SECTIONS
 .SS run
 .TP
@@ -37,10 +107,27 @@ Label for the recovery, shown in the report and the logbook subject.
 .I dry_run
 Default
 .BR true .
-When true, no power command is issued.
+While true, no power command is issued.
 .B \-\-execute
-sets it false. It is one of two independent gates \(em a simulated run cannot
-be armed at all \(em so a config edit alone cannot enable the destructive path.
+sets it false \(em but it is
+.I not
+a second, independent gate. This is an ordinary configuration key, so setting it
+false here, in
+.IR config/.env ,
+or as
+.B MU2E_POWER_RECOVERY_RUN_DRY_RUN=false
+arms the destructive path on its own, with no flag on the command line. Nothing
+re-checks that
+.B \-\-execute
+was given. The run prints
+.B "LIVE RUN \-\- power commands WILL be issued."
+when it is armed.
+.IP
+.B \-\-simulate
+is the gate no configuration file can open: it forces this key back to true
+whatever else was asked for, including
+.B \-\-execute
+on the same command line.
 .TP
 .I stop_on_stage_failure
 Default
@@ -48,7 +135,13 @@ Default
 Stop phase 2 at the first stage that does not meet its requirement.
 .TP
 .I phase_timeout
-Wall-clock budget for one phase, in seconds. 0 disables.
+Intended wall-clock budget for one phase, in seconds; 0 disables.
+.B Not currently enforced:
+the value is read from the file and carried in the run record, but no phase
+consults it. The effective bounds on a run are the per-command ones,
+.I ssh.command_timeout
+and
+.IR ipmi.timeout .
 .TP
 .IR from_stage ", " until_stage
 Default stage range for phase 2; normally set with
@@ -92,8 +185,28 @@ revision.
 .IR user ", " root_user
 Logins for ordinary and root sessions.
 .I user
-null means
-.BR $USER .
+null means no
+.IB login @
+prefix is put on the ssh command line at all, leaving the choice to
+.BR ssh_config (5)
+and then to ssh's own default of the local username. On the DAQ hosts that is
+what supplies
+.BR mu2edaq ,
+and it is why this is left null.
+.IP
+The login is deliberately
+.I not
+derived from the Kerberos principal. That was tried and reverted: with a valid
+personal ticket, logging in as
+.B mu2edaq
+or
+.B root
+succeeds because those accounts'
+.I .k5login
+files authorise the personal principal, while an account named after the
+principal does not exist on those hosts. Set this only to pin a login that
+.BR ssh_config (5)
+gets wrong.
 .TP
 .I proxy
 Jump host.
@@ -120,12 +233,14 @@ Maximum simultaneous SSH sessions across the run.
 .SS ipmi
 .TP
 .I execute_on
-Where
+Records where
 .BR ipmitool (1)
 runs.
-.B gateway
-is the only supported value, and is required: the IPMI subnets are not routable
-from off site.
+.B Not currently consulted:
+ipmitool is always run on a gateway, because the IPMI subnets
+(192.168.157.0/24, 192.168.150.0/24) are not routable from off site. Changing
+this value has no effect; it is here so the intent is visible in the file and
+in the run record.
 .TP
 .I username
 BMC username. Null takes it from the Vault secret's
@@ -146,7 +261,15 @@ Some BMCs need
 rather than 3.
 .TP
 .IR timeout ", " retries
-Per-command budget, and how many times this tool re-runs the whole invocation.
+Per-command budget in seconds, and how many times this tool re-runs the whole
+invocation after a failure (so
+.I retries: 2
+means up to three attempts). The gateway-side
+.BR timeout (1)
+wrapper is set to
+.RI 3x timeout ,
+at least 20 s, deliberately longer than one exchange: it is there to stop a
+wedged invocation, and must not itself cut ipmitool's own retries short.
 .TP
 .IR message_timeout ", " tool_retries
 ipmitool's own
@@ -281,7 +404,25 @@ run.
 .I auto_login
 Run
 .B vault login \-method=ldap
-when no usable token is cached.
+when no usable token is cached. A token is looked for first in
+.BR VAULT_TOKEN ,
+then in
+.IR ~/.vault-token .
+The CLI is shelled out to rather than reimplemented: it is what the site
+documents and it already handles the MFA prompt. Set this false for an
+unattended run, which then fails with the
+.B vault login
+line to run by hand.
+.TP
+.I timeout
+Seconds allowed for one HTTPS request to Vault. Default
+.BR 30 .
+This does
+.I not
+bound the interactive
+.BR "vault login" ,
+which is allowed five minutes because a human has to answer an MFA prompt
+inside it.
 .SS database
 .TP
 .I url
@@ -306,7 +447,30 @@ How many archived runs to keep under
 .IR enabled ", " method
 .RB ( rsync ", " scp ", " copy ", " none ),
 .IR target ", " options .
-Publication failure is never fatal: the report on disk is the artefact.
+.I options
+is passed verbatim to
+.BR rsync (1)
+or
+.BR scp (1)
+and ignored by
+.BR copy ,
+which is a local
+.BR cp (1)-equivalent
+for a target that is a mounted web area.
+.IP
+Publication failure is never fatal: the report on disk is the artefact, and a
+site-wide power event is a plausible reason for the web host to be unreachable.
+An unknown
+.I method
+is reported the same way rather than guessing.
+.IP
+A simulated run
+.RB ( \-\-simulate )
+never publishes, whatever this section says, and gives that as its reason. The
+.B copy
+method writes with the local filesystem directly rather than through the
+scripted transport, so a rehearsal would otherwise overwrite the live web area
+with rehearsal output.
 .SS ecl
 .TP
 .I enabled
@@ -327,10 +491,19 @@ Attach the generated pages to the entry.
 .IR level ", " file
 Console level and the rotating log file.
 .TP
-.IR capture_command_output ", " max_capture_bytes
-Whether to keep remote command output in the run store, and how much per
-command. It is large, and it is the evidence trail the logbook entry is built
-from.
+.I capture_command_output
+Intended switch for keeping remote command output in the run store.
+.B Not currently consulted:
+output is captured either way. Turn the volume down with
+.I max_capture_bytes
+instead.
+.TP
+.I max_capture_bytes
+How much of one command's output is kept, in bytes. Default
+.BR 65536 .
+Output beyond it is dropped at the transport, before it reaches the run store.
+This is the evidence trail the report and the logbook entry are built from, so
+lowering it costs detail in the report, not just disk.
 .SH EXAMPLES
 Override one setting for a single run, without editing anything:
 .RS

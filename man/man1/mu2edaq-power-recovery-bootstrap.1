@@ -1,6 +1,8 @@
-.TH MU2EDAQ-POWER-RECOVERY-BOOTSTRAP 1 "2026-09-17" "mu2edaq-power-recovery 0.1.0" "Mu2e DAQ Operations"
+.TH MU2EDAQ-POWER-RECOVERY-BOOTSTRAP 1 "2026-09-18" "mu2edaq-power-recovery 0.1.0" "Mu2e DAQ Operations"
 .SH NAME
-bootstrap.sh, bootstrap.ps1, start-mu2edaq-power-recovery.sh, stop-mu2edaq-power-recovery.sh \- set up and control a recovery run
+bootstrap.sh, bootstrap.ps1, start-mu2edaq-power-recovery.sh,
+start-mu2edaq-power-recovery.ps1, stop-mu2edaq-power-recovery.sh,
+stop-mu2edaq-power-recovery.ps1 \- set up and control a recovery run
 .SH SYNOPSIS
 .B ./bootstrap.sh
 .RB [ \-\-with\-cpp ]
@@ -11,9 +13,18 @@ bootstrap.sh, bootstrap.ps1, start-mu2edaq-power-recovery.sh, stop-mu2edaq-power
 .B ./start-mu2edaq-power-recovery.sh
 .RI [ options ...]
 .br
+.B ./start-mu2edaq-power-recovery.ps1
+.RI [ options ...]
+.br
 .B ./stop-mu2edaq-power-recovery.sh
 .RB [ \-\-force ]
 .RB [ \-\-status ]
+.br
+.B ./stop-mu2edaq-power-recovery.ps1
+.RB [ \-Force ]
+.RB [ \-Status ]
+.RB [ \-Grace
+.IR SECONDS ]
 .SH DESCRIPTION
 .SS bootstrap.sh, bootstrap.ps1
 Creates or refreshes the project's Python virtual environment in
@@ -44,7 +55,16 @@ selects the interpreter (default
 Python 3.9 is the minimum.
 .B VENV_DIR
 relocates the environment.
-.SS start-mu2edaq-power-recovery.sh
+.PP
+.BR \-h ", " \-\-help
+prints the script's header comment as usage and exits. The PowerShell form
+takes
+.B \-WithCpp
+instead of
+.BR \-\-with\-cpp ,
+and documents itself through
+.BR Get\-Help .
+.SS start-mu2edaq-power-recovery.sh, start-mu2edaq-power-recovery.ps1
 Bootstraps the environment if it is missing, then passes every argument
 straight to
 .BR mu2e-power-recovery (1).
@@ -59,19 +79,76 @@ invocation should look at the cluster rather than change it.
 It writes a pid file to
 .I logs/power-recovery.pid
 and refuses to start a second concurrent run, which would drive the same
-cluster from two directions and interleave power commands.
+cluster from two directions and interleave power commands. A pid file left by a
+process that is no longer running is removed rather than treated as a live run.
+.B PID_FILE
+relocates it in the shell version.
+.PP
+Neither script has options of its own: every argument is handed to
+.BR mu2e-power-recovery (1),
+so
+.B \-\-help
+and
+.B \-\-version
+reach the driver rather than the wrapper. The two behave identically; the
+PowerShell version differs only in calling
+.I venv\eScripts\emu2e-power-recovery.exe
+rather than
+.IR venv/bin/mu2e-power-recovery .
 .SS stop-mu2edaq-power-recovery.sh
-Stops a running recovery. SIGTERM first: the driver catches it, records the
-interruption in the run store and closes the phase it is in, so the report
-still reflects what was actually done. SIGKILL only after a grace period
+Stops a running recovery. SIGTERM first, then SIGKILL after a grace period
 .RB ( GRACE ,
-default 30 seconds), and only if it is needed.
+default 30 seconds), and only if it is needed. A pid file naming a process that
+is no longer running is reported as stale and removed.
+.PP
+.B "Neither path is a clean stop."
+The driver installs no SIGTERM handler, so the default disposition applies and
+the process is terminated where it stands. It does not record the interruption,
+the run is left in the store as
+.I running
+rather than
+.IR interrupted ,
+and the credential cleanup does not execute \(em so the caches the run minted,
+including any root-capable service tickets, survive it. Check with
+.B klist \-l
+and destroy what is left by name with
+.BR "kdestroy \-c" .
+.PP
+.BR SIGINT " is"
+the clean stop: Ctrl-C at the terminal the run is on records the interruption,
+marks the run
+.IR interrupted ,
+and runs cleanup. Prefer it when you have that terminal.
 .TP
 .B \-\-force
-Kill immediately. The run store may not record the interruption.
+Skip the grace period and kill at once. The run store does not record the
+interruption \(em but, as above, it does not on the SIGTERM path either.
 .TP
 .B \-\-status
 Report whether a run is active and change nothing.
+.TP
+.BR \-h ", " \-\-help
+Print the script's header comment as usage and exit.
+.PP
+Any other argument is rejected with exit status 2, rather than being passed on
+to something that might act on it.
+.SS stop-mu2edaq-power-recovery.ps1
+The Windows equivalent, with the same two-stage behaviour: it asks the driver
+to close, waits out the grace period, and only then terminates the process.
+Its parameters follow PowerShell convention rather than the shell script's.
+.TP
+.B \-Force
+Terminate immediately, without the grace period. The run store may not record
+the interruption.
+.TP
+.B \-Status
+Report whether a run is active and change nothing.
+.TP
+.BI \-Grace " SECONDS"
+How long to wait before terminating. Default: 30. The shell script takes the
+same value from the
+.B GRACE
+environment variable instead, which is the one difference between the two.
 .SH FILES
 .TP
 .I venv/
@@ -96,6 +173,16 @@ MU2EDAQ_PYTHON=python3.9 ./bootstrap.sh
 \&./start-mu2edaq-power-recovery.sh                       # survey only
 \&./start-mu2edaq-power-recovery.sh \-\-phase all \-\-simulate
 \&./stop-mu2edaq-power-recovery.sh \-\-status
+GRACE=90 ./stop-mu2edaq-power-recovery.sh
+.EE
+.RE
+.PP
+The same three steps on Windows:
+.RS
+.EX
+\&.\ebootstrap.ps1 \-WithCpp
+\&.\estart\-mu2edaq\-power\-recovery.ps1 \-\-phase all \-\-simulate
+\&.\estop\-mu2edaq\-power\-recovery.ps1 \-Status
 .EE
 .RE
 .SH SEE ALSO

@@ -1,8 +1,14 @@
-.TH MU2E-POWER-STATE 1 "2026-09-17" "mu2edaq-power-recovery 0.1.0" "Mu2e DAQ Operations"
+.TH MU2E-POWER-STATE 1 "2026-09-18" "mu2edaq-power-recovery 0.1.0" "Mu2e DAQ Operations"
 .SH NAME
 mu2e-power-state \- phase 1: read-only survey of the Mu2e DAQ clusters
 .SH SYNOPSIS
 .B mu2e-power-state
+.RB [ \-\-location
+.IR NAME ]
+.RB [ \-\-node
+.IR HOST ]
+.RB [ \-\-principal
+.IR PRINCIPAL ]
 .RI [ options ]
 .SH DESCRIPTION
 Runs phase 1 of
@@ -31,22 +37,150 @@ report page and to
 and are recorded in the run store so that later phases can compare against
 them. In particular the BMC event-log length is recorded here, so phase 2 can
 report only the events its own power-on produced.
-.SH OPTIONS
-Identical to
-.BR mu2e-power-recovery (1),
-except that
-.B \-\-phase
-is fixed to
-.BR assess .
-The options that matter most here are
-.BR \-\-location ,
-.BR \-\-node ,
-.B \-\-principal
-and
-.BR \-\-root\-principal .
+.SH LOGINS
+Each node is entered with the operator's own Kerberos principal first \(em
+always, and for root sessions as much as for ordinary ones. Only when a host
+refuses it are the Mu2e service identities tried, and a service identity that
+worked is remembered for that host as a fallback, never ahead of the personal
+principal. The login name comes from
+.IR ssh.user " and " ssh.root_user ,
+not from the principal.
 .PP
+When
+.I ssh.login
+fails, the remaining SSH checks for that node are skipped: one refusal is
+enough, and twelve more connections would each be refused the same way. A
+changed host key is reported as such rather than as a login failure, because no
+credential can get past it; see
+.B DIAGNOSING A REFUSED LOGIN
+in
+.BR mu2e-power-recovery (1).
+.SH OPTIONS
+Every option of
+.BR mu2e-power-recovery (1)
+is accepted except
+.BR \-\-phase ,
+which is fixed to
+.BR assess .
+The reasoning behind each is given there; the list below is what this command
+takes and what each does here.
+.SS Run control
+.TP
+.BI \-\-label " TEXT"
+Label for this run, shown in the report header and the logbook subject.
+.TP
 .B \-\-execute
-has no effect: this phase changes nothing by construction.
+Accepted, and has no effect: this phase changes nothing by construction.
+.TP
+.B \-\-simulate
+Contact nothing at all; answer every command from the built-in script. Use it
+to exercise the survey and the report off site.
+.TP
+.BI \-\-location " NAME"
+Limit the survey to one location:
+.BR mc2 ", " mc1 " or " teststand .
+Repeatable. Defaults to
+.IR topology.locations .
+.TP
+.BI \-\-node " HOST"
+Limit the survey to these nodes. Repeatable; short or fully-qualified names are
+both accepted.
+.TP
+.B \-\-continue\-on\-error
+Accepted; it governs phase 2 and has no effect here.
+.TP
+.BI \-\-from " STAGE" ", " \-\-until " STAGE"
+Accepted; they bound the phase-2 power-on sequence and have no effect here.
+.TP
+.B \-\-include\-failed
+Accepted; it governs phase 3 and has no effect here.
+.SS Credentials
+.TP
+.BI \-\-principal " PRINCIPAL"
+Kerberos principal for ordinary logins. If there is no usable ticket, a
+password is prompted for and
+.BR kinit (1)
+is run into a credential cache private to the run.
+.TP
+.BI \-\-root\-principal " PRINCIPAL"
+Kerberos principal with root access on the nodes. It is kept in a credential
+cache separate from the ordinary one. Ten of the twenty-five checks open a root
+session:
+.IR ssh.login_root ", " login.users ", " disk.smart ", " disk.errors ,
+.IR disk.raid ", " net.forwarding ", " svc.nfs_export ", " svc.firewall ,
+.IR pcie.devices " and " pcie.driver .
+.B \-\-list\-checks
+prints all twenty-five.
+.TP
+.B \-\-no\-prompt
+Never prompt for a password; fail with instructions instead. For unattended
+runs.
+.TP
+.BI \-\-vault\-addr " URL"
+HashiCorp Vault address, for the BMC credentials the power checks need.
+.SS Report
+.TP
+.BI \-\-output\-dir " DIR"
+Where the report pages are written. Default:
+.IR html/ .
+.TP
+.B \-\-publish
+Copy the report to
+.I report.publish.target
+afterwards.
+.TP
+.BI \-\-publish\-target " DEST"
+Override the publication target. Implies
+.BR \-\-publish .
+.TP
+.B \-\-no\-report
+Do not write the HTML pages; console output only.
+.TP
+.B \-\-post\-ecl
+Accepted; the logbook entry is written by phase 4. See
+.BR mu2e-power-report (1).
+.TP
+.BI \-\-run\-id " N"
+Accepted; only phase 4 reads it. See
+.BR mu2e-power-report (1).
+.SS General
+.TP
+.BR \-h ", " \-\-help
+Print the option summary and exit.
+.TP
+.B \-\-version
+Print
+.I mu2edaq-power-recovery 0.1.0
+and exit.
+.TP
+.BI \-\-config " FILE"
+Main configuration file. Default:
+.IR config/power-recovery.yaml .
+.TP
+.BI \-\-env\-file " FILE"
+Dotenv file. Default:
+.IR config/.env .
+.TP
+.BI \-\-database\-url " URL"
+SQLAlchemy URL for the run store.
+.TP
+.B \-\-no\-self\-update
+Skip the phase-0 check for a newer revision.
+.TP
+.B \-\-list\-checks
+Print every registered check and exit.
+.TP
+.B \-\-list\-nodes
+Print the node inventory and exit.
+.TP
+.B \-\-json
+Print the survey as JSON on stdout instead of tables.
+.TP
+.BR \-v ", " \-\-verbose
+Debug logging, including one line per credential attempted against each host.
+.TP
+.BR \-q ", " \-\-quiet
+Warnings and errors only.
 .SH EXIT STATUS
 .TP
 .B 0
@@ -69,6 +203,7 @@ mu2e-power-state \-\-json > state.json
 .SH SEE ALSO
 .BR mu2e-power-recovery (1),
 .BR mu2e-power-on (1),
+.BR mu2e-ssh-probe (1),
 .BR mu2edaq-checks.yaml (5)
 .SH AUTHOR
 A. Norman <anorman@fnal.gov>, Mu2e DAQ Operations.

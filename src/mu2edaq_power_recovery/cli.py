@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import signal
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
@@ -450,6 +451,7 @@ def main(argv: Optional[Sequence[str]] = None,
     # --- run --------------------------------------------------------------
     exit_code = 0
     results: List[Any] = []
+    install_sigterm_handler()
     try:
         orch.prepare_credentials()
         orch.store.start_run(
@@ -481,8 +483,10 @@ def main(argv: Optional[Sequence[str]] = None,
             print(json.dumps([r.as_dict() for r in results], indent=2, default=str))
 
     except KeyboardInterrupt:
-        print("\n  interrupted by the operator; the run store keeps everything "
-              "done so far.", file=sys.stderr)
+        # Ctrl-C, or SIGTERM routed here by install_sigterm_handler().
+        print("\n  interrupted; the run store keeps everything done so far, and "
+              "the run's private Kerberos caches have been destroyed.",
+              file=sys.stderr)
         orch.store.record_event("run interrupted by the operator", level="error")
         orch.store.finish_run("interrupted")
         exit_code = 3
@@ -498,6 +502,32 @@ def main(argv: Optional[Sequence[str]] = None,
         orch.close()
 
     return exit_code
+
+
+def install_sigterm_handler() -> None:
+    """Route SIGTERM into the same clean path as Ctrl-C.
+
+    Without this the default disposition applies and the process is terminated
+    outright: the run store is left saying 'running', the interruption is never
+    recorded, and -- worst of the three -- the ``finally`` that calls
+    Orchestrator.close() never runs, so the run's private Kerberos caches
+    survive it. Those can include root-capable service tickets.
+
+    stop-mu2edaq-power-recovery.sh sends SIGTERM and has always described that
+    as the clean stop, so it was the documented path that did not do what it
+    said. Raising KeyboardInterrupt reuses the handler that already records the
+    interruption; the signal arrives in the main thread, which is where the
+    phase runner waits on its workers.
+    """
+    def terminate(signum, frame):  # noqa: ARG001 - signal handler signature
+        raise KeyboardInterrupt
+
+    try:
+        signal.signal(signal.SIGTERM, terminate)
+    except (ValueError, OSError, AttributeError):
+        # Not the main thread, or a platform without SIGTERM. The run still
+        # works; only the clean-stop path is unavailable.
+        log.debug("could not install a SIGTERM handler")
 
 
 def default_label() -> str:

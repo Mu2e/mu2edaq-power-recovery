@@ -1,0 +1,219 @@
+.TH MU2EDAQ-GENERATE-DOCS 1 "2026-09-18" "mu2edaq-power-recovery 0.1.0" "Mu2e DAQ Operations"
+.SH NAME
+generate-docs.py \- regenerate the generated man page sections, and check the
+documentation against the code
+.SH SYNOPSIS
+.B ./venv/bin/python tools/generate-docs.py
+.RB [ \-\-check | \-\-write ]
+.RB [ \-\-root
+.IR DIR ]
+.RB [ \-q ]
+.SH DESCRIPTION
+The check reference in
+.BR mu2edaq-power-recovery (7)
+is a transcription of the live check registry, and transcriptions rot: a check
+added to the package is registered, selectable in
+.BR mu2edaq-checks.yaml (5)
+and reported on, and nothing otherwise forces anyone to mention it in the
+manual. That table was first produced by a throwaway script that was not kept,
+so there was no way to tell whether the page still matched the code. This is
+that script, kept, and wired into the build and the test suite.
+.PP
+It is run three ways: by hand, as the
+.B docs
+build target
+.RB ( \-\-write ),
+and as the
+.B docs-check
+.BR ctest (1)
+entry and
+.I tests/unit/test_docs.py
+.RB ( \-\-check ).
+.SH CHECKS
+Four things are verified. Only the first is repaired.
+.TP
+.B 1. the generated check reference
+The
+.B CHECK REFERENCE
+block of
+.I man/man7/mu2edaq-power-recovery.7
+against the live registry, its descriptions and its root requirements. The
+block is delimited by troff comments so the surrounding prose stays
+hand-written, and
+.B \-\-write
+rewrites what lies between them. It is emitted as
+.B .TP
+entries rather than a
+.BR tbl (1)
+table deliberately: tbl needs a preprocessor pass, and a page with an
+unpreprocessed
+.B .TS
+block renders as garbage under plain
+.BR "groff \-man" ,
+which is how these pages get read during a recovery.
+.TP
+.B 2. a man page for every console script
+Every name under
+.I [project.scripts]
+in
+.I pyproject.toml
+must have a
+.IR man/man1/ \fIname\fR .1
+page. Extra man1 pages are not flagged: several things here are documented but
+are not console scripts \(em
+.BR mu2e-probe (1),
+.BR mu2edaq-power-recovery-bootstrap (1),
+and this page.
+.TP
+.B 3. a man 5 entry for every configuration key
+Every dotted key in
+.I settings.DEFAULTS
+must be named in some
+.I man/man5
+page. Read
+.B SCOPE OF CHECK 3
+below before relying on this.
+.TP
+.B 4. no groff warnings
+Every page under
+.I man/
+is rendered with
+.B "groff \-man \-Tascii \-ww"
+and any diagnostic on standard error is a failure. A groff warning is not
+cosmetic: the usual causes \(em an unescaped leading
+.RB ' . '
+inside an
+.B .EX
+block, an unknown macro, an unterminated font change \(em silently drop or
+mangle the text someone is reading in the middle of an outage. When
+.BR groff (1)
+is not installed the check is skipped, with a note.
+.SH SCOPE OF CHECK 3
+Check 3 is
+.I section-scoped identifier matching,
+not dotted-path matching, and the difference is worth knowing before quoting it
+as a guarantee.
+.PP
+A key such as
+.I vault.addr
+is split at the first dot. The page is searched for a
+.B .SS vault
+section, and each remaining component \(em here
+.I addr
+\(em must appear as an argument to a font macro
+.RB ( .B ", " .I ", " .BR
+and so on) somewhere inside it. The man pages are written that way on purpose:
+.B .SS vault
+followed by
+.BR ".I addr" ,
+rather than repeating the full path on every entry. Only 12 of the 77 keys have
+their complete dotted path written out verbatim anywhere in
+.IR man/man5 .
+.PP
+So the check will not catch a leaf documented under the wrong parent, and a leaf
+whose name collides with an unrelated identifier named in the same section would
+pass without being documented. It was checked by hand against the current pages
+and no such false pass exists, but the guarantee is
+.I "every key's name appears in the right section,"
+not
+.I "every key is documented."
+.SH WHAT IT DOES NOT CHECK
+.IP \(bu 2
+.B Itself.
+Check 2 iterates
+.I [project.scripts]
+only, so a tool under
+.I tools/
+is structurally invisible to it. This page exists because that gap left
+.I generate-docs.py
+undocumented.
+.IP \(bu 2
+.B Prose against behaviour.
+Nothing here reads a sentence in a man page or in
+.I README.md
+and compares it with what the code does. Every wrong safety claim this project
+has had passed all four checks.
+.IP \(bu 2
+.B Markdown.
+.IR README.md ", " CLAUDE.md ", " PROJECT-STATUS.md
+and
+.I docs/
+are not examined at all.
+.SH OPTIONS
+.TP
+.B \-\-check
+Report drift and exit non-zero; change nothing. This is the default, and it is
+what
+.B ctest
+and the test suite run.
+.TP
+.B \-\-write
+Regenerate the generated sections in place. Mutually exclusive with
+.BR \-\-check .
+.TP
+.BI \-\-root " DIR"
+Project root. Defaults to the tree this script is in.
+.TP
+.BR \-q ", " \-\-quiet
+Print nothing on success.
+.TP
+.BR \-h ", " \-\-help
+Print the option summary and exit.
+.SH EXIT STATUS
+.TP
+.B 0
+No problems. Unless
+.B \-q
+was given, a one-line summary is printed: the number of man pages, console
+scripts and configuration keys covered.
+.TP
+.B 1
+At least one problem, each listed on standard error.
+.SH EXAMPLES
+Check the documentation against the code, changing nothing:
+.RS
+.EX
+\&./venv/bin/python tools/generate\-docs.py \-\-check
+.EE
+.RE
+.PP
+Regenerate the check reference after adding or renaming a check, then confirm
+the page still renders:
+.RS
+.EX
+\&./venv/bin/python tools/generate\-docs.py \-\-write
+groff \-man \-Tascii \-ww man/man7/mu2edaq\-power\-recovery.7 >/dev/null
+.EE
+.RE
+.PP
+The same, through the build tree:
+.RS
+.EX
+cmake \-\-build build \-\-target docs
+ctest \-\-test\-dir build \-R docs\-check \-\-output\-on\-failure
+.EE
+.RE
+.SH FILES
+.TP
+.I tools/generate-docs.py
+The script.
+.TP
+.I man/man7/mu2edaq-power-recovery.7
+The only page it writes to, and only between its generated-block markers.
+.TP
+.I tests/unit/test_docs.py
+Runs
+.B \-\-check
+as part of
+.BR pytest (1),
+and asserts that
+.B \-\-check
+writes nothing.
+.SH SEE ALSO
+.BR mu2e-power-recovery (1),
+.BR mu2edaq-power-recovery (7),
+.BR mu2edaq-power-recovery.yaml (5),
+.BR groff (1),
+.BR ctest (1)
+.SH AUTHOR
+A. Norman <anorman@fnal.gov>, Mu2e DAQ Operations.

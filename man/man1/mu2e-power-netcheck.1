@@ -1,9 +1,13 @@
-.TH MU2E-POWER-NETCHECK 1 "2026-09-17" "mu2edaq-power-recovery 0.1.0" "Mu2e DAQ Operations"
+.TH MU2E-POWER-NETCHECK 1 "2026-09-18" "mu2edaq-power-recovery 0.1.0" "Mu2e DAQ Operations"
 .SH NAME
 mu2e-power-netcheck \- phase 3: inter-node connectivity across the DAQ networks
 .SH SYNOPSIS
 .B mu2e-power-netcheck
 .RB [ \-\-include\-failed ]
+.RB [ \-\-location
+.IR NAME ]
+.RB [ \-\-node
+.IR HOST ]
 .RI [ options ]
 .SH DESCRIPTION
 Runs phase 3 of
@@ -32,26 +36,144 @@ Sampled: each node is probed against a small set of anchor hosts, which is O(N)
 and sufficient to find a segment that has not come back.
 .PP
 Probes for one source are packed into a single remote shell invocation rather
-than one SSH session per pair \(em a full mesh over thirty data-network nodes
-is 870 pairs, and doing that as 870 sessions would take longer than the rest of
-the recovery.
+than one SSH session per pair \(em the shipped topology has 49 nodes on the data
+network, so the mesh is 2352 ordered pairs, and doing that as 2352 sessions
+would take longer than the rest of the recovery. As one session per source it
+is 49.
 .PP
 The results are interpreted, not merely tabulated. A node that reached nothing
 is reported separately from a node that nobody could reach: the first is a node
 or switch-port problem, the second suggests a one-way path, an ARP problem or a
 host firewall, and they need different responses.
+.PP
+The probes run on the nodes, so they use those nodes' own
+.BR ping (8)
+dialect. The jumbo-frame probe uses the iputils-only
+.BR \-M " and " \-s
+options and is valid because this phase always executes on a gateway, never on
+the operator's workstation.
 .SH OPTIONS
-As
-.BR mu2e-power-recovery (1),
-with
-.B \-\-phase
-fixed to
+Every option of
+.BR mu2e-power-recovery (1)
+is accepted except
+.BR \-\-phase ,
+which is fixed to
 .BR network .
+.SS Phase 3 control
 .TP
 .B \-\-include\-failed
 Probe nodes that failed an earlier phase. By default they are skipped, because
 probing a node already known to be down costs a full timeout per pair and tells
 the operator nothing new.
+.SS Run control
+.TP
+.BI \-\-label " TEXT"
+Label for this run, shown in the report header and the logbook subject.
+.TP
+.B \-\-execute
+Accepted, and has no effect: this phase issues no power command.
+.TP
+.B \-\-simulate
+Contact nothing at all; answer every command from the built-in script.
+.TP
+.BI \-\-location " NAME"
+Limit the probe to one location:
+.BR mc2 ", " mc1 " or " teststand .
+Repeatable.
+.TP
+.BI \-\-node " HOST"
+Limit the probe to these nodes. Repeatable; short or fully-qualified names are
+both accepted. The mesh is then built over the named nodes only, which is the
+quick way to test one suspect path.
+.TP
+.B \-\-continue\-on\-error
+Accepted; it governs phase 2 and has no effect here.
+.TP
+.BI \-\-from " STAGE" ", " \-\-until " STAGE"
+Accepted; they bound the phase-2 power-on sequence and have no effect here.
+.SS Credentials
+.TP
+.BI \-\-principal " PRINCIPAL"
+Kerberos principal for ordinary logins. The probes are issued over SSH, so this
+phase needs a working login to every source node.
+.TP
+.BI \-\-root\-principal " PRINCIPAL"
+Kerberos principal with root access on the nodes.
+.TP
+.B \-\-no\-prompt
+Never prompt for a password; fail with instructions instead.
+.TP
+.BI \-\-vault\-addr " URL"
+HashiCorp Vault address.
+.SS Report
+.TP
+.BI \-\-output\-dir " DIR"
+Where the report pages are written. Default:
+.IR html/ .
+.TP
+.B \-\-publish
+Copy the report to
+.I report.publish.target
+afterwards.
+.TP
+.BI \-\-publish\-target " DEST"
+Override the publication target. Implies
+.BR \-\-publish .
+.TP
+.B \-\-no\-report
+Do not write the HTML pages; console output only.
+.TP
+.B \-\-post\-ecl
+Accepted; the logbook entry is written by phase 4. See
+.BR mu2e-power-report (1).
+.TP
+.BI \-\-run\-id " N"
+Accepted; only phase 4 reads it.
+.SS General
+.TP
+.BR \-h ", " \-\-help
+Print the option summary and exit.
+.TP
+.B \-\-version
+Print
+.I mu2edaq-power-recovery 0.1.0
+and exit.
+.TP
+.BI \-\-config " FILE"
+Main configuration file. Default:
+.IR config/power-recovery.yaml .
+.TP
+.BI \-\-env\-file " FILE"
+Dotenv file. Default:
+.IR config/.env .
+.TP
+.BI \-\-database\-url " URL"
+SQLAlchemy URL for the run store.
+.TP
+.B \-\-no\-self\-update
+Skip the phase-0 check for a newer revision.
+.TP
+.B \-\-list\-checks
+Print every registered check and exit.
+.TP
+.B \-\-list\-nodes
+Print the node inventory and exit.
+.TP
+.B \-\-json
+Print the mesh results as JSON on stdout instead of tables.
+.TP
+.BR \-v ", " \-\-verbose
+Debug logging, including one line per credential attempted against each source
+node.
+.TP
+.BR \-q ", " \-\-quiet
+Warnings and errors only.
+.SH NOTES
+This phase can be the first thing a session runs, which means it can start with
+no gateway session cached. Gateway selection is serialised for that reason: the
+first worker thread that needs a gateway probes for one and the rest wait,
+rather than sixteen threads each opening a TCP sweep and a full SSH handshake
+against the same two hosts.
 .SH EXIT STATUS
 .TP
 .B 0
@@ -68,10 +190,12 @@ The probe could not start.
 mu2e-power-netcheck
 mu2e-power-netcheck \-\-location teststand
 mu2e-power-netcheck \-\-include\-failed \-v
+mu2e-power-netcheck \-\-node mu2e-trk-03 \-\-node mu2e-dl-01 \-\-json
 .EE
 .RE
 .SH SEE ALSO
 .BR mu2e-power-recovery (1),
+.BR mu2e-power-on (1),
 .BR mu2edaq-checks.yaml (5),
 .BR mu2e-probe (1)
 .SH AUTHOR

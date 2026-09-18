@@ -1,4 +1,4 @@
-.TH MU2E-VAULT-IPMI 1 "2026-09-17" "mu2edaq-power-recovery 0.1.0" "Mu2e DAQ Operations"
+.TH MU2E-VAULT-IPMI 1 "2026-09-18" "mu2edaq-power-recovery 0.1.0" "Mu2e DAQ Operations"
 .SH NAME
 mu2e-vault-ipmi \- verify the Vault secret holding the Mu2e DAQ BMC credentials
 .SH SYNOPSIS
@@ -8,7 +8,9 @@ mu2e-vault-ipmi \- verify the Vault secret holding the Mu2e DAQ BMC credentials
 .RB [ \-\-addr
 .IR URL ]
 .RB [ \-\-fields ]
+.RB [ \-\-list ]
 .RB [ \-\-no\-fallback ]
+.RI [ options ]
 .SH DESCRIPTION
 Checks that the recovery tools will be able to read the BMC credentials, which
 live at
@@ -54,12 +56,36 @@ Override
 .B \-\-fields
 Print only the field names present in the secret.
 .TP
+.B \-\-list
+List the secrets under the path instead of reading it. Use this when a path
+turns out to be a folder rather than a secret: reading a folder in a KV v2
+tree returns an empty result, which is indistinguishable from reading a secret
+that has no fields, so listing is the only way to tell the two apart. Folders
+that were not descended into keep their trailing slash in the output.
+.TP
 .B \-\-no\-fallback
 Fail rather than falling back to the local password file. Use this to test
 Vault itself, rather than testing whether a recovery could proceed.
 .TP
 .B \-\-json
 Emit the report as JSON.
+.TP
+.BI \-\-config " FILE"
+Main configuration file. Default:
+.IR config/power-recovery.yaml .
+.TP
+.BI \-\-env\-file " FILE"
+Dotenv file. Default:
+.IR config/.env .
+.TP
+.BR \-v ", " \-\-verbose
+Debug logging, including the full path read and the Vault response status.
+.TP
+.BR \-q ", " \-\-quiet
+Warnings and errors only.
+.TP
+.BR \-h ", " \-\-help
+Print the option summary and exit.
 .SH FALLBACK
 When Vault is unreachable and
 .I vault.allow_file_fallback
@@ -99,6 +125,13 @@ They were not; the reason is printed.
 mu2e-vault-ipmi
 mu2e-vault-ipmi \-\-fields
 mu2e-vault-ipmi \-\-no\-fallback \-\-json
+.EE
+.RE
+.PP
+A read that comes back empty: is the path a folder?
+.RS
+.EX
+mu2e-vault-ipmi \-\-path ipmi \-\-list
 .EE
 .RE
 .SH SEE ALSO

@@ -1,4 +1,4 @@
-.TH MU2EDAQ-CHECKS.YAML 5 "2026-09-17" "mu2edaq-power-recovery 0.1.0" "File Formats"
+.TH MU2EDAQ-CHECKS.YAML 5 "2026-09-18" "mu2edaq-power-recovery 0.1.0" "File Formats"
 .SH NAME
 checks.yaml \- health-check thresholds, expectations and profiles
 .SH SYNOPSIS
@@ -71,21 +71,64 @@ mounted from an address that no longer serves it, which passes
 .B mountpoint
 and fails the moment anything reads a file.
 .SS services
-Daemons whose absence means the node is up but not usable, listed under
+Daemons whose absence means the node is up but not usable, checked by
+.IR svc.running .
 .I common
-and per host class.
+applies everywhere; the other keys are
+.I host classes
+from
+.BR mu2edaq-topology.yaml (5),
+not profile names, and are added to
+.IR common .
+A host class with no entry and no
+.I common
+list makes
+.I svc.running
+report
+.B skip
+rather than pass.
+.PP
+.I systemctl is-active
+is tried first and
+.BR pgrep (1)
+used as the fallback, because some of these run from puppet-managed init
+scripts rather than as systemd units and would otherwise be reported missing
+while running.
 .SS profiles
-Check ids per host class.
+Check ids per profile.
 .I base
 is merged into every other profile and comes first, because its members \(em
 reachability and login \(em are the ones whose failure explains every later
-failure.
+failure. A profile lists only what it adds on top of
+.IR base .
 .PP
 The shipped profiles are
 .BR base ", " gateway ", " manager ", " datalogger ", " dcs ", " cfo ,
 .BR readout ", " teststand " and " other .
-A host whose class has no profile uses
-.BR other .
+.PP
+Which one a node gets depends on the phase:
+.IP \(bu 3
+phase 1 uses the profile named after the node's host class, or
+.B other
+when no profile has that name. The detector classes
+.RB ( tracker ", " calorimeter ", " crv ", " stm ", " extmon ", " worker )
+have no profile of their own, so a bare survey gives them
+.BR base " + " other ;
+.IP \(bu 3
+phase 2 uses the stage's
+.I checks
+key from
+.BR mu2edaq-power-sequence.yaml (5),
+which is how those nodes get
+.B readout
+at all.
+.PP
+Phase 3 runs no profile: it is the mesh probe below and nothing else.
+.PP
+Adding a class to
+.BR mu2edaq-topology.yaml (5)
+without adding a profile of the same name here is therefore silently a no-op
+for phase 1.
 .SS mesh
 Phase 3 settings.
 .TP
@@ -102,7 +145,13 @@ sampled, which is O(N) rather than O(N^2).
 .I anchors
 Representative targets used when
 .I full_mesh
-is false.
+is false. An anchor that is not in this run's node set \(em because
+.B \-\-node
+or
+.B \-\-location
+narrowed it \(em would leave the probe aiming at nothing, so when none of them
+is present the first three nodes on the network are used instead. The network
+still gets tested; the report names what was actually probed.
 .TP
 .I mtu_payload_bytes
 ICMP payload for the jumbo-frame probe. 8972 plus an 8-byte ICMP header plus a
@@ -110,7 +159,144 @@ ICMP payload for the jumbo-frame probe. 8972 plus an 8-byte ICMP header plus a
 if any hop on the path is not jumbo-clean.
 .TP
 .IR count ", " timeout_s
-Per-pair probe budget.
+Per-pair probe budget: ICMP echoes per pair, and the per-packet wait in
+seconds. Unset, they fall back to
+.IR thresholds.ping_count " and " thresholds.ping_timeout_s .
+They also size the wall-clock bound on the single SSH session that carries a
+source's whole probe list, so raising either lengthens phase 3 by roughly
+.RI ( targets " x " count " x " timeout_s )
+per source.
+.SH THE IMPLEMENTED CHECKS
+The 25 ids a profile may name. The ten marked
+.RB ( root )
+run their commands over the root session
+.RI ( ssh.root_user ,
+authenticated from
+.IR kerberos.root_principal ).
+Where that login is refused they fail one at a time, so putting many of them
+in a profile for hosts you have no root on produces a column of failures, not
+one.
+.TP
+.B disk.errors (root)
+No storage errors in the kernel log since boot.
+.TP
+.B disk.local
+No local filesystem is at or above
+.IR disk_full_pct .
+.TP
+.B disk.mounts
+Every filesystem in
+.I mounts
+is mounted, and every path in
+.I mounts.paths
+exists.
+.TP
+.B disk.nfs_from_mgr
+The NFS mounts really come from the host named in the mount entry's
+.IR server ,
+not merely from something. A stale entry passes
+.I disk.mounts
+and fails the moment anything reads a file.
+.TP
+.B disk.raid (root)
+md/RAID arrays are complete and not rebuilding.
+.TP
+.B disk.smart (root)
+SMART overall health for every physical device.
+.TP
+.B host.kernel
+Kernel release, and no taint flags.
+.TP
+.B host.uptime
+Uptime and load average, including the post-power-on test against
+.IR max_post_boot_uptime_s .
+.TP
+.B login.users (root)
+Every account in
+.I kerberos.verify_users
+can start a session. Run as
+.B su - <user>
+from root, so it exercises the home directory too: after an outage the usual
+failure is not a broken account but an unmounted
+.IR /home .
+.TP
+.B net.data
+The data-network interface is up, addressed inside the data subnet, and
+negotiated at
+.IR data_link_speed_mbps .
+.TP
+.B net.dns
+Forward and reverse name resolution work.
+.TP
+.B net.forwarding (root)
+The gateway is forwarding, with a route for each of its location's subnets.
+.TP
+.B net.interfaces
+Every network the node is on, and for which a CIDR is recorded, has an
+interface up with an address in it.
+.TP
+.B net.ipmi_reach
+The gateway has an interface on the IPMI subnet.
+.TP
+.B pcie.devices (root)
+The Xilinx readout card is enumerated on the PCIe bus. A card missing after a
+power event is usually a cold-boot training failure, which only a full AC cycle
+recovers.
+.TP
+.B pcie.driver (root)
+The mu2e driver is loaded and its device nodes are present.
+.TP
+.B ping.lab
+ICMP reachability on the lab network, probed from the gateway.
+.TP
+.B power.sel
+No new critical entries in the BMC event log since the baseline taken in
+phase 1.
+.TP
+.B power.sensors
+No IPMI sensor is in a critical state.
+.TP
+.B power.status
+IPMI chassis power state.
+.TP
+.B ssh.login
+An ordinary SSH session can be opened. Its failure gates the rest: the
+remaining ssh checks on that node are recorded
+.B unknown
+rather than retried, and the detail lists every credential that was refused
+with its reason.
+.IP
+A changed host key is reported as itself, not as a login failure, because no
+credential can get past it: after an outage it usually means the node was
+reimaged, and the other reading is interception. The result says to verify the
+new fingerprint out of band \(em
+.B ssh-keyscan <node>
+from a gateway \(em before touching
+.IR ~/.ssh/known_hosts .
+.TP
+.B ssh.login_root (root)
+A root SSH session can be opened.
+.TP
+.B svc.firewall (root)
+The packet filter has rules loaded.
+.B nft
+first,
+.B iptables
+as the fallback. An empty ruleset is a failure rather than "no firewall
+configured": a gateway that boots with no rules looks healthy and is wide
+open.
+.TP
+.B svc.nfs_export (root)
+The NFS exports are published.
+.TP
+.B svc.running
+Every daemon selected by
+.I services
+is running.
+.PP
+.BR "mu2e-power-recovery \-\-list\-checks"
+prints this list from the registry itself, which is the copy that cannot go
+stale.
 .SH EXAMPLES
 Warn earlier about disk usage:
 .RS

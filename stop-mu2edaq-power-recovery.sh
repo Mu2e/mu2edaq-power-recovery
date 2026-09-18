@@ -1,9 +1,16 @@
 #!/bin/sh
-# Stop a running recovery cleanly.
+# Stop a running recovery.
 #
-# SIGTERM first: the driver catches it, records the interruption in the run
-# store and finishes the phase it is in, so the report still reflects what was
-# actually done.  SIGKILL only after a grace period, and only if it is needed.
+# SIGTERM first, SIGKILL only after a grace period and only if needed.
+#
+# The driver installs a SIGTERM handler that routes into the same path as
+# Ctrl-C: it records the interruption, marks the run 'interrupted' in the run
+# store, and destroys the run's private Kerberos caches -- which can hold
+# root-capable service tickets.
+#
+# --force skips the wait and sends SIGKILL, which none of that survives: the
+# store is left saying 'running' and the caches remain. Check with `klist -l`
+# and destroy them by name if you use it.
 #
 #   ./stop-mu2edaq-power-recovery.sh            # 30-second grace period
 #   ./stop-mu2edaq-power-recovery.sh --force    # kill immediately

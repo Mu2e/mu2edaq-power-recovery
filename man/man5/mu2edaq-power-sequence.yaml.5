@@ -1,4 +1,4 @@
-.TH MU2EDAQ-POWER-SEQUENCE.YAML 5 "2026-09-17" "mu2edaq-power-recovery 0.1.0" "File Formats"
+.TH MU2EDAQ-POWER-SEQUENCE.YAML 5 "2026-09-18" "mu2edaq-power-recovery 0.1.0" "File Formats"
 .SH NAME
 power-sequence.yaml \- phase 2 power-on stage order for the Mu2e DAQ
 .SH SYNOPSIS
@@ -20,6 +20,13 @@ control fabric the tracker, calorimeter, CRV and STM nodes synchronise to.
 .SS defaults
 Values inherited by every stage that does not set its own:
 .IR location ", " require ", " concurrency ", " power_on ", " boot_timeout ", " settle .
+.I checks
+is deliberately
+.I not
+inheritable: a stage with no
+.I checks
+key runs the profile of each node's own host class, which is rarely what a
+whole-stage default would have meant.
 .SS stages
 An ordered list. Each stage runs only after the previous one reached its
 .I require
@@ -27,7 +34,25 @@ state.
 .TP
 .I name
 Short identifier, used in the report and by
-.BR \-\-from / \-\-until .
+.BR \-\-from / \-\-until
+(and by
+.IR run.from_stage / run.until_stage ,
+which they override). Matching is exact and a name that matches nothing is
+.I not
+an error:
+.B \-\-from
+falls back to the first stage and
+.B \-\-until
+to the last, so a typo runs more of the sequence than intended, not less.
+Check the stage list with
+.B \-\-until
+naming the last stage you want and no
+.BR \-\-execute .
+A stage with no
+.I name
+is reported as
+.B unnamed
+and cannot be selected.
 .TP
 .I title
 Human label for the report tables.
@@ -60,6 +85,13 @@ hold up the rest \(em the report still lists every failure.
 .B any
 At least one. Used for the gateways: one working jump host is enough.
 .RE
+.IP
+Any other value is treated as
+.BR all .
+A stage whose
+.I nodes
+resolve to nothing never meets its requirement, whatever is set here \(em an
+empty stage is a topology mistake, not a pass.
 .TP
 .I concurrency
 Maximum nodes worked on at once within the stage.
@@ -67,7 +99,16 @@ Maximum nodes worked on at once within the stage.
 .I power_on
 When false the stage verifies only and never issues a power command. The
 gateway stage sets this, because power-cycling a jump host removes the path
-every later stage depends on.
+every later stage depends on. It is belt and braces: those hosts are also in
+.I protected
+in
+.BR mu2edaq-topology.yaml (5),
+which refuses destructive verbs for them wherever the request comes from.
+.IP
+A node in the stage with no BMC in the topology is recorded as
+.B no_bmc
+rather than passed over, so "we could not power this one on" is visible on the
+checklist.
 .TP
 .I boot_timeout
 Seconds to wait for SSH to answer after

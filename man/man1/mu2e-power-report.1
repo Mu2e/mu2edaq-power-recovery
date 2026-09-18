@@ -1,4 +1,4 @@
-.TH MU2E-POWER-REPORT 1 "2026-09-17" "mu2edaq-power-recovery 0.1.0" "Mu2e DAQ Operations"
+.TH MU2E-POWER-REPORT 1 "2026-09-18" "mu2edaq-power-recovery 0.1.0" "Mu2e DAQ Operations"
 .SH NAME
 mu2e-power-report \- phase 4: the consolidated recovery report
 .SH SYNOPSIS
@@ -23,6 +23,11 @@ was not present needs them: what the run did, what is still wrong, and what has
 to happen next. Follow-ups are derived rather than generic \(em a check that
 failed on three or more nodes is called out as one likely shared cause rather
 than as three separate problems.
+.PP
+Because the run store keeps each credential attempt, the report names the
+identity that opened each node and, for a node nothing could open, each
+login and ticket that was refused and why. A node whose host key had changed is
+reported as that, not as a failed login.
 .SH LOGBOOK POSTING
 .B \-\-post\-ecl
 posts the entry using the
@@ -36,21 +41,29 @@ ECL credentials are read from Vault at the path given by
 .I ecl.credential_path
 under
 .IR vault.base_path .
-The generated HTML pages are attached when
-.I ecl.attach_html
-is set.
+.PP
+The HTML pages are attached only when they were written earlier in the same
+invocation \(em that is, under
+.BR "mu2e-power-recovery \-\-phase all" ,
+where the pages for phases 1 to 3 exist by the time phase 4 posts. Running
+.B mu2e-power-report
+on its own posts the narrative with no attachments, because this phase renders
+its pages after it posts. The narrative itself is complete either way; the
+entry simply carries no HTML.
 .SH OPTIONS
-As
-.BR mu2e-power-recovery (1),
-with
-.B \-\-phase
-fixed to
+Every option of
+.BR mu2e-power-recovery (1)
+is accepted except
+.BR \-\-phase ,
+which is fixed to
 .BR report .
+.SS Report
 .TP
 .BI \-\-run\-id " N"
 Report on this run rather than the most recent one. Run ids are shown on the
 report's run-history page and by
 .BR "mu2e-power-report \-\-json" .
+This is the only phase that reads the flag.
 .TP
 .B \-\-post\-ecl
 Post the entry to the logbook.
@@ -59,6 +72,109 @@ Post the entry to the logbook.
 Copy the report site to
 .I report.publish.target
 after rendering.
+.TP
+.BI \-\-publish\-target " DEST"
+Override the publication target, e.g.
+.IR user@host:/web/recovery/ .
+Implies
+.BR \-\-publish .
+.TP
+.BI \-\-output\-dir " DIR"
+Where the report pages are written. Default:
+.IR html/ .
+.TP
+.B \-\-no\-report
+Do not write the HTML pages. The phase still assembles the narrative, still
+posts it if asked, and still returns its exit status; only the site on disk is
+skipped.
+.SS Run control
+.TP
+.BI \-\-label " TEXT"
+Label for this run, shown in the report header and the logbook subject. It
+labels the new run this invocation opens, not the run named by
+.BR \-\-run\-id .
+.TP
+.B \-\-execute
+Accepted, and has no effect: this phase issues no power command.
+.TP
+.B \-\-simulate
+Contact nothing at all. The pages are written locally and the publisher refuses
+before trying anything, reporting that nothing was published.
+.TP
+.BI \-\-location " NAME"
+Repeatable. Accepted; it narrows the inventory page rather than any probe,
+since this phase contacts nothing.
+.TP
+.BI \-\-node " HOST"
+Repeatable. Accepted; likewise nothing is probed.
+.TP
+.B \-\-continue\-on\-error
+Accepted; it governs phase 2 and has no effect here.
+.TP
+.BI \-\-from " STAGE" ", " \-\-until " STAGE"
+Accepted; they bound the phase-2 power-on sequence and have no effect here.
+.TP
+.B \-\-include\-failed
+Accepted; it governs phase 3 and has no effect here.
+.SS Credentials
+.TP
+.BI \-\-principal " PRINCIPAL"
+Accepted; this phase opens no session of its own. Publication is a local
+.BR rsync (1)
+or
+.BR scp (1)
+run from the workstation, so a remote target is reached with the operator's
+ordinary SSH credentials rather than through the run's credential chain.
+.TP
+.BI \-\-root\-principal " PRINCIPAL"
+Accepted; not used by this phase.
+.TP
+.B \-\-no\-prompt
+Never prompt for a password; fail with instructions instead.
+.TP
+.BI \-\-vault\-addr " URL"
+HashiCorp Vault address. The ECL credentials are read from it, so
+.B \-\-post\-ecl
+needs it reachable.
+.SS General
+.TP
+.BR \-h ", " \-\-help
+Print the option summary and exit.
+.TP
+.B \-\-version
+Print
+.I mu2edaq-power-recovery 0.1.0
+and exit.
+.TP
+.BI \-\-config " FILE"
+Main configuration file. Default:
+.IR config/power-recovery.yaml .
+.TP
+.BI \-\-env\-file " FILE"
+Dotenv file. Default:
+.IR config/.env .
+.TP
+.BI \-\-database\-url " URL"
+SQLAlchemy URL for the run store. Point it at the store that holds the run you
+want reported.
+.TP
+.B \-\-no\-self\-update
+Skip the phase-0 check for a newer revision.
+.TP
+.B \-\-list\-checks
+Print every registered check and exit.
+.TP
+.B \-\-list\-nodes
+Print the node inventory and exit.
+.TP
+.B \-\-json
+Print the phase result as JSON on stdout instead of tables.
+.TP
+.BR \-v ", " \-\-verbose
+Debug logging.
+.TP
+.BR \-q ", " \-\-quiet
+Warnings and errors only.
 .SH EXIT STATUS
 .TP
 .B 0
@@ -79,6 +195,7 @@ mu2e-power-report \-\-publish \-\-publish\-target mu2edaq@mu2egateway01:/web/rec
 .RE
 .SH SEE ALSO
 .BR mu2e-power-recovery (1),
+.BR mu2e-power-state (1),
 .BR mu2edaq-power-recovery.yaml (5),
 .BR mu2edaq-power-recovery (7)
 .SH AUTHOR

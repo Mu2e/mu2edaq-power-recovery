@@ -14,8 +14,13 @@ run:
   # in the ECL entry subject.  Defaults to "<user>@<host> <ISO date>".
   label: null
   # Never issue a state-changing command (IPMI power on/off, remote writes)
-  # unless this is false *and* --execute was passed.  Two independent gates,
-  # deliberately: a config file edit alone cannot arm the destructive path.
+  # while this is true.  --execute is the supported way to set it false, but it
+  # is NOT a second, independent gate: setting dry_run false here, in
+  # config/.env, or as MU2E_POWER_RECOVERY_RUN_DRY_RUN=false arms live power
+  # commands on its own, with no flag on the command line.  The run prints
+  # "LIVE RUN -- power commands WILL be issued." when that is the case.
+  # --simulate is the gate no config file can open: it forces this back to
+  # true whatever else was asked for.
   dry_run: true
   # Stop the phase-2 sequence at the first stage that fails its require:.
   stop_on_stage_failure: true
@@ -54,7 +59,11 @@ selfupdate:
 
 ssh:
   # Login used for ordinary (non-root) checks.
-  user: null                    # null => $USER
+  # null does NOT mean $USER: it means "let ssh decide", i.e. ssh_config's
+  # User for the host, and only failing that ssh's own default of the local
+  # username.  The login is deliberately never derived from the Kerberos
+  # principal -- see docs/DESIGN.md section 2.
+  user: null
   # Login used for checks that need root.  Authentication is GSSAPI from the
   # Kerberos ticket of kerberos.root_principal.
   root_user: root
@@ -76,8 +85,11 @@ ssh:
   max_sessions: 16
 
 ipmi:
-  # ipmitool is executed *on the gateway*, not locally: the IPMI subnets
-  # (192.168.157.0/24, 192.168.150.0/24) are not routable from off-site.
+  # Records where ipmitool runs.  NOT CURRENTLY CONSULTED: ipmitool is always
+  # run on a gateway, because the IPMI subnets (192.168.157.0/24,
+  # 192.168.150.0/24) are not routable from off-site.  Changing this value has
+  # no effect; it is here so the intent is visible in the file and the run
+  # record.
   execute_on: gateway
 
   # BMC username. Null takes it from the Vault secret's username field.
@@ -111,7 +123,8 @@ ipmi:
 
   # Stop issuing IPMI commands once a BMC has answered and rejected the
   # credentials (an RAKP failure, or "unauthorized name"). One credential set
-  # serves all 65 BMCs, so the next one will reject it too -- and each attempt
+  # serves all 45 BMCs (the nodes with an ipmi: interface, of 65 nodes in
+  # topology.yaml), so the next one will reject it too -- and each attempt
   # is three invocations here with four ipmitool retries inside each. Set this
   # false only to gather evidence from several BMCs at once; the run then
   # sends the same bad username to every controller in the cluster.
@@ -191,7 +204,7 @@ vault:
   # the obvious synonyms and logs which field it used.
   ipmi_user_field: username
   ipmi_password_field: password
-  # Fall back to ~/.ipmipasswd (and ipmi.default_user) when Vault is
+  # Fall back to ~/.ipmipasswd (and vault.fallback_user below) when Vault is
   # unreachable, so a recovery is not blocked by a Vault outage.
   allow_file_fallback: true
   fallback_password_file: ~/.ipmipasswd
@@ -236,7 +249,8 @@ ecl:
 logging:
   level: INFO
   file: logs/power-recovery.log
-  # Keep the full stdout/stderr of every remote command in the run store.
-  # Large, but it is the evidence trail for the logbook entry.
+  # Intended switch for keeping the full stdout/stderr of every remote command
+  # in the run store.  NOT CURRENTLY CONSULTED: output is captured either way.
+  # Use max_capture_bytes below to bound the volume.
   capture_command_output: true
   max_capture_bytes: 65536

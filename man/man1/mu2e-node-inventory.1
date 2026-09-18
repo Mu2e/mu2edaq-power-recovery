@@ -1,4 +1,4 @@
-.TH MU2E-NODE-INVENTORY 1 "2026-09-17" "mu2edaq-power-recovery 0.1.0" "Mu2e DAQ Operations"
+.TH MU2E-NODE-INVENTORY 1 "2026-09-18" "mu2edaq-power-recovery 0.1.0" "Mu2e DAQ Operations"
 .SH NAME
 mu2e-node-inventory \- print the Mu2e DAQ node inventory used by the recovery tools
 .SH SYNOPSIS
@@ -52,6 +52,26 @@ List only the hosts protected from destructive IPMI commands.
 .B \-\-json
 Emit the full inventory as JSON, including each node's class, location,
 per-network interface names and subnets.
+.TP
+.BI \-\-config " FILE"
+Main configuration file. Default:
+.IR config/power-recovery.yaml .
+It is read for
+.IR topology.file " and " topology.locations ,
+so pointing this at the configuration a run used shows that run's inventory.
+.TP
+.BI \-\-env\-file " FILE"
+Dotenv file. Default:
+.IR config/.env .
+.TP
+.BR \-v ", " \-\-verbose
+Debug logging.
+.TP
+.BR \-q ", " \-\-quiet
+Warnings and errors only.
+.TP
+.BR \-h ", " \-\-help
+Print the option summary and exit.
 .SH EXAMPLES
 Everything the tools know about:
 .RS

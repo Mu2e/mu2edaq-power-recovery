@@ -4,8 +4,12 @@
 
 .DESCRIPTION
   Asks the driver to close, waits for the grace period, and only then forces
-  it.  A run stopped cleanly records the interruption in the run store, so the
-  report still reflects what was done.
+  it. The driver handles the request the same way it handles Ctrl-C: it records
+  the interruption, marks the run 'interrupted', and destroys the run's private
+  Kerberos caches, which can hold root-capable service tickets.
+
+  -Force terminates outright and none of that happens: the store is left saying
+  'running' and the caches remain. Check with 'klist -l' if you use it.
 
 .PARAMETER Force
   Terminate immediately without the grace period.

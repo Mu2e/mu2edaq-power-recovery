@@ -48,21 +48,146 @@ cache, because acquiring the root ticket must not displace the ordinary one,
 and an SSH command should select its identity by which environment it is given.
 
 **Credential chains.** No single identity can log in to every node, so each host
-is tried against an ordered chain. Three rules govern it:
+is tried against an ordered chain. Four rules govern it:
 
 1. *The operator's own principal is always first*, for root as well as ordinary
    sessions. The run belongs to that identity, and a service credential must
    never be used where a personal one would have done. Nothing displaces it —
    not the per-host memo, not the promotion of a fallback that worked elsewhere.
 2. *Service identities are fallbacks, and the run returns to the personal
-   ticket.* Nothing mutates the ambient environment or the default credential
-   cache: each ssh invocation is handed its own `KRB5CCNAME`, and service
-   tickets are minted into private caches via `get-kerberos-ticket --cache`.
+   ticket.* Each ssh invocation is handed its own `KRB5CCNAME`; nothing writes
+   the ambient environment.
 3. *Root falls back too, by changing the ticket rather than the login.*
    Authenticating as `mu2edaq` and logging in to the `root` account is something
    a node's `root/.k5login` can authorise. An earlier version refused root any
    fallback on the reasoning that service accounts are ordinary users — true of
    the account, irrelevant to the principal, and wrong.
+4. *The login is not derived from the principal.* See below; this was
+   implemented the other way round once, and reverted.
+
+Every attempt is logged as `login X ticket Y [cache Z] -> ok/refused`, and the
+primary pair is logged before anything is tried. A refused chain records the
+login, principal and cache of each attempt, so the report carries them. Without
+that, "Permission denied (gssapi)" fifty times is not a diagnosis.
+
+#### Why only an authentication failure advances the chain
+
+The chain exists to find an identity a host will accept. Only a failure that
+says *this identity was rejected* is evidence that another might do better.
+Everything else is a fact about the host or the path, and repeating it seven
+more times costs seven more connect timeouts and learns nothing. So
+`classify_ssh_failure` sorts stderr into four buckets, and the order of the
+tests is load-bearing:
+
+1. **hostkey** — `Host key verification failed`, `REMOTE HOST IDENTIFICATION HAS
+   CHANGED`, and the DNS-spoofing and man-in-the-middle wordings. Tested
+   *first*, because ssh aborts on a host-key mismatch before it authenticates
+   anything, so any credential-sounding text further down the output is noise.
+   Stops the chain at the first attempt.
+2. **unreachable** — refused connections, timeouts, and the rate-limiting
+   family: `kex_exchange_identification`, "connection reset by peer", "too many
+   authentication failures". Tested before `auth` because a jump host that is
+   down prints both a connection error *and*, further down, something about
+   credentials; reading that as an auth failure sends the chain through every
+   identity against a machine that is simply off. Rate limiting belongs here for
+   the same practical reason: six more identities is what caused it.
+3. **auth** — the only bucket that advances the chain.
+4. **unknown** — also advances it. The cost is one extra attempt; the
+   alternative is refusing an identity that might have worked because ssh
+   phrased its complaint in a way we did not anticipate.
+
+A changed host key gets more than a classification. `ssh.login` reports it as
+what it is — *the host key has CHANGED, ssh refused before authenticating* —
+names reimage-after-outage as the likely cause, points at `ssh-keyscan` from a
+gateway as the out-of-band check, and sets `hostkey_changed` in the result data.
+This is not general good manners; it is specific to an outage tool. Reimaged
+nodes are precisely what a recovery meets, and the alternative reading of a
+changed key is interception, so the one thing the tool must not do is quietly
+try eight credentials against it and report "SSH login failed".
+
+A refused login also stops the node's remaining SSH checks. Previously a node
+counted as unreachable only when ping *and* ssh both failed, so one refusal was
+followed by twelve more checks each opening its own connection — against a
+server that was very likely refusing because of the connection rate.
+
+#### Why the login is not derived from the principal
+
+`~/.ssh/config` sets `User mu2edaq` for the DAQ hosts. That looked like the bug
+when the personal ticket was being refused everywhere, and the login was changed
+to come from the principal instead (`anorman@FNAL.GOV` → `anorman`).
+
+Verified against the live cluster, that was wrong. `mu2edaq` and `root` both
+accept the personal ticket; an account named after the principal does not exist
+on those hosts, so deriving the login broke logins that had been working.
+`ssh_config` was right all along, and the real failure was the displaced default
+credential cache described below — a single cause that produced a symptom
+pointing at something else entirely. The derivation was reverted and the
+reasoning recorded in the code, because it is an attractive-looking fix that
+will suggest itself again. `ssh.user` and `ssh.root_user` remain the supported
+overrides.
+
+This is also the cost of the decision to drive the `ssh` binary (§10): the
+site's `ssh_config` is in force, which is what we want, and it means the login
+is not ours to infer.
+
+#### Credential caches are not always files
+
+The intent is simple: acquiring a root ticket must not displace the ordinary
+one, so each principal gets a private cache and each ssh invocation is given its
+own `KRB5CCNAME`. On MIT Kerberos that is exactly what happens.
+
+macOS ships **Heimdal**, and it does not work that way. Heimdal keeps credential
+caches in an `API:` *collection* rather than as files, and two consequences
+follow that this project had to be rebuilt around:
+
+- **Heimdal ignores `KRB5CCNAME=FILE:` for `kinit`.** The private cache file we
+  asked for never appeared, so every service identity was rejected as unusable
+  even though the ticket was perfectly good. It simply has a ccache *name*
+  (`API:<uuid>`) rather than a path. The ticket source now looks the identity up
+  in the collection (`klist -l`) and uses that name;
+  `Credential.environ()`/`describe()` pass through a value that already carries
+  a ccache type untouched, and `KerberosManager.ensure()` has the same fallback
+  — without it, `--principal` did not work at all on the platform the recovery
+  is most likely to be driven from, reporting "kinit appeared to succeed but no
+  valid ticket is present".
+- **Minting displaces the default; it does not destroy it.** Heimdal makes each
+  newly minted cache the collection default, whatever `--cache` or `KRB5CCNAME`
+  said. So minting a service ticket silently repoints "the default ticket" at
+  it, and every later login runs as that identity. The first diagnosis of this
+  was that the operator's ticket had been *destroyed*; that was wrong, and the
+  distinction matters, because a displaced ticket is still in the collection and
+  `kswitch -p <principal>` restores it instantly. The tools now record the
+  default principal before each mint and put the pointer back afterwards. A mint
+  that *times out* runs the check and restore too — the command had run, so it
+  could have moved the default and then hung, which is the shape of the original
+  incident — and a clobber is reported in preference to the timeout.
+
+Two guards follow from this, and both are about the *next* run rather than this
+one. Before connecting to anything, a run reads the default cache and, when it
+holds a service identity rather than a personal principal, logs a warning and
+prints the `kswitch`/`kdestroy` line that fixes it: otherwise sixty logins fail
+as `mu2eraw` with nothing in the ssh error to explain why.
+
+**This guard warns; it does not stop the run.** `Orchestrator.prepare()` calls
+`KerberosManager.ambient_warning()`, logs whatever comes back and appends it to
+the run's notes, then continues into `prepare()`, the SSH factory and every
+phase. The design intent was to halt, and halting is arguably right — an
+operator who misses one WARNING line then watches every login fail for a reason
+that was printed once, at the top, two hours earlier. It is recorded as an open
+item rather than changed here, because `ambient_warning()` returns a string for
+*two* conditions and only one of them is fatal: a service identity holding the
+default cache (every login will be refused), and the benign case where the
+ambient principal merely differs from `kerberos.principal` (the run uses the
+configured one and is fine). Halting on a non-empty return would stop runs that
+should proceed; the fix is to separate the two conditions, which is a code
+change with an author's judgement in it. Read the top of the run.
+
+And cleanup names each
+cache to `kdestroy -c` rather than steering a bare `kdestroy` with
+`KRB5CCNAME` — `FILE:API:<uuid>` names nothing, so on macOS every service ticket
+used to survive the run and sit in the collection waiting to become its default.
+Cleanup refuses outright any *file* cache whose path is not inside the run's own
+temporary directory: the plausible foreign path is the operator's own.
 
 ### IPMI, executed on the gateway
 
@@ -78,6 +203,27 @@ password is written to the remote shell's stdin, read into `IPMI_PASSWORD`, and
 picked up by `ipmitool -E`. It appears in no argument vector on either host.
 There is a test that asserts this, because it is the sort of property that
 quietly regresses.
+
+**The invocation matches upstream `mu2e_ipmi.sh` exactly, apart from `-E`.**
+`-N 5 -R 1` was once added as tuning; `-R 1` cuts ipmitool to a single attempt,
+so a BMC that needed a retry failed with "Unable to establish IPMI v2 / RMCP+
+session" — indistinguishable from bad credentials. `ipmi.message_timeout` and
+`ipmi.tool_retries` now default to unset, `ipmi.extra_args` exists for anything
+genuinely needed, and the gateway-side wall-clock bound was widened so it cannot
+itself cut ipmitool's retries short. Diverging from a known-working invocation
+is a choice that has to earn itself.
+
+**A credential rejection is neither retried nor repeated.** All 45 BMCs share
+one credential set, so the first rejection settles the matter: the run stops
+issuing IPMI and reports one diagnosis naming the refused username and how to
+find the right one. Previously it retried the same rejected credentials three
+times per BMC, with four ipmitool retries inside each, and then did the same to
+the next BMC — a few hundred failed authentications against machines that count
+them towards account lockout. Recognised only from RAKP failures and
+"unauthorized name". "Unable to establish IPMI v2 / RMCP+ session" is
+deliberately **excluded**: a dark chassis says exactly that, and after an outage
+a dark chassis is the expected case. `ipmi.stop_on_auth_failure: false`
+overrides the whole behaviour.
 
 ## 3. Checks as data
 
@@ -96,6 +242,31 @@ That shape buys three things:
 - the entire suite runs against a scripted `FakeTransport` with no cluster, so
   the tests can be run *before* an outage — which is the only time it matters
   that they pass.
+
+That last claim is enforced rather than asserted: an autouse fixture fails any
+test that shells out to `ssh`, `ping`, `ipmitool`, `kinit`, `vault` and the
+rest, with an `allow_network` marker to opt out. It was added after the suite
+was found opening real ssh connections to the gateways — resolving a gateway
+probes it, and any test building a transport resolved one — and extended after
+a `--simulate` run was found pinging them.
+
+### The command must be in the dialect of the host that runs it
+
+`ping` is not one program. iputils reads `-W` as **seconds**, BSD `ping` reads
+the same flag as **milliseconds**, and Windows spells the pair `-n`/`-w` and
+shares neither the flags nor the output wording. Sending the iputils form
+everywhere turned a five-second per-packet wait into five milliseconds whenever
+a recovery was driven from a Mac, and both gateways duly reported no ICMP at
+all — a wrong answer that looked exactly like a real finding.
+
+So `ping_dialect(transport)` picks the spelling from `Transport.platform`
+(`base.py` defaults to `linux`; `LocalTransport` reports `sys.platform`), and
+the parser reads the Windows summary as well. The MTU probe's iputils-only
+`-M do`/`-s` options are deliberately left alone: only phase 3 asks for them,
+and phase 3 always runs on a gateway.
+
+The general point is that a check runs on whichever host its transport points
+at, and that host is not necessarily the one the tests ran on.
 
 A check named in the config with no implementation is reported as `skip` with
 an explanation. It is never silently dropped: an unimplemented check must not
@@ -130,9 +301,15 @@ The node-level roll-up has two rules that fall out of this:
 
 ### Phase 0 — self-update
 
-Every invocation checks `origin`, fast-forwards if behind, reruns
-`bootstrap.sh` if the pull touched a build input, and re-executes itself once
-(guarded by an environment variable) so the new code is the code that runs.
+Every invocation that will contact the cluster checks `origin`, fast-forwards
+if behind, reruns `bootstrap.sh` if the pull touched a build input, and
+re-executes itself once (guarded by an environment variable) so the new code is
+the code that runs.
+
+Two invocations skip it, both deliberately: `--simulate`, because a rehearsal
+should not depend on the network or change the code under test halfway through,
+and `--list-checks`, which returns before phase 0 is reached. `--list-nodes`
+*does* run it, since it is handled after the orchestrator is built.
 
 Three deliberate conservatisms:
 
@@ -196,10 +373,12 @@ the wrong MTU will fail while every node still looks healthy alone.
 - **Full mesh on the data network**, sampled against anchors on the lab and
   IPMI networks. A full mesh is O(N²); on the network the DAQ actually uses,
   and which is small, that is affordable, and elsewhere it is not worth it.
-- **One SSH session per source**, not per pair. A full mesh over thirty nodes
-  is 870 pairs; 870 sessions would take longer than the rest of the recovery.
-  The probe script brackets each target's output with markers and the results
-  are split back apart.
+- **One SSH session per source**, not per pair. The shipped topology has 49
+  nodes on the data network, so the mesh is 49x48 = 2352 ordered pairs — a
+  simulated run reports `data: 2352/2352 paths ok`. As 2352 SSH sessions that
+  would take longer than the rest of the recovery; as 49 sessions, one per
+  source, it is affordable. The probe script brackets each target's output with
+  markers and the results are split back apart.
 - **Jumbo-frame probe**: 8972 bytes of payload plus 8 of ICMP header plus 20 of
   IP header is exactly a 9000-byte frame, sent with DF set, so it fails if any
   hop is not jumbo-clean.
@@ -282,6 +461,17 @@ ssh, and during an outage that is the likely case for at least one of them. The
 sweep answers in one bounded connect; a gateway that passes it still has to
 pass the SSH handshake, because an open port is not a working login.
 
+That resolution is **serialised**. `SSHFactory.gateway_for()` had an unguarded
+check-then-set cache, and every worker thread asks for its location's gateway
+before its first command — so on a cold cache all sixteen threads probed the
+same two gateways at once, each a TCP sweep plus a full SSH handshake per
+credential in the chain. Against a gateway already refusing logins that is a
+couple of hundred connections in the first second of a phase. The cache is cold
+exactly when it matters, too: it is `_make_ipmi_client` that happens to warm it,
+and that path returns early when Vault has failed, while phase 3 and
+`mu2e-power-netcheck` can start cold outright. The first caller now probes and
+the rest wait behind a lock.
+
 ## 8. Configuration
 
 Five layers, lowest first: built-in defaults, YAML, `config/.env`, environment,
@@ -311,12 +501,30 @@ needs an answer that does not involve reading four files.
 | Gateway stage is `power_on: false` | Power-cycling the jump host mid-sequence |
 | Attempt recorded before it is issued | Losing the audit trail to a crash |
 | Password on stdin, `ipmitool -E` | Credentials in a process table |
-| Private Kerberos caches, destroyed after the run | Root-capable tickets outliving the recovery |
+| Private Kerberos caches, destroyed by name after the run | Root-capable tickets outliving the recovery |
+| Cleanup refuses a file cache outside the run's own directory | Destroying the operator's own ticket |
+| Default-cache principal recorded before each mint and restored after | A service identity silently becoming the run's identity |
+| Startup *warning* on the default credential cache (it does not stop the run) | A whole run attempted as `mu2eraw`, with nothing to say why |
+| A credential rejection stops IPMI for the run | Locking out 45 BMC accounts with one wrong password |
+| `Publisher` refuses to publish under `--simulate` | A rehearsal overwriting the live report |
 
 The protected-host refusal is not overridable by any flag. That is the one
 place where the tool declines to do what it is told, and it is deliberate:
 powering down a gateway or the NFS server from a remote recovery session is
 never the intended outcome of a command typed at three in the morning.
+
+`--simulate` needs the whole row, not just the SSH and IPMI transports.
+`CheckContext.prober` has nothing closer to a gateway than the machine driving
+the run, so for `node_class: gateway` it falls back to `ctx.local` — and while
+the simulate branch replaced the SSH factory and the IPMI client, it left
+`self.local` as a real `LocalTransport`. `ping.lab` therefore shelled out and
+pinged `mu2egateway01` for real during a run whose entire claim is that it
+contacts nothing, which also made two phase tests pass or fail according to
+whether the workstation could reach Fermilab that second. The local transport is
+scripted under `--simulate` too. For the same reason `Publisher` takes a
+`simulate` flag and returns before any other test: `_copy` uses
+`shutil.copytree` directly rather than going through the transport, so scripting
+transports is not enough to hold it back.
 
 ## 10. What was deliberately not built
 
