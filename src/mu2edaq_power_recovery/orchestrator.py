@@ -221,11 +221,28 @@ class Orchestrator:
             return info
 
         self.kerberos = KerberosManager(self.settings, local=self.local)
+
+        # Before anything is attempted: is the ticket we are about to use
+        # actually the operator's? On macOS the credential cache is a
+        # collection, and a service identity minted into it can become the
+        # default -- after which every login runs as that identity and is
+        # refused, with nothing in the ssh error to say why.
+        warning = self.kerberos.ambient_warning()
+        if warning:
+            log.warning("%s", warning)
+            info["notes"].append(warning)
+
         try:
             tickets = self.kerberos.prepare()
             info["kerberos"] = {k: v.as_dict() for k, v in tickets.items()}
         except KerberosError as exc:
             raise SystemExit(f"error: {exc}")
+
+        # Say plainly which login/ticket pair the run will lead with -- it is
+        # the pair that decides everything downstream.
+        primary = self.kerberos.operator_credential()
+        log.info("primary credential: %s", primary.describe())
+        info["primary_credential"] = primary.as_dict()
 
         identities = self.kerberos.available_identities()
         if identities:

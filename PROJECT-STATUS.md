@@ -14,7 +14,7 @@ with the phase-0 self-update, the static report site, the logbook integration,
 the diagnostics utilities, the optional C/C++ probe library and its Python
 bindings, and the documentation set.
 
-293 automated tests pass, plus 7 C++ test groups and an end-to-end simulated
+295 automated tests pass, plus 7 C++ test groups and an end-to-end simulated
 four-phase run. **Nothing has yet been run against the real cluster** — the
 tests and the rehearsal deliberately contact nothing, so what is verified is
 the logic, not the environment. Two items remain open (§6): the MC-1 node list,
@@ -107,7 +107,7 @@ Every requirement from `Project-Description.md`, and where it is met.
 
 ## 4. Test matrix
 
-`pytest` — **293 passed**, no cluster, no credentials, no network.
+`pytest` — **295 passed**, no cluster, no credentials, no network.
 
 | Suite | Tests | Covers |
 |---|---|---|
@@ -118,7 +118,7 @@ Every requirement from `Project-Description.md`, and where it is met.
 | `unit/test_ipmi.py` | 43 | **Safety gates**, credentials, invocation shape, failure diagnosis, credential stop |
 | `unit/test_state.py` | 8 | Round-trip, refusal auditing, append-not-overwrite |
 | `unit/test_vault.py` | 11 | KV path resolution, folder-vs-secret, synonyms, file fallback |
-| `unit/test_credentials.py` | 55 | Primary-first chains, root fallback, ssh-failure classification, KRB5CCNAME, ccache protection |
+| `unit/test_credentials.py` | 50 | Primary-first chains, root fallback, ssh-failure classification, KRB5CCNAME |
 | `unit/test_network_guard.py` | 2 | The suite's "contacts nothing" claim is enforced, not just asserted |
 | `unit/test_sweep.py` | 8 | Both backends, identical semantics |
 | `unit/test_selfupdate.py` | 13 | Dirty tree, divergence, fast-forward, re-exec guard |
@@ -209,7 +209,14 @@ Both remain configurable, and the synonym fallback is kept, because the secret
 is maintained outside this repository and could be re-keyed without anything
 here noticing until a recovery needs it. That is a fallback, not a doubt.
 
-### 6.2a BMC username case — **needs a config line**
+### 6.2a BMC username case — ✅ **resolved 2026-09-18**
+`mu2e-ipmi-tool --diagnose` against a live BMC returned `username 'MU2E',
+cipher suite 3` on the first attempt, reading `Chassis Power is on`. The Vault
+secret now returns `MU2E`, so `ipmi.username` stays null (take it from Vault)
+and no config change is needed. The `--diagnose` mode and the `ipmi.username`
+override remain for the next time the two disagree.
+
+### 6.2b (superseded) BMC username case — needs a config line
 The Vault secret's `username` field holds `mu2e`; the working upstream
 `mu2e_ipmi.sh` hard-codes `MU2E`, and IPMI usernames are case sensitive. A BMC
 therefore refuses the session with "Unable to establish IPMI v2 / RMCP+
@@ -268,38 +275,42 @@ mu2egateway01 --run true` → `mu2e-ipmi-tool -n <one node> chassis power status
   first caller does it, the rest wait for the answer. (ii) `IPMIClient` retried
   a BMC that had *answered and rejected the credentials*, three invocations
   with four ipmitool retries inside each, and then did the same to the next
-  BMC — all 65 of them share one credential set. Given §6.2a is still open,
-  that is the most likely outcome of the first live run. A credential
+  BMC — all 65 of them share one credential set, so the first rejection
+  settles the matter for the rest. §6.2a has since closed in the good
+  direction (`MU2E` works), so this is no longer the expected outcome of the
+  first live run, but it remains what a rotated password or a changed Vault
+  field would produce. A credential
   rejection (RAKP, "unauthorized name") is no longer retried and now stops the
   run's IPMI with one clear diagnosis; `ipmi.stop_on_auth_failure: false`
   overrides it. A BMC that simply does not answer is deliberately not treated
   this way — "Unable to establish IPMI v2 / RMCP+ session" is what a dark
   chassis says too, and after an outage that is the expected case.
-- **Four remaining ways a run could have damaged the operator's credentials.**
-  Found by reviewing the fix above adversarially rather than by a failure.
-  (i) `cleanup()` ran a bare `kdestroy` steered only by `KRB5CCNAME` — the same
-  assumption that destroyed the ticket in the first place, and here it would
-  have run at the end of *every* recovery rather than once; the cache is now
-  named with `-c`, and any path outside the run's own temporary directory is
-  refused outright. (ii) `KerberosManager._kinit`, which mints the operator's
-  own *root-capable* principal, was still steered by `KRB5CCNAME` alone: the
-  service mint had been hardened, the personal one had not. It now passes
-  `-c FILE:<cache>` as well, and compares the default cache before and after.
-  (iii) `default_principal()` returned `None` both when there was no default
-  cache and when `klist` could not be run at all, so on a host with an unusual
-  Kerberos installation the before/after comparison became `None == None` and
-  passed with the guard silently disabled. "Could not look" is now a distinct
-  exception, and a mint that cannot be checked is refused rather than
-  attempted — which costs only the fallbacks, since the operator's own
-  principal is position 0 of every chain. (iv) A `get-kerberos-ticket` that
-  *timed out* skipped the default-cache comparison entirely, so a command that
-  clobbered the cache and then hung was reported as a timeout and the chain
-  moved on to the next six identities, each doing it again. The comparison now
-  runs on the timeout path too and takes precedence over the timeout in the
-  error. Also: the decision to abandon service identities for a whole run was
-  carried by a substring of an error message, and is now carried by the
-  exception type (`DefaultCacheClobbered`), with the substring kept underneath
-  as a fallback.
+- **macOS keeps credential caches in a collection, and minting displaces the
+  default.** The earlier diagnosis ("the operator's ticket was destroyed") was
+  wrong: Heimdal never destroyed it. It keeps caches in an API: *collection*
+  and makes each newly minted cache the collection default, so the personal
+  ticket is displaced, not deleted — `klist -l` still listed it throughout, and
+  `kswitch -p <principal>` restores it instantly. The tool now records the
+  default before each mint and puts the pointer back after, aborting the whole
+  chain only if a restore fails.
+- **Heimdal ignores `KRB5CCNAME=FILE:` for kinit.** So the private cache file
+  we asked for never appeared and every service identity was rejected as
+  unusable. The ticket is perfectly good, it just has a ccache *name*
+  (`API:<uuid>`) rather than a path; the tool now looks it up in the collection
+  by identity and uses that name. All seven identities resolve on macOS.
+- **The login must NOT be derived from the principal.** Deriving it
+  (`anorman@FNAL.GOV` → `anorman`) was a wrong fix for a misdiagnosed symptom:
+  verified against the live cluster, `mu2edaq` and `root` both log in fine with
+  the personal ticket, while `anorman` is refused because no such account
+  exists on those hosts. ssh_config was right; the original failure was the
+  displaced ticket alone. Reverted, with the reasoning recorded in the code.
+- **A failed helper reported the wrong cause.** `get-kerberos-ticket` appends a
+  "Known identities:" listing after an error, so taking the last line of its
+  output reported `nova:` as the failure. `summarise_tool_error` now skips the
+  hint block and surfaces the real line — which immediately exposed that the
+  helper takes `python3` from the ambient PATH (the system Python, with no
+  hvac, unless a venv happens to be active). That interpreter is now pinned to
+  ours, which has hvac by construction.
 - **Service-identity minting destroyed the operator's Kerberos ticket.** Found
   on the first live run. macOS ships Heimdal, whose default cache type is
   `API:`; `get-kerberos-ticket` sets `KRB5CCNAME=<bare path>`, which Heimdal

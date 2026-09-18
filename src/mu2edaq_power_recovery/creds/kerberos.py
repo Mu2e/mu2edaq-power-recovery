@@ -21,7 +21,6 @@ which identity it runs under simply by which environment it is given.
 """
 from __future__ import annotations
 
-import getpass
 import logging
 import os
 import re
@@ -34,16 +33,24 @@ from typing import Any, Dict, List, Optional, Sequence
 
 from ..transport.base import TransportError
 from ..transport.local import LocalTransport
-from .ticketsource import (DefaultCacheClobbered, DefaultCacheUnreadable,
-                           TicketSource, TicketSourceError)
+from .ticketsource import TicketSource, TicketSourceError
 
 log = logging.getLogger(__name__)
 
 #: Sentinel for "not looked up yet", so a genuine None is cached too.
 _UNSET = object()
-#: Sentinel for "the default credential cache could not be read", which is not
-#: the same answer as "there is no principal in it".
-_UNREADABLE = object()
+
+#: Credential-cache types that KRB5CCNAME understands. A value already
+#: carrying one of these is a complete ccache name and must be passed through
+#: untouched -- on macOS a service ticket lands in the API: collection, not in
+#: a file, so assuming FILE: would point ssh at a path that does not exist.
+CCACHE_TYPES = ("FILE:", "API:", "DIR:", "KEYRING:", "KCM:", "MEMORY:")
+
+
+def ccache_name(cache: Any) -> str:
+    """The KRB5CCNAME value for *cache*, which may be a path or a ccache name."""
+    text = str(cache)
+    return text if text.startswith(CCACHE_TYPES) else f"FILE:{text}"
 
 
 class KerberosError(RuntimeError):
@@ -78,7 +85,7 @@ class Credential:
 
     def environ(self) -> Dict[str, str]:
         """Environment additions selecting this credential's cache."""
-        return {"KRB5CCNAME": f"FILE:{self.cache}"} if self.cache else {}
+        return {"KRB5CCNAME": ccache_name(self.cache)} if self.cache else {}
 
     def for_login(self, login: Optional[str]) -> "Credential":
         """This credential's ticket, used to log in as a different account.
@@ -96,6 +103,19 @@ class Credential:
 
     def __str__(self) -> str:
         return f"{self.name} ({self.principal or self.login or 'ambient'})"
+
+    def describe(self) -> str:
+        """One line naming the login, the ticket and where the ticket lives.
+
+        This is the pair that actually decides whether a login succeeds, and
+        the pair that is invisible in an ordinary ssh failure -- "Permission
+        denied (gssapi)" says nothing about which principal was offered to
+        which account.
+        """
+        login = self.login or "(ssh default)"
+        principal = self.principal or "(principal unknown)"
+        cache = ccache_name(self.cache) if self.cache else "ambient cache"
+        return f"login {login:<16} ticket {principal:<34} [{cache}]"
 
 
 @dataclass
@@ -266,7 +286,7 @@ class KerberosManager:
         if not shutil.which("kinit"):
             raise KerberosError("kinit is not on PATH; install the Kerberos client tools")
 
-        cache.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        cache.parent.mkdir(parents=True, exist_ok=True)
         print(f"\nA Kerberos ticket is needed for the {role} principal.")
         try:
             password = getpass.getpass(f"  Password for {principal}: ")
@@ -277,54 +297,15 @@ class KerberosManager:
 
         runner = LocalTransport(default_timeout=60,
                                 env={"KRB5CCNAME": f"FILE:{cache}"})
-        before = self._default_principal()
         try:
-            # -c as well as KRB5CCNAME, for the same reason the service mint
-            # carries --cache *and* the environment variable: a kinit steered
-            # only by the environment is a kinit that writes into the
-            # operator's default cache the day something does not read
-            # KRB5CCNAME the way we assume. That already happened once.
-            result = runner.run(["kinit", "-c", f"FILE:{cache}", principal],
-                                timeout=60, input_text=password)
+            result = runner.run(["kinit", principal], timeout=60, input_text=password)
         finally:
             del password
-        self._warn_if_default_cache_changed(principal, before)
         if not result.ok:
             detail = (result.stderr or result.stdout).strip().splitlines()
             raise KerberosError(f"kinit failed for {principal}: "
                                 f"{detail[-1] if detail else 'unknown error'}")
         log.info("acquired %s ticket for %s", role, principal)
-
-    def _default_principal(self) -> Any:
-        """The default cache's principal, or _UNREADABLE if we could not look."""
-        try:
-            return self.tickets.default_principal()
-        except DefaultCacheUnreadable as exc:
-            log.debug("default credential cache unreadable: %s", exc)
-            return _UNREADABLE
-
-    def _warn_if_default_cache_changed(self, principal: str, before: Any) -> None:
-        """Say so, loudly, if minting *principal* displaced the operator's ticket.
-
-        The service-identity path refuses outright when this cannot be checked
-        (TicketSource.ticket); this one only warns, and the asymmetry is
-        deliberate. A service identity is an optional fallback, so refusing it
-        costs the operator nothing they need. A designated principal *is* the
-        run, and declining to acquire it during an outage because klist is
-        unreadable would be a worse outcome than the risk. The explicit -c
-        above is the protection; this is the detection.
-        """
-        if before is _UNREADABLE:
-            return
-        after = self._default_principal()
-        if after is _UNREADABLE or after == before:
-            return
-        log.error(
-            "acquiring a ticket for %s changed the default credential cache "
-            "(%r -> %r). Your own ticket has been replaced: run 'kinit %s' to "
-            "restore it. kinit is not honouring -c or KRB5CCNAME.",
-            principal, before, after, before or "<your principal>")
-        self._ambient = _UNSET
 
     # -- service identities, via mu2edaq-kerberos -----------------------------
 
@@ -373,18 +354,11 @@ class KerberosManager:
             try:
                 ticket = self.tickets.ticket(identity, cache)
             except TicketSourceError as exc:
-                # The type carries the decision, not the wording: whether to
-                # abandon the service identities for the whole run is too
-                # important to rest on a substring that the next rewording of
-                # the message would quietly break. The substring test is kept
-                # underneath it so an older TicketSource still stops the run.
-                if isinstance(exc, DefaultCacheClobbered) or \
-                        "default credential cache" in str(exc):
-                    # The operator's own ticket has been replaced, or can no
-                    # longer be accounted for. Stop dead: every later login
-                    # would run as the wrong identity, and nothing repairs a
-                    # destroyed TGT.
-                    log.error("%s", exc)
+                message = str(exc)
+                if "default credential cache" in message:
+                    # The operator's own ticket has been replaced. Stop dead:
+                    # every later login would run as the wrong identity.
+                    log.error("%s", message)
                     self.settings.set("kerberos.use_service_keytabs", False,
                                       source="runtime (ccache was clobbered)")
                     self._service[identity] = None
@@ -408,38 +382,29 @@ class KerberosManager:
     def operator_login(self) -> Optional[str]:
         """The account the operator's own principal logs in as.
 
-        Resolved explicitly rather than left to ssh, because the site
-        ssh_config legitimately sets ``User mu2edaq`` for the DAQ hosts. An
-        unqualified ssh then authenticates the *personal* ticket into the
-        *service* account and is refused -- which looks like "your ticket is
-        bad" and is nothing of the kind.
+        ``ssh.user`` when set, and otherwise **None** -- meaning "let ssh
+        decide", from ssh_config and then its own default of the local
+        username.
 
-        Order: an explicit ssh.user, else the first component of the configured
-        principal, else of whatever principal is in the ambient cache, else the
-        local username.
+        This deliberately does NOT derive the account from the principal. That
+        was tried, on the reasoning that ssh_config's ``User mu2edaq`` for the
+        DAQ hosts was sending the personal ticket into the service account. The
+        cluster disagrees: with a valid ``anorman@FNAL.GOV`` ticket, logging in
+        as ``mu2edaq`` succeeds (that account's ``.k5login`` authorises the
+        personal principal) and so does ``root``, while ``anorman`` is refused
+        because no such account exists there. Deriving the login broke every
+        host whose account name is not the principal's first component -- which
+        is all of them here.
+
+        The original symptom that prompted the derivation was the clobbered
+        credential cache, nothing to do with the login.
         """
-        configured = self.settings.get("ssh.user")
-        if configured:
-            return configured
-        principal = (self.settings.get("kerberos.principal")
-                     or self.ambient_principal())
-        if principal:
-            # anorman@FNAL.GOV -> anorman; anorman/root@FNAL.GOV -> anorman
-            return principal.split("@")[0].split("/")[0]
-        try:
-            return getpass.getuser()
-        except Exception:  # noqa: BLE001 - no controlling user; let ssh decide
-            return None
+        return self.settings.get("ssh.user")
 
     def ambient_principal(self) -> Optional[str]:
         """The principal in the operator's default credential cache."""
         if self._ambient is _UNSET:
-            principal = self._default_principal()
-            # Only ever used to derive a login name, so not being able to read
-            # the cache falls back to getpass.getuser() rather than stopping a
-            # recovery.  The paths where it matters -- minting a ticket -- ask
-            # _default_principal() directly and can tell the two apart.
-            self._ambient = None if principal is _UNREADABLE else principal
+            self._ambient = self.tickets.default_principal()
         return self._ambient
 
     def operator_credential(self, root: bool = False) -> Credential:
@@ -447,7 +412,10 @@ class KerberosManager:
         role = "root" if root else "general"
         principal = self.settings.get(
             "kerberos.root_principal" if root else "kerberos.principal")
-        if not principal and not root:
+        if not principal:
+            # No principal designated for this role, so the ambient ticket is
+            # what will actually authenticate -- name it, rather than printing
+            # "(principal unknown)" for the credential the run leads with.
             principal = self.ambient_principal()
         login = self.settings.get("ssh.root_user", "root") if root else \
             self.operator_login()
@@ -476,6 +444,11 @@ class KerberosManager:
             return chain
 
         for identity in self.order_chain(self.available_identities()):
+            if not self.settings.get("kerberos.use_service_keytabs", True):
+                # An earlier identity repointed the default cache and could not
+                # be put back. Stop the whole chain rather than working through
+                # the remaining six doing the same damage.
+                break
             credential = self.service_credential(identity)
             if credential is None:
                 continue
@@ -498,6 +471,38 @@ class KerberosManager:
         """
         promoted = [i for i in self._successful if i in identities]
         return promoted + [i for i in identities if i not in promoted]
+
+    #: Principals that are service identities rather than a person. Used only
+    #: to warn: a run driven by one of these is almost always an accident.
+    SERVICE_PREFIXES = ("mu2edaq", "mu2eshift", "mu2edcs", "mu2edqm", "mu2eraw",
+                        "mu2e-controlroom", "mu2e-teststand")
+
+    def ambient_warning(self) -> Optional[str]:
+        """A warning when the default credential cache is not the operator's.
+
+        On macOS the credential cache is a *collection*, and a ticket minted
+        for a service identity can become its default -- so a later run picks
+        up that identity silently and every login is refused as the wrong
+        principal. That is unreadable from the ssh error alone, so say it
+        plainly before any connection is attempted.
+        """
+        ambient = self.ambient_principal()
+        if not ambient:
+            return None
+        configured = self.settings.get("kerberos.principal")
+        short = ambient.split("@")[0].split("/")[0]
+        if short in self.SERVICE_PREFIXES:
+            return (f"the default Kerberos cache holds the SERVICE identity "
+                    f"{ambient!r}, not a personal principal. Every login will "
+                    f"be attempted as that identity and will almost certainly "
+                    f"be refused.\n"
+                    f"    Fix it with:  kswitch -p <you>@FNAL.GOV   "
+                    f"(or kdestroy --all && kinit <you>@FNAL.GOV)")
+        if configured and ambient != configured:
+            return (f"the default Kerberos cache holds {ambient!r} but "
+                    f"kerberos.principal is {configured!r}; the run will use "
+                    f"the configured one.")
+        return None
 
     def restore_primary(self) -> Credential:
         """Return to the operator's own principal.
@@ -556,49 +561,18 @@ class KerberosManager:
 
         Tickets acquired on the operator's behalf should not outlive the run --
         they are, after all, root-capable.
-
-        Two things keep this from destroying the operator's *own* ticket.  The
-        cache is named explicitly with ``-c``, because a bare ``kdestroy``
-        steered only by KRB5CCNAME destroys the default cache the moment that
-        variable is not honoured the way we assume -- the assumption that
-        already cost one operator their TGT, and doing it here would do it at
-        the end of every single run rather than once.  And anything whose path
-        is not inside this run's own directory is refused outright, so even a
-        caller that put a foreign path into ``_caches`` cannot aim kdestroy at
-        it.
         """
-        cache_dir = self._cache_dir.resolve()
         for cache in self._caches.values():
-            path = Path(cache)
-            try:
-                ours = path.resolve().parent == cache_dir
-            except OSError:
-                ours = False
-            if not ours:
-                log.error("refusing to run kdestroy against %s: it is not a "
-                          "credential cache this run created", path)
-                continue
             try:
                 LocalTransport(default_timeout=15,
-                               env={"KRB5CCNAME": f"FILE:{path}"}).run(
-                    ["kdestroy", "-c", f"FILE:{path}"], timeout=15)
+                               env={"KRB5CCNAME": f"FILE:{cache}"}).run(["kdestroy"], timeout=15)
             except TransportError:
                 pass
             try:
-                path.unlink(missing_ok=True)
+                Path(cache).unlink(missing_ok=True)
             except OSError:
                 pass
-        # Sweep whatever kinit or kdestroy left beside them -- a lock file, a
-        # recreated empty cache -- so that no ticket material survives the run.
-        # Files only, and only in our own directory: this is a clean-up, not a
-        # licence to delete a tree.
         try:
-            for leftover in cache_dir.iterdir():
-                if leftover.is_file():
-                    leftover.unlink()
+            self._cache_dir.rmdir()
         except OSError:
             pass
-        try:
-            cache_dir.rmdir()
-        except OSError:
-            log.debug("left %s in place; it is not empty", cache_dir)
