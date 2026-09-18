@@ -8,12 +8,15 @@ actually reaches ssh.
 """
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 import pytest
 
 from mu2edaq_power_recovery.creds.kerberos import Credential, KerberosManager
-from mu2edaq_power_recovery.creds.ticketsource import (ServiceTicket, TicketSource,
+from mu2edaq_power_recovery.creds.ticketsource import (DefaultCacheClobbered,
+                                                       DefaultCacheUnreadable,
+                                                       ServiceTicket, TicketSource,
                                                        TicketSourceError)
 from mu2edaq_power_recovery.transport.base import CommandResult
 from mu2edaq_power_recovery.transport.ssh import (SSHError, SSHFactory,
@@ -479,3 +482,214 @@ def test_a_clobbered_cache_disables_service_identities_for_the_run(manager):
     # ...and no further identity is attempted, because the damage is done.
     assert manager.settings.get("kerberos.use_service_keytabs") is False
     assert [c.name for c in manager.chain()] == ["general"]
+
+
+def test_the_clobber_stop_is_carried_by_the_exception_type(manager):
+    """Not by a substring of the message.
+
+    Whether to abandon the service identities for a whole run is too important
+    a decision to rest on the wording of an error string, which the next person
+    to reword it would break without noticing.  The message here deliberately
+    says nothing recognisable.
+    """
+    class Clobbering:
+        available = True
+        def identities(self): return ["mu2edaq", "mu2eshift"]
+        def unavailable_reason(self): return ""
+        @staticmethod
+        def default_principal(): return "anorman@FNAL.GOV"
+        def ticket(self, identity, cache, timeout=120):
+            raise DefaultCacheClobbered("something happened to your ticket")
+
+    manager.tickets = Clobbering()
+    assert manager.service_credential("mu2edaq") is None
+    assert manager.settings.get("kerberos.use_service_keytabs") is False
+    assert [c.name for c in manager.chain()] == ["general"]
+
+
+def test_an_unreadable_default_cache_is_not_an_answer(monkeypatch):
+    """'We could not look' must not be reported as 'there is nothing there'.
+
+    Both sides of the before/after comparison returning None passes it with
+    the guard switched off -- on exactly the sort of unusual Kerberos
+    installation that makes the guard worth having.
+    """
+    def no_klist(*args, **kwargs):
+        raise FileNotFoundError("klist")
+
+    monkeypatch.setattr(subprocess, "run", no_klist)
+    with pytest.raises(DefaultCacheUnreadable):
+        TicketSource.default_principal()
+
+
+def test_an_absent_default_cache_is_an_answer(monkeypatch):
+    # klist exits non-zero with "No credentials cache found". There is nothing
+    # there, which is a fact about the cache, not a failure to read it.
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: type("R", (), {
+        "returncode": 1, "stdout": b"",
+        "stderr": b"klist: No credentials cache found"})())
+    assert TicketSource.default_principal() is None
+
+
+def _stub_ticket_source(settings, monkeypatch, klist, run=None):
+    """A TicketSource whose command is a stub and whose klist is scripted."""
+    from mu2edaq_power_recovery.creds import ticketsource as ts_module
+
+    def default_run(self, command, args, timeout=120, env=None):
+        return type("R", (), {"returncode": 0, "stdout": b"", "stderr": b""})()
+
+    monkeypatch.setattr(ts_module.TicketSource, "resolve",
+                        lambda self, command: Path("/bin/true"))
+    monkeypatch.setattr(ts_module.TicketSource, "_run", run or default_run)
+    monkeypatch.setattr(ts_module.TicketSource, "default_principal",
+                        staticmethod(klist))
+    monkeypatch.setattr(ts_module.TicketSource, "_principal_of",
+                        staticmethod(lambda cache: "svc@FNAL.GOV"))
+    return ts_module.TicketSource(settings)
+
+
+def test_a_mint_is_refused_when_the_default_cache_cannot_be_read(settings, tmp_path,
+                                                                 monkeypatch):
+    """Refusing costs only the fallbacks; minting anyway risks the TGT."""
+    attempted = []
+
+    def unreadable():
+        raise DefaultCacheUnreadable("klist is not installed")
+
+    def record(self, command, args, timeout=120, env=None):
+        attempted.append(args)
+        return type("R", (), {"returncode": 0, "stdout": b"", "stderr": b""})()
+
+    source = _stub_ticket_source(settings, monkeypatch, unreadable, run=record)
+    with pytest.raises(TicketSourceError, match="refusing to mint"):
+        source.ticket("mu2edaq", tmp_path / "cache")
+    assert attempted == [], "the mint must not be attempted at all"
+
+
+def test_a_cache_that_stops_being_readable_counts_as_a_clobber(settings, tmp_path,
+                                                               monkeypatch):
+    # The absence of evidence that the ticket survived is not evidence that it
+    # did, and the cost of guessing wrong is every login that follows.
+    answers = iter(["anorman@FNAL.GOV"])
+
+    def klist():
+        try:
+            return next(answers)
+        except StopIteration:
+            raise DefaultCacheUnreadable("klist exited 127")
+
+    source = _stub_ticket_source(settings, monkeypatch, klist)
+    with pytest.raises(DefaultCacheClobbered, match="no longer be read"):
+        source.ticket("mu2eraw", tmp_path / "cache")
+
+
+def test_a_timed_out_mint_still_checks_the_operators_ticket(settings, tmp_path,
+                                                            monkeypatch):
+    """get-kerberos-ticket ran, so it may have clobbered the cache then hung.
+
+    Reporting only the timeout leaves the operator's ticket destroyed and the
+    chain free to try the next six identities, each one doing it again -- which
+    is how one bad mint became seven.
+    """
+    answers = iter(["anorman@FNAL.GOV", "mu2eraw/mu2e@FNAL.GOV"])
+
+    def hang(self, command, args, timeout=120, env=None):
+        raise subprocess.TimeoutExpired(cmd="get-kerberos-ticket", timeout=timeout)
+
+    source = _stub_ticket_source(settings, monkeypatch,
+                                 lambda: next(answers), run=hang)
+    with pytest.raises(DefaultCacheClobbered, match="replaced the default"):
+        source.ticket("mu2eraw", tmp_path / "cache")
+
+
+def test_a_timed_out_mint_with_an_intact_ticket_reports_the_timeout(settings, tmp_path,
+                                                                    monkeypatch):
+    answers = iter(["anorman@FNAL.GOV", "anorman@FNAL.GOV"])
+
+    def hang(self, command, args, timeout=120, env=None):
+        raise subprocess.TimeoutExpired(cmd="get-kerberos-ticket", timeout=timeout)
+
+    source = _stub_ticket_source(settings, monkeypatch,
+                                 lambda: next(answers), run=hang)
+    with pytest.raises(TicketSourceError, match="timed out"):
+        source.ticket("mu2edaq", tmp_path / "cache")
+
+
+def test_kinit_names_the_cache_explicitly(manager, tmp_path, monkeypatch):
+    """KRB5CCNAME alone is what sent seven service tickets into the default cache.
+
+    The service mint was hardened for this; the operator's own designated
+    principal -- the root-capable one -- was still being minted with nothing
+    but the environment variable to steer it.
+    """
+    import getpass as getpass_module
+
+    from mu2edaq_power_recovery.transport import local as local_module
+
+    seen = {}
+
+    def fake_run(self, command, timeout=None, user=None, input_text=None,
+                 check=False):
+        seen["argv"] = list(command)
+        seen["env"] = dict(self.env or {})
+        return CommandResult(command=" ".join(command), rc=0)
+
+    monkeypatch.setattr(getpass_module, "getpass", lambda prompt="": "not-a-password")
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(local_module.LocalTransport, "run", fake_run)
+
+    cache = manager.cache_for("anorman@FNAL.GOV")
+    manager._kinit("anorman@FNAL.GOV", cache, "general")
+
+    assert seen["argv"] == ["kinit", "-c", f"FILE:{cache}", "anorman@FNAL.GOV"]
+    assert seen["env"].get("KRB5CCNAME") == f"FILE:{cache}", \
+        "KRB5CCNAME must also be set, for any kinit that ignores -c"
+
+
+def test_cleanup_names_each_cache_and_never_runs_a_bare_kdestroy(manager, monkeypatch):
+    """A bare kdestroy steered only by KRB5CCNAME destroys the *default* cache.
+
+    That is the same assumption that cost an operator their ticket once, and
+    here it would run at the end of every single recovery rather than once.
+    """
+    from mu2edaq_power_recovery.transport import local as local_module
+
+    calls = []
+
+    def fake_run(self, command, timeout=None, user=None, input_text=None,
+                 check=False):
+        calls.append(list(command))
+        return CommandResult(command=" ".join(command), rc=0)
+
+    monkeypatch.setattr(local_module.LocalTransport, "run", fake_run)
+
+    cache = manager.cache_for("anorman@FNAL.GOV")
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    cache.write_text("stand-in for a credential cache")
+    manager._caches["general"] = cache
+
+    manager.cleanup()
+    assert calls == [["kdestroy", "-c", f"FILE:{cache}"]]
+    assert not cache.exists()
+
+
+def test_cleanup_refuses_a_cache_outside_the_runs_own_directory(manager, tmp_path,
+                                                                monkeypatch):
+    """Nothing puts a foreign path in _caches today.
+
+    If something ever does, kdestroy must not be what discovers it: the
+    plausible foreign path is the operator's own cache.
+    """
+    from mu2edaq_power_recovery.transport import local as local_module
+
+    calls = []
+    monkeypatch.setattr(local_module.LocalTransport, "run",
+                        lambda self, command, **kwargs: calls.append(list(command)))
+
+    foreign = tmp_path / "krb5cc_1000"
+    foreign.write_text("the operator's own ticket")
+    manager._caches["general"] = foreign
+
+    manager.cleanup()
+    assert calls == []
+    assert foreign.exists()

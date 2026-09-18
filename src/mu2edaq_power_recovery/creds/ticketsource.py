@@ -46,6 +46,27 @@ class TicketSourceError(RuntimeError):
     """mu2edaq-kerberos is unavailable, or could not mint a ticket."""
 
 
+class DefaultCacheUnreadable(TicketSourceError):
+    """The operator's default credential cache could not be inspected.
+
+    Distinct from "there is no default cache", which is an answer.  This means
+    we could not look, and a check that cannot be made must never be mistaken
+    for one that passed -- ``None == None`` would have silently switched the
+    clobber guard off on exactly the sort of unusual Kerberos installation
+    that makes it necessary.
+    """
+
+
+class DefaultCacheClobbered(TicketSourceError):
+    """Minting a service ticket disturbed the operator's own credentials.
+
+    A separate type because the *decision* it drives -- abandon the service
+    identities for the whole run -- is too important to hang on a substring of
+    an error message, which the next person to reword the message would break
+    without noticing.
+    """
+
+
 @dataclass
 class ServiceTicket:
     """A ticket minted for one service identity."""
@@ -137,17 +158,30 @@ class TicketSource:
 
         Read with KRB5CCNAME removed from the environment, so this reports the
         operator's own cache rather than whichever one a caller has selected.
+
+        Returns None when ``klist`` ran and found no principal -- an empty or
+        absent default cache, which is a legitimate state and a real answer.
+        Raises :class:`DefaultCacheUnreadable` when klist could not be run at
+        all: missing, unexecutable, or hung.  That is *not* an answer, and
+        returning None for it would make the before/after comparison in
+        :meth:`ticket` compare None with None and pass, disarming the one
+        check standing between a run and the operator's own ticket.
         """
         env = {k: v for k, v in os.environ.items() if k != "KRB5CCNAME"}
         try:
             result = subprocess.run(["klist"], env=env, stdout=subprocess.PIPE,
-                                    stderr=subprocess.DEVNULL, timeout=20,
+                                    stderr=subprocess.PIPE, timeout=20,
                                     check=False)
-        except (OSError, subprocess.SubprocessError):
-            return None
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise DefaultCacheUnreadable(
+                f"could not run klist to read the default credential cache: "
+                f"{exc}") from exc
         for line in result.stdout.decode("utf-8", "replace").splitlines():
             if "principal:" in line.lower():
                 return line.split(":", 1)[1].strip()
+        # klist exits non-zero for an absent or empty cache and says so on
+        # stderr.  That is an answer -- there is nothing there -- so it is
+        # reported as None rather than as a failure to look.
         return None
 
     def identities(self) -> List[str]:
@@ -189,7 +223,9 @@ class TicketSource:
         if command is None:
             raise TicketSourceError(self.unavailable_reason())
 
-        cache.parent.mkdir(parents=True, exist_ok=True)
+        # 0700: this directory holds TGTs.  mkdtemp already makes it so; the
+        # mode matters for a cache_dir supplied by a caller.
+        cache.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         extra = list(self.settings.get("kerberos.vault_client_args", []) or [])
 
         # An explicit FILE: type, not a bare path. macOS ships Heimdal, whose
@@ -205,30 +241,42 @@ class TicketSource:
         # the flag. Neither alone is enough to guarantee the default cache is
         # left alone, and that guarantee is the point.
         env = {**os.environ, "KRB5CCNAME": target}
-        before = self.default_principal()
+        try:
+            before = self.default_principal()
+        except DefaultCacheUnreadable as exc:
+            # Refusing here costs the operator the service-identity fallbacks
+            # and nothing else -- their own principal is position 0 of every
+            # chain and is unaffected. Minting anyway would spend their TGT on
+            # a guarantee we cannot make.
+            raise TicketSourceError(
+                f"refusing to mint a ticket for {identity}: the default "
+                f"credential cache cannot be read ({exc}), so the before/after "
+                f"comparison that protects your own ticket cannot be made. "
+                f"This is the operation that destroyed it once already. Set "
+                f"kerberos.use_service_keytabs: false to run without the "
+                f"service-identity fallbacks.") from exc
 
+        timed_out: Optional[TicketSourceError] = None
         try:
             result = self._run(command, [identity, "--cache", target, *extra],
                                timeout=timeout, env=env)
         except subprocess.TimeoutExpired as exc:
-            raise TicketSourceError(
-                f"get-kerberos-ticket timed out after {timeout}s for {identity}"
-            ) from exc
+            # Held back rather than raised: the command *ran*, so it may have
+            # replaced the default cache before it hung. Reporting a timeout
+            # while the operator's ticket is quietly gone -- and then trying
+            # the next six identities -- is how one bad mint became seven.
+            timed_out = TicketSourceError(
+                f"get-kerberos-ticket timed out after {timeout}s for {identity}")
+            timed_out.__cause__ = exc
+            result = None
         except OSError as exc:
+            # Never started, so nothing can have been touched.
             raise TicketSourceError(
                 f"could not run {command} for {identity}: {exc}") from exc
 
-        after = self.default_principal()
-        if before != after:
-            # Refuse to carry on quietly: the operator's own ticket has just
-            # been replaced, every later login would run as the wrong identity,
-            # and no amount of retrying fixes a destroyed TGT.
-            raise TicketSourceError(
-                f"minting a ticket for {identity} replaced the default "
-                f"credential cache ({before!r} -> {after!r}). Refusing to use "
-                f"service identities. Run 'kinit {before or '<your principal>'}' "
-                f"to restore your own ticket, and report this -- "
-                f"get-kerberos-ticket is not honouring --cache.")
+        self._assert_default_cache_survived(identity, before)
+        if timed_out is not None:
+            raise timed_out
 
         if result.returncode != 0:
             detail = (result.stderr or result.stdout).decode("utf-8", "replace")
@@ -243,6 +291,35 @@ class TicketSource:
                 f"else -- check that kinit honours KRB5CCNAME={target}.")
         return ServiceTicket(identity=identity, cache=cache,
                              principal=self._principal_of(cache))
+
+    def _assert_default_cache_survived(self, identity: str,
+                                       before: Optional[str]) -> None:
+        """Raise unless the operator's default cache is as it was.
+
+        Both failure directions count as a clobber.  A cache that can no
+        longer be read is not evidence that it survived -- it is the absence
+        of evidence -- and the cost of guessing wrong is the operator's TGT
+        and every login that follows.
+        """
+        try:
+            after = self.default_principal()
+        except DefaultCacheUnreadable as exc:
+            raise DefaultCacheClobbered(
+                f"after minting a ticket for {identity} the default "
+                f"credential cache could no longer be read ({exc}). Treating "
+                f"that as a clobber and refusing to use service identities. "
+                f"Check 'klist'; if your own ticket is gone, run "
+                f"'kinit {before or '<your principal>'}'.") from exc
+        if before != after:
+            # Refuse to carry on quietly: the operator's own ticket has just
+            # been replaced, every later login would run as the wrong identity,
+            # and no amount of retrying fixes a destroyed TGT.
+            raise DefaultCacheClobbered(
+                f"minting a ticket for {identity} replaced the default "
+                f"credential cache ({before!r} -> {after!r}). Refusing to use "
+                f"service identities. Run 'kinit {before or '<your principal>'}' "
+                f"to restore your own ticket, and report this -- "
+                f"get-kerberos-ticket is not honouring --cache.")
 
     @staticmethod
     def _principal_of(cache: Path) -> Optional[str]:

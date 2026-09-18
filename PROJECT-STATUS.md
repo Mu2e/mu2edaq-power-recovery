@@ -14,7 +14,7 @@ with the phase-0 self-update, the static report site, the logbook integration,
 the diagnostics utilities, the optional C/C++ probe library and its Python
 bindings, and the documentation set.
 
-278 automated tests pass, plus 7 C++ test groups and an end-to-end simulated
+288 automated tests pass, plus 7 C++ test groups and an end-to-end simulated
 four-phase run. **Nothing has yet been run against the real cluster** — the
 tests and the rehearsal deliberately contact nothing, so what is verified is
 the logic, not the environment. Two items remain open (§6): the MC-1 node list,
@@ -107,7 +107,7 @@ Every requirement from `Project-Description.md`, and where it is met.
 
 ## 4. Test matrix
 
-`pytest` — **278 passed**, no cluster, no credentials, no network.
+`pytest` — **288 passed**, no cluster, no credentials, no network.
 
 | Suite | Tests | Covers |
 |---|---|---|
@@ -118,7 +118,7 @@ Every requirement from `Project-Description.md`, and where it is met.
 | `unit/test_ipmi.py` | 39 | **Safety gates**, credentials, invocation shape, failure diagnosis |
 | `unit/test_state.py` | 8 | Round-trip, refusal auditing, append-not-overwrite |
 | `unit/test_vault.py` | 11 | KV path resolution, folder-vs-secret, synonyms, file fallback |
-| `unit/test_credentials.py` | 44 | Primary-first chains, root fallback, ssh-failure classification, KRB5CCNAME |
+| `unit/test_credentials.py` | 54 | Primary-first chains, root fallback, ssh-failure classification, KRB5CCNAME, ccache protection |
 | `unit/test_network_guard.py` | 2 | The suite's "contacts nothing" claim is enforced, not just asserted |
 | `unit/test_sweep.py` | 8 | Both backends, identical semantics |
 | `unit/test_selfupdate.py` | 13 | Dirty tree, divergence, fast-forward, re-exec guard |
@@ -256,6 +256,31 @@ mu2egateway01 --run true` → `mu2e-ipmi-tool -n <one node> chassis power status
   neither spelling nor output wording); and a simulated run would still have
   published its report to the live web area, because `Publisher._copy` writes
   with `shutil.copytree` rather than through the transport.
+- **Four remaining ways a run could have damaged the operator's credentials.**
+  Found by reviewing the fix above adversarially rather than by a failure.
+  (i) `cleanup()` ran a bare `kdestroy` steered only by `KRB5CCNAME` — the same
+  assumption that destroyed the ticket in the first place, and here it would
+  have run at the end of *every* recovery rather than once; the cache is now
+  named with `-c`, and any path outside the run's own temporary directory is
+  refused outright. (ii) `KerberosManager._kinit`, which mints the operator's
+  own *root-capable* principal, was still steered by `KRB5CCNAME` alone: the
+  service mint had been hardened, the personal one had not. It now passes
+  `-c FILE:<cache>` as well, and compares the default cache before and after.
+  (iii) `default_principal()` returned `None` both when there was no default
+  cache and when `klist` could not be run at all, so on a host with an unusual
+  Kerberos installation the before/after comparison became `None == None` and
+  passed with the guard silently disabled. "Could not look" is now a distinct
+  exception, and a mint that cannot be checked is refused rather than
+  attempted — which costs only the fallbacks, since the operator's own
+  principal is position 0 of every chain. (iv) A `get-kerberos-ticket` that
+  *timed out* skipped the default-cache comparison entirely, so a command that
+  clobbered the cache and then hung was reported as a timeout and the chain
+  moved on to the next six identities, each doing it again. The comparison now
+  runs on the timeout path too and takes precedence over the timeout in the
+  error. Also: the decision to abandon service identities for a whole run was
+  carried by a substring of an error message, and is now carried by the
+  exception type (`DefaultCacheClobbered`), with the substring kept underneath
+  as a fallback.
 - **Service-identity minting destroyed the operator's Kerberos ticket.** Found
   on the first live run. macOS ships Heimdal, whose default cache type is
   `API:`; `get-kerberos-ticket` sets `KRB5CCNAME=<bare path>`, which Heimdal

@@ -34,12 +34,16 @@ from typing import Any, Dict, List, Optional, Sequence
 
 from ..transport.base import TransportError
 from ..transport.local import LocalTransport
-from .ticketsource import TicketSource, TicketSourceError
+from .ticketsource import (DefaultCacheClobbered, DefaultCacheUnreadable,
+                           TicketSource, TicketSourceError)
 
 log = logging.getLogger(__name__)
 
 #: Sentinel for "not looked up yet", so a genuine None is cached too.
 _UNSET = object()
+#: Sentinel for "the default credential cache could not be read", which is not
+#: the same answer as "there is no principal in it".
+_UNREADABLE = object()
 
 
 class KerberosError(RuntimeError):
@@ -262,7 +266,7 @@ class KerberosManager:
         if not shutil.which("kinit"):
             raise KerberosError("kinit is not on PATH; install the Kerberos client tools")
 
-        cache.parent.mkdir(parents=True, exist_ok=True)
+        cache.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         print(f"\nA Kerberos ticket is needed for the {role} principal.")
         try:
             password = getpass.getpass(f"  Password for {principal}: ")
@@ -273,15 +277,54 @@ class KerberosManager:
 
         runner = LocalTransport(default_timeout=60,
                                 env={"KRB5CCNAME": f"FILE:{cache}"})
+        before = self._default_principal()
         try:
-            result = runner.run(["kinit", principal], timeout=60, input_text=password)
+            # -c as well as KRB5CCNAME, for the same reason the service mint
+            # carries --cache *and* the environment variable: a kinit steered
+            # only by the environment is a kinit that writes into the
+            # operator's default cache the day something does not read
+            # KRB5CCNAME the way we assume. That already happened once.
+            result = runner.run(["kinit", "-c", f"FILE:{cache}", principal],
+                                timeout=60, input_text=password)
         finally:
             del password
+        self._warn_if_default_cache_changed(principal, before)
         if not result.ok:
             detail = (result.stderr or result.stdout).strip().splitlines()
             raise KerberosError(f"kinit failed for {principal}: "
                                 f"{detail[-1] if detail else 'unknown error'}")
         log.info("acquired %s ticket for %s", role, principal)
+
+    def _default_principal(self) -> Any:
+        """The default cache's principal, or _UNREADABLE if we could not look."""
+        try:
+            return self.tickets.default_principal()
+        except DefaultCacheUnreadable as exc:
+            log.debug("default credential cache unreadable: %s", exc)
+            return _UNREADABLE
+
+    def _warn_if_default_cache_changed(self, principal: str, before: Any) -> None:
+        """Say so, loudly, if minting *principal* displaced the operator's ticket.
+
+        The service-identity path refuses outright when this cannot be checked
+        (TicketSource.ticket); this one only warns, and the asymmetry is
+        deliberate. A service identity is an optional fallback, so refusing it
+        costs the operator nothing they need. A designated principal *is* the
+        run, and declining to acquire it during an outage because klist is
+        unreadable would be a worse outcome than the risk. The explicit -c
+        above is the protection; this is the detection.
+        """
+        if before is _UNREADABLE:
+            return
+        after = self._default_principal()
+        if after is _UNREADABLE or after == before:
+            return
+        log.error(
+            "acquiring a ticket for %s changed the default credential cache "
+            "(%r -> %r). Your own ticket has been replaced: run 'kinit %s' to "
+            "restore it. kinit is not honouring -c or KRB5CCNAME.",
+            principal, before, after, before or "<your principal>")
+        self._ambient = _UNSET
 
     # -- service identities, via mu2edaq-kerberos -----------------------------
 
@@ -330,11 +373,18 @@ class KerberosManager:
             try:
                 ticket = self.tickets.ticket(identity, cache)
             except TicketSourceError as exc:
-                message = str(exc)
-                if "default credential cache" in message:
-                    # The operator's own ticket has been replaced. Stop dead:
-                    # every later login would run as the wrong identity.
-                    log.error("%s", message)
+                # The type carries the decision, not the wording: whether to
+                # abandon the service identities for the whole run is too
+                # important to rest on a substring that the next rewording of
+                # the message would quietly break. The substring test is kept
+                # underneath it so an older TicketSource still stops the run.
+                if isinstance(exc, DefaultCacheClobbered) or \
+                        "default credential cache" in str(exc):
+                    # The operator's own ticket has been replaced, or can no
+                    # longer be accounted for. Stop dead: every later login
+                    # would run as the wrong identity, and nothing repairs a
+                    # destroyed TGT.
+                    log.error("%s", exc)
                     self.settings.set("kerberos.use_service_keytabs", False,
                                       source="runtime (ccache was clobbered)")
                     self._service[identity] = None
@@ -384,7 +434,12 @@ class KerberosManager:
     def ambient_principal(self) -> Optional[str]:
         """The principal in the operator's default credential cache."""
         if self._ambient is _UNSET:
-            self._ambient = self.tickets.default_principal()
+            principal = self._default_principal()
+            # Only ever used to derive a login name, so not being able to read
+            # the cache falls back to getpass.getuser() rather than stopping a
+            # recovery.  The paths where it matters -- minting a ticket -- ask
+            # _default_principal() directly and can tell the two apart.
+            self._ambient = None if principal is _UNREADABLE else principal
         return self._ambient
 
     def operator_credential(self, root: bool = False) -> Credential:
@@ -501,18 +556,49 @@ class KerberosManager:
 
         Tickets acquired on the operator's behalf should not outlive the run --
         they are, after all, root-capable.
+
+        Two things keep this from destroying the operator's *own* ticket.  The
+        cache is named explicitly with ``-c``, because a bare ``kdestroy``
+        steered only by KRB5CCNAME destroys the default cache the moment that
+        variable is not honoured the way we assume -- the assumption that
+        already cost one operator their TGT, and doing it here would do it at
+        the end of every single run rather than once.  And anything whose path
+        is not inside this run's own directory is refused outright, so even a
+        caller that put a foreign path into ``_caches`` cannot aim kdestroy at
+        it.
         """
+        cache_dir = self._cache_dir.resolve()
         for cache in self._caches.values():
+            path = Path(cache)
+            try:
+                ours = path.resolve().parent == cache_dir
+            except OSError:
+                ours = False
+            if not ours:
+                log.error("refusing to run kdestroy against %s: it is not a "
+                          "credential cache this run created", path)
+                continue
             try:
                 LocalTransport(default_timeout=15,
-                               env={"KRB5CCNAME": f"FILE:{cache}"}).run(["kdestroy"], timeout=15)
+                               env={"KRB5CCNAME": f"FILE:{path}"}).run(
+                    ["kdestroy", "-c", f"FILE:{path}"], timeout=15)
             except TransportError:
                 pass
             try:
-                Path(cache).unlink(missing_ok=True)
+                path.unlink(missing_ok=True)
             except OSError:
                 pass
+        # Sweep whatever kinit or kdestroy left beside them -- a lock file, a
+        # recreated empty cache -- so that no ticket material survives the run.
+        # Files only, and only in our own directory: this is a clean-up, not a
+        # licence to delete a tree.
         try:
-            self._cache_dir.rmdir()
+            for leftover in cache_dir.iterdir():
+                if leftover.is_file():
+                    leftover.unlink()
         except OSError:
             pass
+        try:
+            cache_dir.rmdir()
+        except OSError:
+            log.debug("left %s in place; it is not empty", cache_dir)
