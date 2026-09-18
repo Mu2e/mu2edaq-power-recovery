@@ -14,7 +14,7 @@ with the phase-0 self-update, the static report site, the logbook integration,
 the diagnostics utilities, the optional C/C++ probe library and its Python
 bindings, and the documentation set.
 
-284 automated tests pass, plus 7 C++ test groups and an end-to-end simulated
+289 automated tests pass, plus 7 C++ test groups and an end-to-end simulated
 four-phase run. **Nothing has yet been run against the real cluster** — the
 tests and the rehearsal deliberately contact nothing, so what is verified is
 the logic, not the environment. Two items remain open (§6): the MC-1 node list,
@@ -107,7 +107,7 @@ Every requirement from `Project-Description.md`, and where it is met.
 
 ## 4. Test matrix
 
-`pytest` — **284 passed**, no cluster, no credentials, no network.
+`pytest` — **289 passed**, no cluster, no credentials, no network.
 
 | Suite | Tests | Covers |
 |---|---|---|
@@ -118,7 +118,7 @@ Every requirement from `Project-Description.md`, and where it is met.
 | `unit/test_ipmi.py` | 39 | **Safety gates**, credentials, invocation shape, failure diagnosis |
 | `unit/test_state.py` | 8 | Round-trip, refusal auditing, append-not-overwrite |
 | `unit/test_vault.py` | 11 | KV path resolution, folder-vs-secret, synonyms, file fallback |
-| `unit/test_credentials.py` | 50 | Primary-first chains, root fallback, ssh-failure classification, KRB5CCNAME |
+| `unit/test_credentials.py` | 55 | Primary-first chains, root fallback, ssh-failure classification, KRB5CCNAME |
 | `unit/test_network_guard.py` | 1 | The suite's "contacts nothing" claim is enforced, not just asserted |
 | `unit/test_sweep.py` | 8 | Both backends, identical semantics |
 | `unit/test_selfupdate.py` | 13 | Dirty tree, divergence, fast-forward, re-exec guard |
@@ -243,6 +243,23 @@ mu2egateway01 --run true` → `mu2e-ipmi-tool -n <one node> chassis power status
 --execute --until manager` on a maintenance day.
 
 ### 6.4 Fixed during development, worth knowing
+- **A changed host key was reported as a login failure.** Found against
+  `mu2e-calo-01`, whose ED25519 key no longer matched the stored ECDSA entry.
+  `StrictHostKeyChecking=accept-new` correctly refuses a *changed* key, so ssh
+  aborts before authenticating -- but the tool then walked all eight
+  credentials against it, reported "SSH login failed", and hammered the
+  gateway doing so. Host-key failures are now their own classification, stop
+  the chain immediately, and are reported as what they are, with the advice to
+  verify the new fingerprint out of band before touching `known_hosts`. This
+  matters specifically for an outage tool: reimaged nodes are exactly what a
+  recovery meets.
+- **`mu2e-ssh-probe` did not use the credential chain.** It built an
+  `SSHFactory` with no Kerberos manager, so it tested only the ambient ticket
+  and ssh_config's login -- meaning the diagnostic could succeed against a host
+  the real run could not reach, which is the confusion it exists to prevent. It
+  now builds the same chain, reports which credential succeeded, and lists each
+  refused login/ticket pair with its reason. `--no-chain` restores the old
+  ambient-only behaviour.
 - **macOS keeps credential caches in a collection, and minting displaces the
   default.** The earlier diagnosis ("the operator's ticket was destroyed") was
   wrong: Heimdal never destroyed it. It keeps caches in an API: *collection*

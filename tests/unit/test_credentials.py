@@ -649,3 +649,57 @@ def test_the_real_tool_error_is_surfaced_not_the_usage_hint():
               "  Known identities:\n    mu2e: \n    nova: ")
     assert "hvac" in summarise_tool_error(output)
     assert "nova" not in summarise_tool_error(output)
+
+
+# ---------------------------------------------------------------------------
+# a changed host key is not a login failure
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("stderr", [
+    "@@@@ WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED! @@@@",
+    "Host key verification failed.",
+    "POSSIBLE DNS SPOOFING DETECTED!",
+])
+def test_host_key_failures_are_their_own_category(stderr):
+    """Reimaged nodes are exactly what an outage recovery meets.
+
+    ssh aborts on a changed host key before authenticating, so this is not a
+    credential problem and must not be reported as one.
+    """
+    assert classify_ssh_failure(stderr) == "hostkey"
+
+
+def test_a_host_key_failure_stops_the_chain_immediately():
+    # No identity can get past a host key mismatch, and each further attempt
+    # is another connection to a host already refusing.
+    local = ScriptedLocal(
+        allow=set(),
+        failure="@@@ WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED! @@@")
+    t = SSHTransport("node", credentials=CHAIN, local=local)
+    with pytest.raises(SSHError):
+        t.run(["id", "-un"])
+    assert local.attempts == ["anorman"], "only the first credential is tried"
+
+
+def test_the_login_check_says_the_host_key_changed(make_context, monkeypatch):
+    from mu2edaq_power_recovery.checks import Status, run_check
+    from mu2edaq_power_recovery.transport.base import TransportError
+
+    ctx = make_context()
+
+    def refuse(*args, **kwargs):
+        raise TransportError("Host key verification failed.")
+
+    transport = ctx.ssh
+    monkeypatch.setattr(type(transport), "run", refuse)
+    transport.attempts = [{"credential": "general", "reason": "hostkey",
+                           "detail": "REMOTE HOST IDENTIFICATION HAS CHANGED",
+                           "described": "login x ticket y"}]
+
+    res = run_check("ssh.login", ctx)
+    assert res.status is Status.FAIL
+    assert "host key has CHANGED" in res.summary
+    assert res.data.get("hostkey_changed") is True
+    # It must say how to verify, not invite a blind known_hosts edit.
+    assert "ssh-keyscan" in res.detail
