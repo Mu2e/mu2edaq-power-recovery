@@ -254,40 +254,31 @@ class TicketSource:
         # left alone, and that guarantee is the point.
         env = {**os.environ, "KRB5CCNAME": target, **self._python_env()}
         before = self.default_principal()
+        if before is None:
+            log.debug("the default credential cache reports no principal; the "
+                      "displacement check cannot run for this mint")
 
+        timed_out: Optional[TicketSourceError] = None
         try:
             result = self._run(command, [identity, "--cache", target, *extra],
                                timeout=timeout, env=env)
         except subprocess.TimeoutExpired as exc:
-            raise TicketSourceError(
-                f"get-kerberos-ticket timed out after {timeout}s for {identity}"
-            ) from exc
+            # Held back rather than raised here. The command *ran*, so it may
+            # have repointed the default cache before it hung -- and returning
+            # a bare timeout would leave the pointer moved and let the chain
+            # try the next six identities under the wrong identity.
+            timed_out = TicketSourceError(
+                f"get-kerberos-ticket timed out after {timeout}s for {identity}")
+            timed_out.__cause__ = exc
+            result = None
         except OSError as exc:
+            # Never started, so nothing can have been repointed.
             raise TicketSourceError(
                 f"could not run {command} for {identity}: {exc}") from exc
 
-        after = self.default_principal()
-        if before and after != before:
-            # Expected on macOS. Heimdal keeps credential caches in a
-            # *collection* and makes a freshly minted one the collection
-            # default, whatever KRB5CCNAME or --cache said -- so minting a
-            # service ticket silently repoints "the default ticket" at it, and
-            # every later login runs as that identity.
-            #
-            # The operator's ticket is not destroyed, only displaced: it is
-            # still in the collection. So put the pointer back rather than
-            # giving up on service identities altogether.
-            if self._restore_default(before):
-                log.debug("default credential cache moved to %s while minting "
-                          "%s; restored to %s", after, identity, before)
-            else:
-                raise TicketSourceError(
-                    f"minting a ticket for {identity} repointed the default "
-                    f"credential cache from {before!r} to {after!r}, and it "
-                    f"could not be restored. Every later login would run as "
-                    f"the wrong identity. Run 'kswitch -p {before}' (or "
-                    f"'kinit {before}') and re-run with "
-                    f"kerberos.use_service_keytabs: false.")
+        self._restore_default_if_displaced(identity, before)
+        if timed_out is not None:
+            raise timed_out
 
         if result.returncode != 0:
             detail = (result.stderr or result.stdout).decode("utf-8", "replace")
@@ -319,6 +310,37 @@ class TicketSource:
             f"ticket is neither at {cache} nor in the credential collection. "
             f"Check that kinit honours KRB5CCNAME={target}.")
 
+    def _restore_default_if_displaced(self, identity: str,
+                                      before: Optional[str]) -> None:
+        """Put the default credential cache back if minting moved it.
+
+        Expected on macOS. Heimdal keeps credential caches in a *collection*
+        and makes a freshly minted one the collection default, whatever
+        KRB5CCNAME or --cache said -- so minting a service ticket silently
+        repoints "the default ticket" at it and every later login runs as that
+        identity.
+
+        The operator's ticket is not destroyed, only displaced: it is still in
+        the collection. So put the pointer back rather than giving up on
+        service identities altogether.
+        """
+        if not before:
+            return
+        after = self.default_principal()
+        if after == before:
+            return
+        if self.restore_default(before):
+            log.debug("default credential cache moved to %s while minting "
+                      "%s; restored to %s", after, identity, before)
+            return
+        raise TicketSourceError(
+            f"minting a ticket for {identity} repointed the default "
+            f"credential cache from {before!r} to {after!r}, and it "
+            f"could not be restored. Every later login would run as "
+            f"the wrong identity. Run 'kswitch -p {before}' (or "
+            f"'kinit {before}') and re-run with "
+            f"kerberos.use_service_keytabs: false.")
+
     @staticmethod
     def collection() -> dict:
         """principal -> ccache name for every cache in the collection.
@@ -344,7 +366,7 @@ class TicketSource:
                 caches[parts[0]] = parts[1]
         return caches
 
-    def _restore_default(self, principal: str) -> bool:
+    def restore_default(self, principal: str) -> bool:
         """Point the default credential cache back at *principal*.
 
         ``kswitch -p`` selects an existing cache within the collection; it

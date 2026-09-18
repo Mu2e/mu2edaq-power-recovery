@@ -8,11 +8,13 @@ actually reaches ssh.
 """
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 import pytest
 
-from mu2edaq_power_recovery.creds.kerberos import Credential, KerberosManager
+from mu2edaq_power_recovery.creds.kerberos import (Credential, KerberosManager,
+                                                   TicketInfo)
 from mu2edaq_power_recovery.creds.ticketsource import (ServiceTicket, TicketSource,
                                                        TicketSourceError)
 from mu2edaq_power_recovery.transport.base import CommandResult
@@ -222,6 +224,13 @@ class FakeTicketSource:
         # A stable ambient principal, so operator_login() resolves without
         # shelling out to klist.
         return "anorman@FNAL.GOV"
+
+    @staticmethod
+    def collection():
+        return {}
+
+    def restore_default(self, principal):
+        return True
 
 
 @pytest.fixture
@@ -584,7 +593,7 @@ def test_the_default_cache_pointer_is_restored_after_a_mint(settings, tmp_path,
                         lambda self, c: Path("/bin/true"))
     monkeypatch.setattr(ts_module.TicketSource, "default_principal",
                         staticmethod(lambda: state["default"]))
-    monkeypatch.setattr(ts_module.TicketSource, "_restore_default", fake_restore)
+    monkeypatch.setattr(ts_module.TicketSource, "restore_default", fake_restore)
     monkeypatch.setattr(ts_module.TicketSource, "collection",
                         staticmethod(lambda: {"mu2edaq/mu2e@FNAL.GOV": "API:XYZ"}))
 
@@ -608,7 +617,7 @@ def test_an_unrestorable_default_aborts_rather_than_continuing(settings, tmp_pat
                         lambda self, c: Path("/bin/true"))
     monkeypatch.setattr(ts_module.TicketSource, "default_principal",
                         staticmethod(lambda: next(principals)))
-    monkeypatch.setattr(ts_module.TicketSource, "_restore_default",
+    monkeypatch.setattr(ts_module.TicketSource, "restore_default",
                         lambda self, p: False)
 
     with pytest.raises(TicketSourceError) as excinfo:
@@ -649,3 +658,204 @@ def test_the_real_tool_error_is_surfaced_not_the_usage_hint():
               "  Known identities:\n    mu2e: \n    nova: ")
     assert "hvac" in summarise_tool_error(output)
     assert "nova" not in summarise_tool_error(output)
+
+
+# ---------------------------------------------------------------------------
+# the other places a ticket is minted, or destroyed
+# ---------------------------------------------------------------------------
+
+
+def test_a_timed_out_mint_still_restores_the_default_pointer(settings, tmp_path,
+                                                             monkeypatch):
+    """get-kerberos-ticket ran, so it may have moved the pointer and then hung.
+
+    Returning a bare timeout leaves the operator's ticket displaced and lets
+    the chain work through the next six identities under the wrong identity --
+    which is the shape of the original incident.
+    """
+    from mu2edaq_power_recovery.creds import ticketsource as ts_module
+
+    state = {"default": "anorman@FNAL.GOV", "restored": False}
+
+    def hang(self, command, args, timeout=120, env=None):
+        state["default"] = "mu2edaq/mu2e@FNAL.GOV"      # moved, then hangs
+        raise subprocess.TimeoutExpired(cmd="get-kerberos-ticket", timeout=timeout)
+
+    def fake_restore(self, principal):
+        state["default"] = principal
+        state["restored"] = True
+        return True
+
+    source = ts_module.TicketSource(settings)
+    monkeypatch.setattr(ts_module.TicketSource, "_run", hang)
+    monkeypatch.setattr(ts_module.TicketSource, "resolve",
+                        lambda self, c: Path("/bin/true"))
+    monkeypatch.setattr(ts_module.TicketSource, "default_principal",
+                        staticmethod(lambda: state["default"]))
+    monkeypatch.setattr(ts_module.TicketSource, "restore_default", fake_restore)
+
+    with pytest.raises(TicketSourceError, match="timed out"):
+        source.ticket("mu2edaq", tmp_path / "cache")
+    assert state["restored"], "the pointer must be put back even on a timeout"
+    assert state["default"] == "anorman@FNAL.GOV"
+
+
+def test_kinit_names_the_cache_and_restores_a_displaced_default(manager, monkeypatch):
+    """_kinit is the other place this project runs kinit.
+
+    The service mint was hardened against Heimdal repointing the default; this
+    one was still steered by KRB5CCNAME alone -- and it mints the designated,
+    root-capable principal.
+    """
+    import getpass as getpass_module
+
+    from mu2edaq_power_recovery.transport import local as local_module
+
+    seen = {}
+    state = {"default": "anorman@FNAL.GOV", "restored": None}
+
+    def fake_run(self, command, timeout=None, user=None, input_text=None,
+                 check=False):
+        seen["argv"] = list(command)
+        seen["env"] = dict(self.env or {})
+        seen["stdin"] = input_text
+        state["default"] = "mu2edaq/mu2e@FNAL.GOV"      # the mint moves it
+        return CommandResult(command=" ".join(command), rc=0)
+
+    def restore(principal):
+        state["default"] = principal
+        state["restored"] = principal
+        return True
+
+    monkeypatch.setattr(getpass_module, "getpass", lambda prompt="": "not-a-password")
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(local_module.LocalTransport, "run", fake_run)
+    manager.tickets.default_principal = lambda: state["default"]
+    manager.tickets.restore_default = restore
+
+    cache = manager.cache_for("anorman@FNAL.GOV")
+    manager._kinit("anorman@FNAL.GOV", cache, "general")
+
+    assert seen["argv"] == ["kinit", "-c", f"FILE:{cache}", "anorman@FNAL.GOV"]
+    assert seen["env"].get("KRB5CCNAME") == f"FILE:{cache}", \
+        "KRB5CCNAME must also be set, for any kinit that ignores -c"
+    assert state["restored"] == "anorman@FNAL.GOV"
+    # The prompt path itself is covered by getting this far: reaching kinit
+    # means getpass was importable, which it briefly was not.
+    assert seen["stdin"] == "not-a-password"
+    assert "not-a-password" not in " ".join(seen["argv"])
+    assert "not-a-password" not in "".join(seen["env"].values())
+
+
+def test_a_designated_principal_is_found_in_the_collection(manager, monkeypatch):
+    """Heimdal's kinit does not honour a FILE: cache name.
+
+    The ticket is perfectly good; it just has a ccache name rather than a
+    path. Without this fallback --principal and --root-principal do not work
+    at all on macOS, which is the platform the recovery is driven from.
+    """
+    monkeypatch.setattr(KerberosManager, "_kinit",
+                        lambda self, principal, cache, role: None)
+
+    def fake_klist(self, cache=None):
+        found = str(cache) == "API:ABC123"
+        return TicketInfo(principal="anorman@FNAL.GOV" if found else None,
+                          cache=str(cache), valid=found)
+
+    monkeypatch.setattr(KerberosManager, "_klist", fake_klist)
+    manager.tickets.collection = lambda: {"anorman@FNAL.GOV": "API:ABC123"}
+
+    info = manager.ensure("anorman@FNAL.GOV", role="general")
+    assert info.valid
+    assert manager._caches["general"] == "API:ABC123"
+    # ...and that name is what reaches ssh, not FILE:API:ABC123.
+    assert manager.environ_for("general") == {"KRB5CCNAME": "API:ABC123"}
+
+
+def test_cleanup_names_each_cache_and_never_runs_a_bare_kdestroy(manager, monkeypatch):
+    """A cache here may be a collection name, and FILE:API:<uuid> names nothing.
+
+    Unnamed, kdestroy either destroyed nothing -- so every service ticket
+    survived the run, sitting in the operator's collection where it can become
+    the collection default and make the *next* run log in as a service
+    identity -- or destroyed the default cache, according to whether
+    KRB5CCNAME happened to be honoured.
+    """
+    from mu2edaq_power_recovery.transport import local as local_module
+
+    calls = []
+
+    def fake_run(self, command, timeout=None, user=None, input_text=None,
+                 check=False):
+        calls.append(list(command))
+        return CommandResult(command=" ".join(command), rc=0)
+
+    monkeypatch.setattr(local_module.LocalTransport, "run", fake_run)
+
+    path_cache = manager.cache_for("anorman@FNAL.GOV")
+    path_cache.parent.mkdir(parents=True, exist_ok=True)
+    path_cache.write_text("stand-in for a credential cache")
+    manager._caches["general"] = path_cache
+    manager._caches["svc-mu2edaq"] = "API:8E3F"
+
+    manager.cleanup()
+
+    assert calls == [["kdestroy", "-c", f"FILE:{path_cache}"],
+                     ["kdestroy", "-c", "API:8E3F"]]
+    assert not path_cache.exists()
+
+
+def test_cleanup_refuses_a_file_cache_outside_the_runs_own_directory(manager, tmp_path,
+                                                                     monkeypatch):
+    """Nothing puts a foreign path in _caches today.
+
+    If something ever does, kdestroy must not be what discovers it: the
+    plausible foreign path is the operator's own cache.
+    """
+    from mu2edaq_power_recovery.transport import local as local_module
+
+    calls = []
+    monkeypatch.setattr(local_module.LocalTransport, "run",
+                        lambda self, command, **kwargs: calls.append(list(command)))
+
+    foreign = tmp_path / "krb5cc_1000"
+    foreign.write_text("the operator's own ticket")
+    manager._caches["general"] = foreign
+
+    manager.cleanup()
+    assert calls == []
+    assert foreign.exists()
+
+
+def test_the_gateways_are_probed_once_even_if_every_worker_asks_at_once(
+        settings, topology, monkeypatch):
+    """Nodes are assessed a thread apiece, and each asks for its gateway first.
+
+    On a cold cache that meant the whole worker pool probing the same two
+    gateways simultaneously -- a TCP sweep plus a full handshake per credential
+    in the chain, times sixteen, in the first second of a phase. Against a
+    gateway that is refusing logins that is a burst of a couple of hundred
+    connections, which is how a rate limiter starts refusing everything else
+    too.
+    """
+    import concurrent.futures
+    import time
+
+    from mu2edaq_power_recovery.transport import ssh as ssh_module
+
+    probes = []
+    factory = SSHFactory(settings, topology)
+
+    def slow_probe(self, location):
+        probes.append(location)
+        time.sleep(0.05)          # widen the window a real probe leaves open
+        self._gateway_cache[location] = "mu2egateway01.fnal.gov"
+        return self._gateway_cache[location]
+
+    monkeypatch.setattr(ssh_module.SSHFactory, "_select_gateway", slow_probe)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
+        futures = [pool.submit(factory.gateway_for, "mc2") for _ in range(16)]
+        answers = [f.result() for f in futures]
+
+    assert probes == ["mc2"], f"the gateways were probed {len(probes)} times"
+    assert set(answers) == {"mu2egateway01.fnal.gov"}

@@ -21,6 +21,7 @@ which identity it runs under simply by which environment it is given.
 """
 from __future__ import annotations
 
+import getpass
 import logging
 import os
 import re
@@ -161,7 +162,9 @@ class KerberosManager:
         self.min_lifetime: int = int(settings.get("kerberos.min_lifetime", 3600))
         self._cache_dir = cache_dir or Path(
             tempfile.mkdtemp(prefix="mu2e-recovery-krb5-"))
-        self._caches: Dict[str, Path] = {}
+        #: role -> KRB5CCNAME target: a path under _cache_dir normally, or a
+        #: collection name when Heimdal put the ticket in the API: collection.
+        self._caches: Dict[str, Any] = {}
         self._acquired: List[str] = []
         #: Service tickets come from the mu2edaq-kerberos package, which owns
         #: the keytab-in-Vault layout; this project never handles a keytab.
@@ -178,8 +181,10 @@ class KerberosManager:
 
     # -- inspection --------------------------------------------------------
 
-    def _klist(self, cache: Optional[Path] = None) -> TicketInfo:
-        env = {"KRB5CCNAME": f"FILE:{cache}"} if cache else {}
+    def _klist(self, cache: Optional[Any] = None) -> TicketInfo:
+        # ccache_name, not FILE:, because a cache we hold may be a collection
+        # name (API:<uuid>) rather than a path -- see ensure().
+        env = {"KRB5CCNAME": ccache_name(cache)} if cache else {}
         runner = LocalTransport(default_timeout=20, env=env)
         try:
             listed = runner.run(["klist"], timeout=20)
@@ -252,7 +257,7 @@ class KerberosManager:
                      info.principal or "(principal unknown)")
             return info
 
-        cache = self.cache_for(principal)
+        cache: Any = self.cache_for(principal)
         self._caches[role] = cache
         info = self._klist(cache)
         if info.valid and (info.remaining is None or info.remaining >= self.min_lifetime):
@@ -265,10 +270,36 @@ class KerberosManager:
         self._kinit(principal, cache, role)
         info = self._klist(cache)
         if not info.valid:
+            # No file, but kinit reported success: on macOS Heimdal does not
+            # honour a FILE: cache name and put the ticket in the API:
+            # collection instead. It is perfectly usable, it just has a ccache
+            # name rather than a path. Same fallback TicketSource.ticket()
+            # makes for the service identities -- without it, --principal and
+            # --root-principal simply do not work on the operator's own laptop.
+            name = self._collection_cache_for(principal)
+            if name:
+                log.debug("%s is in the credential collection as %s",
+                          principal, name)
+                cache = name
+                self._caches[role] = name
+                info = self._klist(name)
+        if not info.valid:
             raise KerberosError(f"kinit appeared to succeed but no valid ticket "
                                 f"is present for {principal}")
         self._acquired.append(principal)
         return info
+
+    def _collection_cache_for(self, principal: str) -> Optional[str]:
+        """The ccache name holding *principal*, from the collection."""
+        caches = self.tickets.collection()
+        if principal in caches:
+            return caches[principal]
+        # A principal given without a realm still names one cache.
+        wanted = principal.split("@")[0]
+        for held, name in caches.items():
+            if held.split("@")[0] == wanted:
+                return name
+        return None
 
     def _kinit(self, principal: str, cache: Path, role: str) -> None:
         """Run kinit into *cache*, reading the password from stdin.
@@ -295,17 +326,53 @@ class KerberosManager:
         if not password:
             raise KerberosError(f"empty password given for {principal}")
 
+        target = ccache_name(cache)
         runner = LocalTransport(default_timeout=60,
-                                env={"KRB5CCNAME": f"FILE:{cache}"})
+                                env={"KRB5CCNAME": target})
+        # The same displacement TicketSource.ticket() guards against, in the
+        # one other place this project mints a ticket -- and the riskier one,
+        # because this is the operator's own, root-capable principal. -c is
+        # what kinit documents; KRB5CCNAME alone is what Heimdal ignores.
+        before = self.tickets.default_principal()
         try:
-            result = runner.run(["kinit", principal], timeout=60, input_text=password)
+            result = runner.run(["kinit", "-c", target, principal],
+                                timeout=60, input_text=password)
         finally:
             del password
+        self._restore_default_if_displaced(principal, before)
         if not result.ok:
             detail = (result.stderr or result.stdout).strip().splitlines()
             raise KerberosError(f"kinit failed for {principal}: "
                                 f"{detail[-1] if detail else 'unknown error'}")
         log.info("acquired %s ticket for %s", role, principal)
+
+    def _restore_default_if_displaced(self, principal: str,
+                                      before: Optional[str]) -> None:
+        """Put the default credential cache back if minting moved it.
+
+        Unlike the service-identity path this does not abort the run when the
+        restore fails, and the asymmetry is deliberate: a service identity is
+        an optional fallback, so refusing it costs the operator nothing they
+        need, whereas a designated principal *is* the run. Refusing to acquire
+        it mid-outage would be worse than the displacement, which ``kswitch``
+        undoes in a second and which the startup guard names on the next run.
+        """
+        if not before:
+            return
+        after = self.tickets.default_principal()
+        if after == before:
+            return
+        if self.tickets.restore_default(before):
+            log.debug("default credential cache moved to %s while acquiring "
+                      "%s; restored to %s", after, principal, before)
+            return
+        log.error(
+            "acquiring a ticket for %s repointed the default credential cache "
+            "from %r to %r and it could not be restored. Every later login "
+            "will run as the wrong identity -- run 'kswitch -p %s' (or "
+            "'kinit %s') before continuing.",
+            principal, before, after, before, before)
+        self._ambient = _UNSET
 
     # -- service identities, via mu2edaq-kerberos -----------------------------
 
@@ -535,7 +602,7 @@ class KerberosManager:
         principal was designated for the role.
         """
         cache = self._caches.get(role)
-        return {"KRB5CCNAME": f"FILE:{cache}"} if cache else {}
+        return {"KRB5CCNAME": ccache_name(cache)} if cache else {}
 
     def prepare(self) -> Dict[str, TicketInfo]:
         """Acquire every ticket the run will need, before any phase starts.
@@ -561,18 +628,57 @@ class KerberosManager:
 
         Tickets acquired on the operator's behalf should not outlive the run --
         they are, after all, root-capable.
+
+        Each cache is named to kdestroy with ``-c``, not steered at it through
+        KRB5CCNAME.  Two reasons.  A cache here may be a collection name
+        (``API:<uuid>``) rather than a path, and ``FILE:API:<uuid>`` names
+        nothing -- so on macOS every service ticket used to survive the run,
+        sitting in the operator's collection where it can become the
+        collection default and make the *next* run log in as a service
+        identity.  And a bare kdestroy steered only by the environment
+        destroys the *default* cache the moment that variable is not honoured
+        the way we assume, which is the assumption this module has already
+        been caught making once.
+
+        A file cache outside the run's own directory is refused outright: the
+        plausible foreign path is the operator's own.
         """
+        cache_dir = self._cache_dir.resolve()
         for cache in self._caches.values():
+            target = ccache_name(cache)
+            if target.startswith("FILE:"):
+                path = Path(target[len("FILE:"):])
+                try:
+                    ours = path.resolve().parent == cache_dir
+                except OSError:
+                    ours = False
+                if not ours:
+                    log.error("refusing to destroy %s: not a credential cache "
+                              "this run created", path)
+                    continue
+            else:
+                path = None
             try:
                 LocalTransport(default_timeout=15,
-                               env={"KRB5CCNAME": f"FILE:{cache}"}).run(["kdestroy"], timeout=15)
-            except TransportError:
-                pass
-            try:
-                Path(cache).unlink(missing_ok=True)
-            except OSError:
-                pass
+                               env={"KRB5CCNAME": target}).run(
+                    ["kdestroy", "-c", target], timeout=15)
+            except TransportError as exc:
+                log.debug("kdestroy %s: %s", target, exc)
+            if path is not None:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        # Sweep whatever kinit or kdestroy left beside the caches, so no ticket
+        # material survives the run. Files only, and only in our own directory:
+        # this is a clean-up, not a licence to delete a tree.
         try:
-            self._cache_dir.rmdir()
+            for leftover in cache_dir.iterdir():
+                if leftover.is_file():
+                    leftover.unlink()
         except OSError:
             pass
+        try:
+            cache_dir.rmdir()
+        except OSError:
+            log.debug("left %s in place; it is not empty", cache_dir)

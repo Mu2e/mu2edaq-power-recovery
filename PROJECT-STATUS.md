@@ -14,7 +14,7 @@ with the phase-0 self-update, the static report site, the logbook integration,
 the diagnostics utilities, the optional C/C++ probe library and its Python
 bindings, and the documentation set.
 
-295 automated tests pass, plus 7 C++ test groups and an end-to-end simulated
+301 automated tests pass, plus 7 C++ test groups and an end-to-end simulated
 four-phase run. **Nothing has yet been run against the real cluster** — the
 tests and the rehearsal deliberately contact nothing, so what is verified is
 the logic, not the environment. Two items remain open (§6): the MC-1 node list,
@@ -107,7 +107,7 @@ Every requirement from `Project-Description.md`, and where it is met.
 
 ## 4. Test matrix
 
-`pytest` — **295 passed**, no cluster, no credentials, no network.
+`pytest` — **301 passed**, no cluster, no credentials, no network.
 
 | Suite | Tests | Covers |
 |---|---|---|
@@ -118,7 +118,7 @@ Every requirement from `Project-Description.md`, and where it is met.
 | `unit/test_ipmi.py` | 43 | **Safety gates**, credentials, invocation shape, failure diagnosis, credential stop |
 | `unit/test_state.py` | 8 | Round-trip, refusal auditing, append-not-overwrite |
 | `unit/test_vault.py` | 11 | KV path resolution, folder-vs-secret, synonyms, file fallback |
-| `unit/test_credentials.py` | 50 | Primary-first chains, root fallback, ssh-failure classification, KRB5CCNAME |
+| `unit/test_credentials.py` | 56 | Primary-first chains, root fallback, ssh-failure classification, KRB5CCNAME, collection caches, cleanup |
 | `unit/test_network_guard.py` | 2 | The suite's "contacts nothing" claim is enforced, not just asserted |
 | `unit/test_sweep.py` | 8 | Both backends, identical semantics |
 | `unit/test_selfupdate.py` | 13 | Dirty tree, divergence, fast-forward, re-exec guard |
@@ -243,6 +243,39 @@ mu2egateway01 --run true` → `mu2e-ipmi-tool -n <one node> chassis power status
 --execute --until manager` on a maintenance day.
 
 ### 6.4 Fixed during development, worth knowing
+- **`kinit` could not prompt for a password at all.** The commit that stopped
+  deriving the ssh login from the principal removed `import getpass` with the
+  `getpass.getuser()` call it had added — but `KerberosManager._kinit` still
+  calls `getpass.getpass`. So `--principal` or `--root-principal` without a
+  live ticket raised `NameError: name 'getpass' is not defined` instead of
+  prompting, which is requirement 18. Import restored; the path now has a test
+  that exercises it, which is how it was found.
+- **Three more places the credential handling had not caught up with the
+  collection model.** All consequences of a service ticket now having a ccache
+  *name* (`API:<uuid>`) rather than a path. (i) `cleanup()` built
+  `KRB5CCNAME=FILE:API:<uuid>`, which names nothing, and ran a bare `kdestroy`
+  — so on macOS *every service ticket survived the run*, sitting in the
+  operator's collection where it can become the collection default and make
+  the next run log in as a service identity, which is exactly the state the
+  new startup guard exists to warn about. Each cache is now named to kdestroy
+  with `-c`, and a file cache outside the run's own directory is refused
+  outright rather than handed to it. (ii) `KerberosManager._kinit` was still
+  steered by `KRB5CCNAME=FILE:` alone — the spelling Heimdal ignores — for the
+  operator's own, root-capable principal, with no displacement check at all.
+  It now passes `-c` as well and restores the default pointer if minting moved
+  it; unlike the service path it warns rather than aborting, because a
+  designated principal *is* the run. (iii) `ensure()` had no collection
+  fallback, so when Heimdal wrote no file it reported "kinit appeared to
+  succeed but no valid ticket is present" and `--principal` simply did not
+  work on the platform the recovery is driven from. It now looks the principal
+  up in the collection, as `TicketSource.ticket()` already does for the
+  service identities. `_klist` and `environ_for` take a ccache name too.
+- **A mint that timed out skipped the displacement check.** The command had
+  run, so it could have repointed the default cache and then hung — and the
+  caller saw only a timeout, logged a warning, and moved on to the next six
+  identities under the wrong identity. That is the shape of the original
+  incident. The check and the restore now run on the timeout path as well, and
+  a failed restore is reported in preference to the timeout.
 - **A `--simulate` run pinged the real gateways, and two phase tests failed
   intermittently because of it.** `CheckContext.prober` has nothing closer to a
   gateway than the machine driving the run, so for `node_class: gateway` it
@@ -382,6 +415,14 @@ mu2egateway01 --run true` → `mu2e-ipmi-tool -n <one node> chassis power status
   — but it changes the connection profile against machines that have just
   booted, in the most safety-critical phase, so it wants the author's eye
   rather than a drive-by fix. Found during the hostility review; not changed.
+- **Whether to abandon the service identities for a whole run is decided by a
+  substring.** `KerberosManager.service_credential` tests
+  `"default credential cache" in str(exc)` to tell an unrecoverable
+  displacement from an ordinary "no keytab for this identity". A reworded
+  message silently downgrades the first to the second, and the run carries on
+  minting under a displaced default. Carrying the decision on the exception
+  *type* would fix it; left alone because the current wording is fresh and the
+  author may want a view on the shape. Found during the credential review.
 - A node that answers TCP but refuses every identity costs one connection per
   credential in the chain — up to eight with the seven Mu2e service identities
   discovered from Vault. That is the intended behaviour of the chain and it is
