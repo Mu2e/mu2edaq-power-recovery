@@ -22,7 +22,7 @@ mu2e-power-on --execute                      # phase 2, actually switches on
 mu2e-power-netcheck                          # phase 3
 mu2e-power-report --post-ecl                 # phase 4
 
-pytest                                       # 271 tests, no cluster needed
+pytest                                       # 293 tests, no cluster needed
 cmake -S . -B build && cmake --build build   # optional C/C++ library
 ctest --test-dir build --output-on-failure
 ```
