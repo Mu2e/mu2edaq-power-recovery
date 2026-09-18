@@ -96,6 +96,31 @@ def test_parse_ping_on_empty_output_is_not_alive():
     assert not P.parse_ping("").alive
 
 
+PING_WINDOWS = """
+Ping statistics for 131.225.245.51:
+    Packets: Sent = 3, Received = 3, Lost = 0 (0% loss),
+Approximate round trip times in milli-seconds:
+    Minimum = 0ms, Maximum = 2ms, Average = 1ms
+"""
+PING_WINDOWS_DEAD = """
+Ping statistics for 131.225.245.51:
+    Packets: Sent = 3, Received = 0, Lost = 3 (100% loss),
+"""
+
+
+def test_parse_ping_reads_the_windows_wording():
+    # The gateways are the one class probed from the operator's own
+    # workstation, and INSTALL.md says that may be Windows 11.  Windows ping
+    # shares no wording with either Unix ping, so without this an operator on
+    # Windows would be told both gateways are dead.
+    win = P.parse_ping(PING_WINDOWS)
+    assert win.alive and win.transmitted == 3 and win.received == 3
+    assert win.loss_pct == 0.0 and win.rtt_avg_ms == 1.0
+
+    dead = P.parse_ping(PING_WINDOWS_DEAD)
+    assert not dead.alive and dead.loss_pct == 100.0
+
+
 def test_parse_load_handles_comma_separators():
     assert P.parse_load("load average: 0.31, 0.22, 0.09") == (0.31, 0.22, 0.09)
     assert P.parse_load("load averages: 1.00 2.00 3.00") == (1.0, 2.0, 3.0)

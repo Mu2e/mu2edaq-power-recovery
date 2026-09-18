@@ -135,6 +135,23 @@ def test_local_copy_publication(settings, tmp_path, orch, phase_result):
     assert (destination / "index.html").exists()
 
 
+def test_a_simulated_run_publishes_nothing(settings, tmp_path, orch):
+    # The 'copy' method writes with shutil.copytree rather than through the
+    # transport, so scripting the transport is not enough to keep a rehearsal
+    # off the live web area -- it would overwrite it for real.
+    writer = ReportWriter(settings, orch.topology)
+    writer.write_index(orch.store.get_run(), [], orch.version.as_dict())
+    destination = tmp_path / "webroot"
+    settings.set("report.publish.enabled", True)
+    settings.set("report.publish.method", "copy")
+    settings.set("report.publish.target", str(destination))
+
+    result = Publisher(settings, simulate=True).publish()
+    assert result["published"] is False
+    assert "simulated" in result["reason"]
+    assert not destination.exists()
+
+
 # ---------------------------------------------------------------------------
 # the logbook entry
 # ---------------------------------------------------------------------------

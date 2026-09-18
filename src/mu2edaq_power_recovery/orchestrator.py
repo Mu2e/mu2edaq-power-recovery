@@ -195,6 +195,16 @@ class Orchestrator:
 
         if self.simulate:
             self.ssh_factory = SimulatedSSHFactory(self.topology)
+            # The workstation's own transport has to be scripted as well.  A
+            # gateway has no prober closer than the machine driving the run --
+            # CheckContext.prober falls back to ctx.local for node_class
+            # 'gateway' -- so leaving the real LocalTransport in place meant a
+            # *simulated* ping.lab shelled out and pinged mu2egateway01 for
+            # real.  That contacted the cluster the simulation promises not to
+            # touch, and made the outcome depend on whether the operator's
+            # workstation happened to reach Fermilab at that instant, which is
+            # what made the phase tests fail intermittently.
+            self.local = self.ssh_factory.for_host("localhost")
             # A simulated IPMI client too, driven by the same scripted
             # transport: without it every power.* check would report SKIP and
             # the rehearsal would exercise neither the BMC parsing nor the

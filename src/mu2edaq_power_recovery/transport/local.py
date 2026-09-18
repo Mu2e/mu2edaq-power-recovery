@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import os
 import subprocess
+import sys
 import time
 from typing import Any, Optional, Sequence
 
@@ -25,6 +26,11 @@ class LocalTransport(Transport):
     """
 
     host = "localhost"
+
+    #: Unlike every other transport, this one does not reach a RHEL node: the
+    #: operator drives the recovery from Linux, macOS or Windows.  A command
+    #: built for this transport may not assume the GNU/iputils spelling.
+    platform = sys.platform
 
     def __init__(self, default_timeout: float = 120.0,
                  max_capture: int = DEFAULT_MAX_CAPTURE,

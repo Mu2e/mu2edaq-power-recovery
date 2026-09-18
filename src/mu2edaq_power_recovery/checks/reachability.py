@@ -2,23 +2,45 @@
 from __future__ import annotations
 
 import time
-from typing import Optional
+from typing import Any, Optional
 
 from ..transport.base import TransportError
 from .base import CheckContext, CheckResult, Status, register, result
 from .parsers import parse_ping
 
 
-def _ping_command(target: str, count: int, timeout: int,
-                  payload: Optional[int] = None) -> str:
-    """A ping command that works on both iputils (Linux) and BSD ping.
+def ping_dialect(transport: Any) -> str:
+    """Which ping *transport*'s far end speaks: 'iputils', 'bsd' or 'windows'."""
+    platform = getattr(transport, "platform", "linux")
+    if platform.startswith("win") or platform == "cygwin":
+        return "windows"
+    if platform.startswith("linux"):
+        return "iputils"
+    return "bsd"
 
-    ``-c`` and ``-W`` are common; ``-W`` means seconds on Linux and is a
-    per-packet timeout, which is what we want.  The payload/DF options are only
-    added for the MTU probe, where they are Linux-specific -- the gateways this
-    runs on are Linux, so that is safe.
+
+def _ping_command(target: str, count: int, timeout: int,
+                  payload: Optional[int] = None,
+                  dialect: str = "iputils") -> str:
+    """A ping command in the dialect of the host that will run it.
+
+    The three spellings are not cosmetic variants.  iputils reads ``-W`` as
+    *seconds*; BSD ping reads the same flag as *milliseconds*; Windows spells
+    the pair ``-n``/``-w`` and shares neither.  Sending the iputils form
+    everywhere turned a five-second wait into a five-millisecond one whenever
+    the run was driven from a Mac, so every gateway came back "does not answer
+    ICMP" -- and gateways are precisely the class probed from the operator's
+    own workstation, because CheckContext.prober has nothing closer to them.
+
+    The payload/DF options are iputils-only.  Only the phase-3 MTU probe asks
+    for them and that always runs on a gateway, so the other dialects are
+    never asked to express them.
     """
-    cmd = f"ping -c {count} -W {timeout} -q"
+    if dialect == "windows":
+        # -w is milliseconds here too, and there is no quiet mode.
+        return f"ping -n {count} -w {timeout * 1000} {target}"
+    wait = timeout * 1000 if dialect == "bsd" else timeout
+    cmd = f"ping -c {count} -W {wait} -q"
     if payload is not None:
         cmd += f" -M do -s {payload}"
     return f"{cmd} {target}"
@@ -31,7 +53,9 @@ def ping_lab(ctx: CheckContext) -> CheckResult:
     count = int(ctx.threshold("ping_count", 3))
     timeout = int(ctx.threshold("ping_timeout_s", 5))
 
-    res = ctx.probe(_ping_command(target, count, timeout), timeout=count * timeout + 10)
+    command = _ping_command(target, count, timeout,
+                            dialect=ping_dialect(ctx.prober))
+    res = ctx.probe(command, timeout=count * timeout + 10)
     stats = parse_ping(res.output)
     data = {"target": target, "probed_from": ctx.prober.host, **stats.as_dict()}
 

@@ -173,15 +173,21 @@ class PingResult:
 
 
 _PING_STATS = re.compile(r"(\d+) packets transmitted,\s*(\d+)\s*(?:packets\s*)?received")
-_PING_LOSS = re.compile(r"([\d.]+)% packet loss")
+_PING_LOSS = re.compile(r"([\d.]+)% (?:packet )?loss")
 _PING_RTT = re.compile(r"(?:rtt|round-trip) min/avg/max(?:/mdev|/stddev)?\s*=\s*"
                        r"[\d.]+/([\d.]+)/")
+# Windows ping shares no wording with either Unix ping, and the gateways are
+# the one class probed from the operator's workstation -- which the install
+# docs say may be Windows 11.  Without these an operator driving the recovery
+# from Windows would be told both gateways are dead.
+_PING_STATS_WIN = re.compile(r"Sent\s*=\s*(\d+),\s*Received\s*=\s*(\d+)")
+_PING_RTT_WIN = re.compile(r"Average\s*=\s*(\d+)\s*ms")
 
 
 def parse_ping(text: str) -> PingResult:
-    """Parse the summary block of iputils or BSD ping."""
+    """Parse the summary block of iputils, BSD or Windows ping."""
     res = PingResult()
-    stats = _PING_STATS.search(text)
+    stats = _PING_STATS.search(text) or _PING_STATS_WIN.search(text)
     if stats:
         res.transmitted = int(stats.group(1))
         res.received = int(stats.group(2))
@@ -190,7 +196,7 @@ def parse_ping(text: str) -> PingResult:
         res.loss_pct = float(loss.group(1))
     elif res.transmitted:
         res.loss_pct = 100.0 * (res.transmitted - res.received) / res.transmitted
-    rtt = _PING_RTT.search(text)
+    rtt = _PING_RTT.search(text) or _PING_RTT_WIN.search(text)
     if rtt:
         res.rtt_avg_ms = float(rtt.group(1))
     return res

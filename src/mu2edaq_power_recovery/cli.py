@@ -314,7 +314,8 @@ def write_report(orch: Orchestrator, results: Sequence[Any],
     if run.get("id"):
         writer.archive_run(int(run["id"]))
 
-    publication = Publisher(settings, orch.local).publish()
+    publication = Publisher(settings, orch.local,
+                            simulate=orch.simulate).publish()
     return {"pages": written, "output_dir": str(writer.output_dir),
             "publication": publication, "page_paths": writer.page_paths()}
 

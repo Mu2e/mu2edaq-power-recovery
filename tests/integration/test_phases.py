@@ -41,6 +41,28 @@ def test_assess_reports_every_node_healthy_on_a_healthy_cluster(orch):
     assert result.counts["ok"] == 2
 
 
+def test_a_simulated_run_probes_gateways_through_the_script(orch):
+    """A simulation must contact nothing -- gateways included.
+
+    CheckContext.prober has nothing closer to a gateway than the machine
+    driving the run, so while the orchestrator left the real LocalTransport in
+    place a *simulated* ping.lab shelled out and pinged mu2egateway01 for
+    real.  These tests then passed or failed according to whether the
+    workstation could reach Fermilab at that instant, which is exactly the
+    intermittent failure this guards against.
+    """
+    from mu2edaq_power_recovery.transport import LocalTransport
+
+    assert not isinstance(orch.local, LocalTransport)
+    result = phase1_assess.run(orch, _nodes(orch, "mu2egateway01"))
+    ping = next(r for r in result.assessments[0].results
+                if r.check_id == "ping.lab")
+    assert ping.status is Status.OK
+    assert ping.data["probed_from"] == "localhost"
+    # ... and the probe landed in the scripted call log, not on a socket.
+    assert orch.ssh_factory.base.ran(r"\bping\b", host="localhost")
+
+
 def test_assess_takes_no_corrective_action(orch):
     # The phase is specified as read-only; nothing it runs may change state.
     phase1_assess.run(orch, _nodes(orch, "mu2e-trk-01"))

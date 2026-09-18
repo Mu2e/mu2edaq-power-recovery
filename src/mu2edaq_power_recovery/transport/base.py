@@ -79,6 +79,13 @@ class Transport(abc.ABC):
     #: Host this transport addresses, for logging and CommandResult.host.
     host: str = "localhost"
 
+    #: Which command dialect the far end speaks.  Every DAQ node and gateway
+    #: is RHEL, so "linux" is right for every transport except the local one,
+    #: which is whatever the operator drives the recovery from.  Only commands
+    #: whose spelling genuinely differs need to consult it -- ping does, and
+    #: gets it wrong in a way that reads as a dead host (see _ping_command).
+    platform: str = "linux"
+
     @abc.abstractmethod
     def run(self, command: Command, timeout: Optional[float] = None,
             user: Optional[str] = None, input_text: Optional[str] = None,

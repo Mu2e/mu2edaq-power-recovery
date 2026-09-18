@@ -101,7 +101,7 @@ def make_context(settings, topology, factory, checks_config):
 
 @pytest.fixture(autouse=True)
 def no_real_network(monkeypatch, request):
-    """Fail any test that tries to shell out to ssh, ipmitool or kinit.
+    """Fail any test that tries to shell out to ssh, ping, ipmitool or kinit.
 
     The suite claims to contact nothing -- no DAQ network, no Kerberos ticket,
     no Vault -- and that claim is the reason it can be run before an outage.
@@ -110,6 +110,13 @@ def no_real_network(monkeypatch, request):
     it for real. This turns that into a failure instead of a slow test and a
     stray connection to the cluster.
 
+    ``ping`` is on the list because leaving it off cost two days of an
+    intermittent failure: a simulated run probed gateway nodes from the
+    workstation's own transport, so ping.lab really did ping mu2egateway01,
+    and the phase tests passed or failed according to whether that answered.
+    A test that pings a DAQ host is a test that contacts the DAQ network,
+    whatever the transport underneath claims to be.
+
     Mark a test with @pytest.mark.allow_network to opt out.
     """
     if request.node.get_closest_marker("allow_network"):
@@ -117,8 +124,9 @@ def no_real_network(monkeypatch, request):
 
     from mu2edaq_power_recovery.transport import local as local_module
 
-    blocked = ("ssh", "scp", "rsync", "ipmitool", "kinit", "klist", "kdestroy",
-               "vault", "get-kerberos-ticket", "vault-client")
+    blocked = ("ssh", "scp", "rsync", "ping", "ping6", "ipmitool", "kinit",
+               "klist", "kdestroy", "vault", "get-kerberos-ticket",
+               "vault-client")
     original = local_module.LocalTransport.run
 
     def guarded(self, command, *args, **kwargs):

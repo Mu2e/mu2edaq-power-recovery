@@ -14,7 +14,7 @@ with the phase-0 self-update, the static report site, the logbook integration,
 the diagnostics utilities, the optional C/C++ probe library and its Python
 bindings, and the documentation set.
 
-271 automated tests pass, plus 7 C++ test groups and an end-to-end simulated
+278 automated tests pass, plus 7 C++ test groups and an end-to-end simulated
 four-phase run. **Nothing has yet been run against the real cluster** — the
 tests and the rehearsal deliberately contact nothing, so what is verified is
 the logic, not the environment. Two items remain open (§6): the MC-1 node list,
@@ -107,23 +107,23 @@ Every requirement from `Project-Description.md`, and where it is met.
 
 ## 4. Test matrix
 
-`pytest` — **271 passed**, no cluster, no credentials, no network.
+`pytest` — **278 passed**, no cluster, no credentials, no network.
 
 | Suite | Tests | Covers |
 |---|---|---|
 | `unit/test_topology.py` | 14 | NodeRange expansion, aliases, classes, protection, MC-1 emptiness |
 | `unit/test_settings.py` | 23 | All five precedence layers, coercion, redaction, malformed YAML |
-| `unit/test_parsers.py` | 19 | `df`, `ip`, `ping` (iputils + BSD), `mdstat`, SMART, kernel errors |
-| `unit/test_checks.py` | 36 | Every check's pass and fail path; framework containment |
+| `unit/test_parsers.py` | 20 | `df`, `ip`, `ping` (iputils + BSD + Windows), `mdstat`, SMART, kernel errors |
+| `unit/test_checks.py` | 39 | Every check's pass and fail path; framework containment; ping dialects |
 | `unit/test_ipmi.py` | 39 | **Safety gates**, credentials, invocation shape, failure diagnosis |
 | `unit/test_state.py` | 8 | Round-trip, refusal auditing, append-not-overwrite |
 | `unit/test_vault.py` | 11 | KV path resolution, folder-vs-secret, synonyms, file fallback |
 | `unit/test_credentials.py` | 44 | Primary-first chains, root fallback, ssh-failure classification, KRB5CCNAME |
-| `unit/test_network_guard.py` | 1 | The suite's "contacts nothing" claim is enforced, not just asserted |
+| `unit/test_network_guard.py` | 2 | The suite's "contacts nothing" claim is enforced, not just asserted |
 | `unit/test_sweep.py` | 8 | Both backends, identical semantics |
 | `unit/test_selfupdate.py` | 13 | Dirty tree, divergence, fast-forward, re-exec guard |
-| `integration/test_phases.py` | 22 | All four phases end to end |
-| `integration/test_report.py` | 19 | Page rendering, archiving, publication, ECL body |
+| `integration/test_phases.py` | 23 | All four phases end to end; simulation hermeticity |
+| `integration/test_report.py` | 20 | Page rendering, archiving, publication, ECL body |
 | `integration/test_cli.py` | 14 | Driver, flags, exit codes, JSON output |
 
 **C++** — `ctest`, 7 test groups: version/OpenMP agreement, unresolvable names,
@@ -236,6 +236,26 @@ mu2egateway01 --run true` → `mu2e-ipmi-tool -n <one node> chassis power status
 --execute --until manager` on a maintenance day.
 
 ### 6.4 Fixed during development, worth knowing
+- **A `--simulate` run pinged the real gateways, and two phase tests failed
+  intermittently because of it.** `CheckContext.prober` has nothing closer to a
+  gateway than the machine driving the run, so for `node_class: gateway` it
+  falls back to `ctx.local` — and the orchestrator's simulate branch replaced
+  the SSH factory and the IPMI client with scripted stand-ins but left
+  `self.local` as the real `LocalTransport`. `ping.lab` therefore shelled out
+  and pinged `mu2egateway01` for real during a run that promises to contact
+  nothing, and `test_a_failed_stage_stops_the_sequence` and
+  `test_report_summarises_the_stored_run` passed or failed according to whether
+  the workstation could reach Fermilab that second (the observed headline,
+  `1/2 node(s) healthy; 1 failed`, is the gateway failing `ping.lab`). A
+  simulated run's local transport is now scripted too. The guard that should
+  have caught this did not list `ping`; it does now, so the same mistake fails
+  loudly instead of intermittently. Two adjacent faults were fixed with it: BSD
+  `ping` reads `-W` as *milliseconds* where iputils reads it as *seconds*, so
+  driving a recovery from a Mac turned the 5 s per-packet wait into 5 ms and
+  reported both gateways as answering no ICMP at all (Windows `ping` shares
+  neither spelling nor output wording); and a simulated run would still have
+  published its report to the live web area, because `Publisher._copy` writes
+  with `shutil.copytree` rather than through the transport.
 - **Service-identity minting destroyed the operator's Kerberos ticket.** Found
   on the first live run. macOS ships Heimdal, whose default cache type is
   `API:`; `get-kerberos-ticket` sets `KRB5CCNAME=<bare path>`, which Heimdal
@@ -295,7 +315,8 @@ mu2egateway01 --run true` → `mu2e-ipmi-tool -n <one node> chassis power status
 - Phase 3's full mesh on the data network is O(N²) SSH-bundled probes; at the
   present 30-odd data-network nodes that is ~870 pairs in one session per
   source. If the cluster grows substantially, consider anchoring it too.
-- `pytest` takes ~70 s, dominated by deliberate sweep timeouts.
+- `pytest` takes ~25 s, dominated by deliberate sweep timeouts. It was ~70 s
+  until the simulated run stopped issuing real pings (§6.4).
 
 ---
 

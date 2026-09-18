@@ -12,6 +12,7 @@ outage, and see exactly which commands would be issued.
 from __future__ import annotations
 
 import re
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Pattern, Sequence, Union
@@ -60,6 +61,12 @@ class FakeTransport(Transport):
                  default: Optional[ScriptedResponse] = None):
         self.host = host
         self._rules: List[_Rule] = []
+        #: Guards the rule scan.  Clones share the rule list, and
+        #: Orchestrator.assess_nodes runs a node per thread, so several
+        #: threads walk these rules at once; a 'once' rule is *consumed* by
+        #: marking it used, which without this could fire for two nodes or
+        #: neither.  Held only for the scan -- never across a rule's delay.
+        self._lock = threading.Lock()
         self.calls: List[Dict[str, Any]] = []
         self.default = default if default is not None else ScriptedResponse(
             rc=127, stderr="fake transport: no rule matched")
@@ -76,7 +83,8 @@ class FakeTransport(Transport):
         """Add a rule; returns self so rules can be chained."""
         if isinstance(response, str):
             response = ScriptedResponse(stdout=response)
-        self._rules.append(_Rule(re.compile(pattern), response, host))
+        with self._lock:
+            self._rules.append(_Rule(re.compile(pattern), response, host))
         return self
 
     def expect_first(self, pattern: str, response: Responder,
@@ -91,7 +99,8 @@ class FakeTransport(Transport):
         """
         if isinstance(response, str):
             response = ScriptedResponse(stdout=response)
-        self._rules.insert(0, _Rule(re.compile(pattern), response, host))
+        with self._lock:
+            self._rules.insert(0, _Rule(re.compile(pattern), response, host))
         return self
 
     def clone(self, host: str) -> "FakeTransport":
@@ -102,6 +111,9 @@ class FakeTransport(Transport):
         """
         other = FakeTransport(host=host, default=self.default)
         other._rules = self._rules
+        # One lock for the whole family, or sharing the rules would not be
+        # guarded at all: each clone would be serialising against itself.
+        other._lock = self._lock
         other.calls = self.calls
         return other
 
@@ -115,19 +127,20 @@ class FakeTransport(Transport):
                            "stdin": bool(input_text), "timeout": timeout})
 
         response = self.default
-        for rule in self._rules:
-            if rule.used:
-                continue
-            if rule.host is not None and rule.host != self.host:
-                continue
-            if rule.pattern.search(rendered):
-                candidate = rule.response
-                if callable(candidate) and not isinstance(candidate, ScriptedResponse):
-                    candidate = candidate(rendered)
-                response = candidate
-                if getattr(candidate, "once", False):
-                    rule.used = True
-                break
+        with self._lock:
+            for rule in self._rules:
+                if rule.used:
+                    continue
+                if rule.host is not None and rule.host != self.host:
+                    continue
+                if rule.pattern.search(rendered):
+                    candidate = rule.response
+                    if callable(candidate) and not isinstance(candidate, ScriptedResponse):
+                        candidate = candidate(rendered)
+                    response = candidate
+                    if getattr(candidate, "once", False):
+                        rule.used = True
+                    break
 
         if response.delay:
             time.sleep(response.delay)

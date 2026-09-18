@@ -30,9 +30,14 @@ class PublishError(RuntimeError):
 class Publisher:
     """Pushes ``report.output_dir`` to ``report.publish.target``."""
 
-    def __init__(self, settings: Any, local: Optional[LocalTransport] = None):
+    def __init__(self, settings: Any, local: Optional[LocalTransport] = None,
+                 simulate: bool = False):
         self.settings = settings
         self.local = local or LocalTransport(default_timeout=600)
+        #: A rehearsal must not touch the live web area.  The 'copy' method
+        #: calls shutil.copytree directly rather than going through *local*,
+        #: so scripting the transport is not enough to hold it back.
+        self.simulate = simulate
         self.enabled: bool = bool(settings.get("report.publish.enabled", False))
         self.method: str = str(settings.get("report.publish.method", "rsync")).lower()
         self.target: Optional[str] = settings.get("report.publish.target")
@@ -42,6 +47,10 @@ class Publisher:
 
     def publish(self) -> Dict[str, Any]:
         """Copy the site; returns what happened, never raises for a bad target."""
+        if self.simulate:
+            return {"published": False,
+                    "reason": "simulated run: the report was written locally "
+                              "but nothing was published"}
         if not self.enabled or self.method == "none":
             return {"published": False, "reason": "publication not enabled"}
         if not self.target:

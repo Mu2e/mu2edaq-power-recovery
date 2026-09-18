@@ -56,6 +56,28 @@ def test_transport_failure_is_unknown_not_fail(make_context, monkeypatch):
     assert result.status is Status.UNKNOWN
 
 
+def test_a_once_rule_fires_exactly_once_under_concurrency():
+    """Clones share the rule list, and nodes are assessed a thread apiece.
+
+    Consuming a 'once' rule means marking it used, so an unguarded scan could
+    hand the same first-call-fails response to two nodes, or to neither, and
+    the test that relied on it would pass or fail by timing.
+    """
+    import concurrent.futures
+
+    base = FakeTransport("base")
+    base.expect(r"power status", ScriptedResponse(stdout="on"))
+    base.expect_first(r"power status", ScriptedResponse(stdout="off", once=True))
+
+    clones = [base.clone(f"node-{i:02d}") for i in range(24)]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:
+        outputs = [f.result().stdout for f in
+                   [pool.submit(c.run, "chassis power status") for c in clones]]
+
+    assert outputs.count("off") == 1
+    assert outputs.count("on") == len(clones) - 1
+
+
 def test_rollup_ignores_not_applicable_checks():
     # A node with no BMC skips power.status; that must not make the node 'n/a'.
     assert rollup([Status.OK, Status.SKIP, Status.OK]) is Status.OK
@@ -86,6 +108,36 @@ def test_ping_fails_when_nothing_answers(make_context, fake_transport):
     fake_transport.expect_first(r"\bping\b", ScriptedResponse(
         stdout="3 packets transmitted, 0 received, 100% packet loss"))
     assert run_check("ping.lab", make_context()).status is Status.FAIL
+
+
+def test_the_ping_command_follows_the_dialect_of_the_host_running_it():
+    # iputils reads -W as seconds; BSD ping reads the same flag as
+    # milliseconds.  Sending the iputils spelling to a Mac turned a five
+    # second wait into a five millisecond one, so a gateway one switch away
+    # was reported as answering no ICMP at all.
+    from mu2edaq_power_recovery.checks.reachability import _ping_command
+
+    assert _ping_command("h", 3, 5) == "ping -c 3 -W 5 -q h"
+    assert _ping_command("h", 3, 5, dialect="bsd") == "ping -c 3 -W 5000 -q h"
+    assert _ping_command("h", 3, 5, dialect="windows") == "ping -n 3 -w 5000 h"
+    # The DF/payload options are iputils-only; only the phase-3 MTU probe asks
+    # for them and that always runs on a gateway.
+    assert "-M do -s 8972" in _ping_command("h", 1, 5, payload=8972)
+
+
+def test_the_ping_dialect_comes_from_the_transport():
+    from mu2edaq_power_recovery.checks.reachability import ping_dialect
+    from mu2edaq_power_recovery.transport import LocalTransport
+
+    # Everything reached over SSH is RHEL, including the fake stand-in.
+    assert ping_dialect(FakeTransport("mu2e-trk-01.fnal.gov")) == "iputils"
+
+    local = LocalTransport()
+    for platform, expected in (("linux", "iputils"), ("darwin", "bsd"),
+                               ("freebsd14", "bsd"), ("win32", "windows"),
+                               ("cygwin", "windows")):
+        local.platform = platform
+        assert ping_dialect(local) == expected, platform
 
 
 def test_root_login_requires_uid_zero(make_context, fake_transport):
