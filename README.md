@@ -36,6 +36,12 @@ So the point is this is complicated, but it should work.
 
 ## Quick start
 
+The assumption is that you are going to be running this from a laptop, or some other
+machine that is NOT on the DAQ network (we will also have copies installed on the 
+DAQ Network but the instructions are designed for the external case)
+
+So first install....
+
 ```sh
 git clone git@github.com:Mu2e/mu2edaq-power-recovery.git
 cd mu2edaq-power-recovery
@@ -52,10 +58,19 @@ mu2e-power-recovery --phase all --simulate
 
 That rehearsal needs no credentials, no network and no cluster: it answers every
 command from a built-in script. If it writes a report, the installation is
-sound. The report goes to `html/`; open `html/index.html` in a browser.
+sound. The report goes to `html/`; open `html/index.html` in a browser.  The
+purpose of the rehersal is to make sure that all the tools are in place 
+and that everything is responding the way we intend.  Basically it's 
+the double check to make sure you aren't chasing a phantom error later because
+you happen to have a weird setup that is missing some tool.
 
-Then, once you have a Kerberos ticket, the real read-only survey. It changes
-nothing and is safe to run while the DAQ is taking data:
+Then when you are ready you will need a Kerberos ticket.  I've designed this
+to work with both personal tickets that are in the k5's and with special service
+tickets (which allow non-experts to also run this)
+
+Once you have a Kerberos ticket, you can do a real read-only survey. It changes
+nothing and is safe to run while the DAQ is taking data.  Basically it's just 
+probing the state of the system:
 
 ```sh
 mu2e-power-state --principal $USER@FNAL.GOV
