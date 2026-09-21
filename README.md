@@ -1,14 +1,36 @@
 # mu2edaq-power-recovery
 
-Tools to recover the Mu2e DAQ computing centres from a planned or unplanned
-power outage: assess the current state, power the cluster on in dependency
+These are a set of tools and scripts to properly recover the Mu2e DAQ computing
+centers from planned and unplanned power outages, bumps and other disruptions.
+Basically if it can knock our machines off the air this should be able to 
+systemmatically bring them back.
+
+This is all based upon our written procedures in DocDB and in the operations
+wiki.  So if you have questions about certain decisions or why the orderings
+are the way they are, see those docs for details.
+
+The approach I took is that we would assume that after a power incident we
+would have only our gateway nodes available to us.  We would work external
+to those nodes and systemmatically bring things up in stages, where each stage
+would bring up resources, verify them, log that everything is working and then
+proceed to the next step.
+
+I also assumed that we would want to document everything in the ECL, so there
+are hooks in all of this for posting to the ECL.
+
+In terms of verification, I want EVERYTHING checked and I assume everything
+is broken.  So the working model is assess the current state, power the cluster on in dependency
 order, verify every component, check the network fabric between nodes, and
 produce a report for the electronic logbook.
 
-Everything runs from a workstation **outside** the DAQ networks. Nodes are
-reached over SSH through a gateway with Kerberos/GSSAPI; BMCs are reached by
+Now this is important -- Everything runs from a workstation **outside** the DAQ 
+networks (i.e. Andrew's Laptop). This means that we have to navigate the 
+firewalls and other DAQ boundaries at each step (which is a pain) Nodes are
+reached over SSH through a gateway with Kerberos/GSSAPI; While BMCs are reached by
 running `ipmitool` *on* a gateway, because the IPMI subnets are not routable
-from off site.
+from off site (and we can't tunnel through).
+
+So the point is this is complicated, but it should work.
 
 ---
 
