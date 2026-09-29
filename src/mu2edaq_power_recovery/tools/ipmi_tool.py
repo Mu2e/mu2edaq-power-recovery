@@ -15,7 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from typing import Any, List, Optional, Sequence
+from typing import Any, List, Optional, Sequence, Tuple
 
 from .. import console
 from ..creds import VaultCredentials, VaultError
@@ -86,15 +86,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     location = topology.canonical_location(location)
 
     # --- targets ----------------------------------------------------------
-    if args.node:
-        nodes = topology.resolve(args.node, [location])
-    elif args.node_class:
-        wanted = {c.lower() for c in args.node_class}
-        nodes = [n for n in topology.all_nodes([location])
-                 if n.node_class.lower() in wanted]
-    else:
-        nodes = [n for n in topology.all_nodes([location]) if n.ipmi_host]
-    nodes = [n for n in nodes if n.ipmi_host] or nodes
+    # Everything up to here touches neither Vault nor a gateway, so a
+    # selection with nothing valid in it stops before either is contacted.
+    from ..topology import TopologyError
+
+    try:
+        nodes, skipped = select_targets(topology, location, args.node,
+                                        args.node_class)
+    except TopologyError as exc:
+        # An invalid -n name (one that fails valid_hostname) is an operator
+        # typo, not a crash: say so and exit as for any other bad selection.
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    for node, reason in skipped:
+        print(f"  skipping {node.short}: {reason}", file=sys.stderr)
     if not nodes:
         print("error: no target nodes with a BMC", file=sys.stderr)
         return 2
@@ -106,11 +111,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if changing and not args.execute:
         print(f"  '{' '.join(args.command)}' changes machine state; re-run with "
               f"--execute to issue it. Showing intent only.\n")
+    if changing:
+        # Every target, by name: an operator confirming a state change must
+        # see exactly which machines it will reach, not a count.
+        out = sys.stderr if args.json else sys.stdout
+        print(f"  targets for '{' '.join(args.command)}' ({len(nodes)}):",
+              file=out)
+        print(target_listing(nodes, topology, destructive) + "\n", file=out)
     if destructive and args.execute and not args.yes:
-        listed = ", ".join(n.short for n in nodes[:10])
-        more = f" and {len(nodes) - 10} more" if len(nodes) > 10 else ""
-        answer = input(f"  About to '{' '.join(args.command)}' on {len(nodes)} "
-                       f"host(s): {listed}{more}\n  Type 'yes' to proceed: ")
+        answer = input(f"  About to '{' '.join(args.command)}' on the "
+                       f"{len(nodes)} host(s) listed above.\n"
+                       f"  Type 'yes' to proceed: ")
         if answer.strip().lower() != "yes":
             print("  aborted")
             return 3
@@ -151,6 +162,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         message_timeout=settings.get("ipmi.message_timeout"),
         tool_retries=settings.get("ipmi.tool_retries"),
         extra_args=settings.get("ipmi.extra_args", []),
+        # As in the run: a refusal from the first BMC stops the rest of a
+        # -c/-l sweep being sent the same rejected credential.
+        stop_on_auth_failure=bool(
+            settings.get("ipmi.stop_on_auth_failure", True)),
+        reachability_precheck=bool(
+            settings.get("ipmi.reachability_precheck", True)),
     )
 
     if args.diagnose:
@@ -201,6 +218,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     else:
         print(console.table(rows, ["NODE", "BMC", "RESULT", "OUTPUT"]))
         print(f"\n  {len(rows) - failures}/{len(rows)} succeeded")
+        if client.credentials_refused:
+            # The rest of the sweep was stopped, not failed: say why once.
+            print(f"\n  stopped: {client.credentials_refused}")
         # One diagnosis, not one per node: a credential or cipher-suite problem
         # hits every BMC identically, and repeating it fifty times helps nobody.
         for entry in results:
@@ -214,6 +234,56 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                       f"chassis power status")
                 break
     return 1 if failures else 0
+
+
+def select_targets(topology: Any, location: str,
+                   names: Optional[Sequence[str]],
+                   classes: Optional[Sequence[str]]
+                   ) -> Tuple[List[Any], List[Tuple[Any, str]]]:
+    """The nodes to address, and the selected nodes that cannot be.
+
+    Returns ``(valid, skipped)``: *valid* have a BMC; *skipped* pairs each
+    other selected node with why. There is no fallback to the unfiltered
+    selection -- a node without a BMC has no address to give ipmitool, and
+    the old fallback built ``ipmitool -H None``. With neither *names* nor
+    *classes*, every node of *location* that has a BMC is selected and none
+    is reported as skipped: nobody asked for the others.
+    """
+    if names:
+        selected = topology.resolve(list(names), [location])
+    elif classes:
+        wanted = {c.lower() for c in classes}
+        selected = [n for n in topology.all_nodes([location])
+                    if n.node_class.lower() in wanted]
+    else:
+        return [n for n in topology.all_nodes([location]) if n.ipmi_host], []
+
+    valid: List[Any] = []
+    skipped: List[Tuple[Any, str]] = []
+    for node in selected:
+        if node.ipmi_host:
+            valid.append(node)
+        elif node.location == "unknown":
+            # Topology.resolve() keeps a name it does not know, for the ssh
+            # tools' sake; here it has no BMC to address.
+            skipped.append((node, f"unknown host: not in the topology for "
+                                  f"location {location}"))
+        else:
+            skipped.append((node, "no BMC: the topology lists no ipmi "
+                                  "interface for it"))
+    return valid, skipped
+
+
+def target_listing(nodes: Sequence[Any], topology: Any,
+                   destructive: bool) -> str:
+    """One line per target: hostname and BMC, marking protected refusals."""
+    lines = []
+    for node in nodes:
+        mark = ""
+        if destructive and topology.is_protected(node.hostname):
+            mark = "  (protected: will be refused)"
+        lines.append(f"    {node.hostname}  [BMC {node.ipmi_host}]{mark}")
+    return "\n".join(lines)
 
 
 def candidate_usernames(configured: str) -> List[str]:
@@ -250,6 +320,8 @@ def diagnose(settings: Any, topology: Any, factory: Any, gateway_host: str,
     combination that works, and at :data:`MAX_ATTEMPTS` regardless, because
     each failure counts towards the BMC's account lockout.
     """
+    from ..transport.ipmi import IPMIUnreachable
+
     if not node.ipmi_host:
         print(f"error: {node.short} has no BMC in the topology", file=sys.stderr)
         return 2
@@ -284,10 +356,18 @@ def diagnose(settings: Any, topology: Any, factory: Any, gateway_host: str,
                 dry_run=True,       # read-only anyway, but be explicit
                 protected=topology.is_protected,
                 extra_args=settings.get("ipmi.extra_args", []),
+                reachability_precheck=bool(
+                    settings.get("ipmi.reachability_precheck", True)),
             )
             try:
                 res = client._run(node.ipmi_host, ["chassis", "power", "status"])
                 ok, detail = res.ok, (res.output.strip().splitlines() or [""])[0]
+            except IPMIUnreachable as exc:
+                # No credential was tried; another combination cannot help.
+                print(f"  {exc}. No combination was tried: the BMC is dark or "
+                      f"filters ICMP\n  (set ipmi.reachability_precheck: false "
+                      f"for the latter).")
+                return 1
             except TransportError as exc:
                 ok, detail = False, str(exc)[:60]
             rows.append([username, str(cipher), "OK" if ok else "refused",

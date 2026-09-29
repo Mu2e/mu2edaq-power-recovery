@@ -77,7 +77,7 @@ return `PhaseResult`, so console, HTML and logbook output cannot drift apart.
 Four YAML files in `config/`, each with a man page in section 5:
 
 ```yaml
-# power-recovery.yaml -- everything except the inventory. 77 keys; man 5
+# power-recovery.yaml -- everything except the inventory. 78 keys; man 5
 # mu2edaq-power-recovery.yaml documents each one.
 run:      {label, dry_run: true, stop_on_stage_failure, phase_timeout,
            from_stage, until_stage}
@@ -87,7 +87,8 @@ ssh:      {user, root_user, proxy: auto, connect_timeout, command_timeout,
            options, max_sessions}
 ipmi:     {execute_on: gateway, username, tool, interface, privilege,
            cipher_suite, timeout, retries, power_on_delay, message_timeout,
-           tool_retries, extra_args, stop_on_auth_failure}
+           tool_retries, extra_args, stop_on_auth_failure,
+           reachability_precheck}
 kerberos: {principal, root_principal, min_lifetime, prompt, verify_users,
            use_service_keytabs, root_fallback, service_identities,
            discover_identities, get_kerberos_ticket_command,
@@ -216,7 +217,22 @@ could fire for two nodes or for neither.
 - **Never weaken the protected-host refusal.** It is the one place the tool
   declines to do what it is told, and it is deliberate.
 - **Keep FAIL and UNKNOWN distinct.** "It is broken" and "we could not look"
-  need different responses.
+  need different responses. A refused IPMI credential is UNKNOWN
+  (`PowerState.REFUSED`, ensure_on action `credentials_refused`), never FAIL
+  "BMC does not answer", and never the protected-host refusal.
+- **One `CredentialBreaker` per BMC account, shared by every `IPMIClient`.**
+  Pass the orchestrator's `ipmi_breaker` to any client you build; a client with
+  its own breaker would present a refused credential again. While unproven it
+  admits one invocation at a time (`AUTH_PROBE_CONCURRENCY`, a constant, not a
+  config key); do not raise it. The reachability ping
+  (`ipmi.reachability_precheck`) runs *before* the gate and must stay
+  gate-free — it is what keeps dark BMCs from being serialised. "Unable to
+  establish" trips the breaker only from BMCs that answered that ping, and
+  only at `ESTABLISH_FAILURE_LIMIT` (2) distinct BMCs; RAKP / "unauthorized
+  name" trip it at once. After `power.status` is UNREACHABLE or REFUSED,
+  `assess_node` reports `power.sensors`/`power.sel` UNKNOWN without a call.
+- **SEL comparisons go by record id.** `parse_sel_list` / `diff_sel` in
+  `checks/parsers.py`; never compare the tail's length or the BMC's timestamps.
 - Parsers live in `checks/parsers.py` with their own tests, against real
   command output rather than invented samples.
 

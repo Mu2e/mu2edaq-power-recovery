@@ -109,7 +109,8 @@ def build_narrative(export: Dict[str, Any]) -> Dict[str, Any]:
     powered = [a for a in actions if a.get("action") == "power_on"
                and a.get("outcome") == "power_on"]
     refused = [a for a in actions if a.get("outcome") in ("refused", "no_bmc",
-                                                          "unavailable", "failed")]
+                                                          "unavailable", "failed",
+                                                          "credentials_refused")]
 
     outstanding: List[Dict[str, str]] = []
     for phase in phases:

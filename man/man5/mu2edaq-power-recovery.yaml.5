@@ -296,11 +296,45 @@ serves every BMC, so the next one rejects it too, and each attempt is
 .I retries
 invocations here with four ipmitool retries inside each. Defaults to
 .BR true .
+While it is true, IPMI commands are also issued one at a time until a first
+BMC accepts the credential, so under concurrent assessment a wrong credential
+reaches exactly one BMC; after that first success they run concurrently. The
+state is shared by every IPMI client of the run. A refusal is reported as
+.BR unknown ,
+not as a BMC that does not answer.
 Set it false only to gather evidence from several BMCs deliberately; the run
-then sends the same rejected username to every controller in the cluster.
+then neither serialises nor stops, and sends the same rejected username to
+every controller in the cluster.
 A BMC that simply does not answer is not this \(em a dark chassis reports
 "Unable to establish IPMI v2 / RMCP+ session" as well, and after an outage
 that is the expected case.
+The exception is a BMC that has just answered the
+.I reachability_precheck
+ping: two distinct such BMCs failing with "Unable to establish" while no BMC
+has yet accepted the credential trip the stop as well, because a live BMC that
+refuses the session is most likely being sent the wrong username. An RAKP
+failure or "unauthorized name" still trips it on the first occurrence.
+.TP
+.I reachability_precheck
+While the credential is unproven, send one
+.B ping \-c 1 \-W 1
+to the BMC from the gateway before each ipmitool invocation. A BMC that does
+not answer is reported unreachable at once: ipmitool is not run, and the call
+does not wait behind the one-at-a-time credential gate, so dark BMCs are
+assessed concurrently rather than each costing a serialised ipmitool timeout.
+In phase 1, a node whose
+.B power.status
+is unreachable or refused then reports
+.BR power.sensors " and " power.sel
+as
+.B unknown
+without asking the BMC again. A gateway without
+.B ping
+(exit 126/127) skips the pre-check with a warning. Defaults to
+.BR true ;
+set it false for BMCs that filter ICMP. Has no effect with
+.I stop_on_auth_failure
+false, which bypasses the gate altogether.
 .SS kerberos
 .TP
 .IR principal ", " root_principal

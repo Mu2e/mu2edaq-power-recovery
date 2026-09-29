@@ -83,7 +83,11 @@ each. Only a RAKP failure or
 counts;
 .I "Unable to establish IPMI v2 / RMCP+ session"
 does not, because that is also what a chassis with no standby power says, and
-after an outage that is the expected case. Set
+after an outage that is the expected case. A node whose power state could not
+be read because of that refusal is recorded as
+.IR credentials_refused ,
+distinct both from a BMC that did not answer and from the deliberate
+protected-host refusal. Set
 .I ipmi.stop_on_auth_failure: false
 to override.
 .PP

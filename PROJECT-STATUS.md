@@ -121,9 +121,10 @@ Every requirement from `Project-Description.md`, and where it is met.
 |---|---|---|
 | `unit/test_topology.py` | 14 | NodeRange expansion, aliases, classes, protection, MC-1 emptiness |
 | `unit/test_settings.py` | 23 | All five precedence layers, coercion, redaction, malformed YAML |
-| `unit/test_parsers.py` | 20 | `df`, `ip`, `ping` (iputils + BSD + Windows), `mdstat`, SMART, kernel errors |
-| `unit/test_checks.py` | 39 | Every check's pass and fail path; framework containment; ping dialects |
-| `unit/test_ipmi.py` | 43 | **Safety gates**, credentials, invocation shape, failure diagnosis, credential stop |
+| `unit/test_parsers.py` | 35 | `df`, `ip`, `ping` (iputils + BSD + Windows), `mdstat`, SMART, kernel errors, `sel list` and the SEL diff |
+| `unit/test_checks.py` | 50 | Every check's pass and fail path; framework containment; ping dialects; SEL empty/short/rotated/cleared/identical/unread; refused credential is UNKNOWN |
+| `unit/test_ipmi.py` | 54 | **Safety gates**, credentials, invocation shape, failure diagnosis, credential stop, breaker under barrier-forced concurrency |
+| `unit/test_ipmi_tool.py` | 8 | `mu2e-ipmi-tool` target selection: no un-filtering, skipped-node reasons, exit 2 before Vault, confirmation lists hostnames |
 | `unit/test_state.py` | 8 | Round-trip, refusal auditing, append-not-overwrite |
 | `unit/test_vault.py` | 11 | KV path resolution, folder-vs-secret, synonyms, file fallback |
 | `unit/test_credentials.py` | 68 | Primary-first chains, root fallback, ssh-failure classification, KRB5CCNAME, collection caches, host keys, cleanup, password prompting |
@@ -131,7 +132,7 @@ Every requirement from `Project-Description.md`, and where it is met.
 | `unit/test_docs.py` | 3 | `tools/generate-docs.py --check`: the man pages still match the code, and `--check` writes nothing |
 | `unit/test_sweep.py` | 8 | Both backends, identical semantics |
 | `unit/test_selfupdate.py` | 13 | Dirty tree, divergence, fast-forward, re-exec guard |
-| `integration/test_phases.py` | 23 | All four phases end to end; simulation hermeticity |
+| `integration/test_phases.py` | 26 | All four phases end to end; simulation hermeticity |
 | `integration/test_report.py` | 20 | Page rendering, archiving, publication, ECL body |
 | `integration/test_cli.py` | 14 | Driver, flags, exit codes, JSON output |
 
@@ -160,6 +161,9 @@ JSON files, and is wired into `ctest` as `simulated-run`.
 | Phase 1 takes no corrective action | `test_assess_takes_no_corrective_action` |
 | The gateway stage never issues a power command | `test_the_gateway_stage_never_issues_a_power_command` |
 | Refusals are recorded, not just successes | `test_actions_record_refusals_as_well_as_successes` |
+| A rejected credential reaches one BMC under a concurrent start | `test_a_concurrent_start_puts_a_rejected_credential_to_one_bmc_only` |
+| Waiters get the shared diagnosis without invoking ipmitool | `test_waiting_callers_get_the_shared_diagnosis_without_invoking_ipmitool` |
+| A BMC-less selection contacts neither Vault nor a gateway | `test_a_lone_bmc_less_node_contacts_nothing_and_exits_2` |
 | Re-running a phase does not erase earlier evidence | `test_rerunning_a_phase_appends_rather_than_overwrites` |
 
 ---
@@ -504,11 +508,43 @@ by how much an operator would care.
   and `describe()` prints `ticket you@FNAL.GOV [ambient cache]` even when the
   ambient cache holds someone else. There is no `--principal` flag to compensate.
   Documented in `man 1 mu2e-ssh-probe`.
-- **`mu2e-ipmi-tool` silently un-filters when every named host lacks a BMC.**
+- ~~**`mu2e-ipmi-tool` silently un-filters when every named host lacks a BMC.**
   `ipmi_tool.py:97`: `nodes = [n for n in nodes if n.ipmi_host] or nodes`. So
   `-n mu2e-dcs-03` (on the lab network, no `ipmi:` interface) proceeds and builds
-  `ipmitool -H None …` on the gateway. The `--diagnose` path handles this
-  correctly (`ipmi_tool.py:253-255`). Documented in the man page.
+  `ipmitool -H None …` on the gateway.~~ **Fixed (#16, fix/ipmi).**
+  `select_targets()` returns the valid targets and the skipped ones with a
+  reason ("unknown host" vs "no BMC"), printed on stderr; there is no fallback,
+  and an empty selection exits 2 before Vault or `SSHFactory` is constructed. A
+  state-changing verb lists every target by hostname (the old prompt stopped at
+  ten and gave a count).
+- ~~**The IPMI credential stop was not thread-safe.**~~ **Fixed (#8,
+  fix/ipmi).** `credentials_refused` was read and set without a lock while
+  sixteen workers shared one client, so a wrong credential could reach many
+  BMCs before the first rejection landed. `CredentialBreaker` now serialises
+  invocations until a first success proves the credential, re-reads the refusal
+  after taking the gate and before every retry, and is shared by every client of
+  the run. A refusal is `PowerState.REFUSED` -> UNKNOWN, not FAIL "BMC does not
+  answer". The serial-while-dark trade-off is gone: each unproven call is
+  preceded by a gate-free `ping -c 1 -W 1` of the BMC from the gateway
+  (`ipmi.reachability_precheck`, default true), so dark BMCs are reported
+  UNREACHABLE concurrently without ipmitool, and phase 1 reports their
+  `power.sensors`/`power.sel` UNKNOWN without asking again. Two distinct BMCs
+  that answer the ping and fail "Unable to establish" while unproven trip the
+  breaker (likely wrong username); RAKP/"unauthorized name" still trip on the
+  first. `mu2e-ipmi-tool` honours the pre-check and, as the run does,
+  `ipmi.stop_on_auth_failure` (it previously ignored the key and got a
+  private breaker's default). An invalid `-n`
+  hostname (`TopologyError` from `select_targets`) exits 2 with a clean error
+  instead of a traceback.
+- ~~**SEL baselines compared the length of a 20-entry tail.**~~ **Fixed (#10,
+  fix/ipmi).** Once a log was full, phase 1 and phase 2 both read 20 rows and
+  new events were never reported. The baseline is now `{record_id:
+  fingerprint}` from `parse_sel_list`; a reused id or a new "Log area
+  reset/cleared" gives WARN "SEL cleared since survey", an all-new full tail is
+  noted as possibly truncated, and a failed read is UNKNOWN with no baseline.
+  The optional cross-process baseline (loading phase 1's from the run store for
+  a standalone `mu2e-power-on`) was cut: a separate process still starts
+  without one.
 - ~~**The test suite's network guard covers one method.**~~ **Fixed (#22,
   fix/test-guard).** The guard now patches `subprocess.Popen`, `socket.connect`
   and `sweep.sweep`, and raises a BaseException so production

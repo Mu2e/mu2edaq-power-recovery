@@ -129,8 +129,8 @@ class CheckContext:
         self.checks_config = checks_config or {}
         self.local = local
         #: Values recorded earlier in the run that a check may compare against
-        #: (e.g. the SEL entry count seen in phase 1, so phase 2 can report
-        #: only the events the power-on itself produced).
+        #: (e.g. the SEL record ids seen in phase 1, key ``sel``, so phase 2
+        #: can report only the events the power-on itself produced).
         self.baseline = baseline or {}
         self._user_ssh: Optional[Transport] = None
         self._root_ssh: Optional[Transport] = None

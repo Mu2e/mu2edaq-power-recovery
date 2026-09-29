@@ -281,9 +281,19 @@ it against the other 44 only advances lockout counters. (45 is the number of
 nodes carrying an `ipmi:` interface in `config/topology.yaml` — 37 at MC-2 and
 8 at the teststand — out of 65 nodes in total. `mu2e-node-inventory -n ipmi`
 lists them.)
+That holds under concurrency: until one BMC has accepted the credential, IPMI
+commands are issued one at a time, so a wrong credential reaches exactly one BMC
+however many workers are assessing, and every waiting check reports the shared
+diagnosis as UNKNOWN without invoking ipmitool. The breaker is shared by every
+IPMI client of the run.
 `ipmi.stop_on_auth_failure: false` overrides that. A BMC that does not answer at
 all is deliberately *not* treated this way: after an outage a dark chassis is
-the expected case, and it says much the same thing.
+the expected case, and it says much the same thing. To tell them apart, each
+unproven call first pings the BMC from the gateway: a dark BMC is reported
+unreachable without ipmitool and without waiting its turn, and two BMCs that
+answer ping but still cannot open a session (likely a wrong username) stop the
+run's IPMI too. `ipmi.reachability_precheck: false` disables the ping for BMCs
+that filter ICMP.
 
 If Vault is unreachable — plausible during a site-wide power event — the tools
 fall back to `~/.ipmipasswd`, the file the existing `mu2edaq-operations`
@@ -353,12 +363,12 @@ Two things to know about `mu2e-ipmi-tool` before using it to judge access:
   would take a real run somewhere else. It tests the *BMC* credentials well; it
   is not a test of the run's SSH access. Use `mu2e-ssh-probe … --run true` for
   that.
-- **Naming only BMC-less hosts silently widens the target list.** Targets are
-  filtered to nodes that have a BMC, but if that filter empties the list the
-  tool falls back to the unfiltered one rather than stopping — so
+- **Only nodes with a BMC are addressed.** Every other selected node is named
+  on stderr as an *unknown host* or as having *no BMC*, and when none remains
+  the tool exits 2 before Vault or a gateway is touched — so
   `mu2e-ipmi-tool -n mu2e-dcs-03 chassis power status` (no `ipmi:` interface in
-  the topology) runs `ipmitool -H None …` on the gateway instead of saying so.
-  `--diagnose` gets this right and reports "has no BMC in the topology".
+  the topology) says so instead of running anything. A state-changing verb
+  lists every target by hostname before the confirmation prompt.
   `mu2e-node-inventory -n ipmi --hostnames` lists which hosts actually have one.
 
 If a check reports **the host key has CHANGED**, no credential can get past it:
