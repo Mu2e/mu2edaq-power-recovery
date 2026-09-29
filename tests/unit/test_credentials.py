@@ -9,13 +9,18 @@ actually reaches ssh.
 from __future__ import annotations
 
 import subprocess
+import threading
+import time
 from pathlib import Path
 
 import pytest
 
-from mu2edaq_power_recovery.creds.kerberos import (Credential, KerberosManager,
+from mu2edaq_power_recovery.creds.kerberos import (Credential, KerberosError,
+                                                   KerberosManager,
                                                    TicketInfo)
-from mu2edaq_power_recovery.creds.ticketsource import (ServiceTicket, TicketSource,
+from mu2edaq_power_recovery.creds.ticketsource import (DefaultCacheDisplaced,
+                                                       DefaultCacheUnverifiable,
+                                                       ServiceTicket, TicketSource,
                                                        TicketSourceError)
 from mu2edaq_power_recovery.transport.base import CommandResult
 from mu2edaq_power_recovery.transport.ssh import (SSHError, SSHFactory,
@@ -207,7 +212,7 @@ class FakeTicketSource:
     def identities(self):
         return list(self._identities)
 
-    def ticket(self, identity, cache, timeout=120):
+    def ticket(self, identity, cache, timeout=120, **kwargs):
         self.minted.append(identity)
         if identity in self._fail:
             raise TicketSourceError(f"no keytab for {identity}")
@@ -446,8 +451,8 @@ def test_the_ticket_cache_is_requested_with_an_explicit_FILE_type(settings, tmp_
     monkeypatch.setattr(ts_module.TicketSource, "_run", fake_run)
     monkeypatch.setattr(ts_module.TicketSource, "resolve",
                         lambda self, command: Path("/bin/true"))
-    monkeypatch.setattr(ts_module.TicketSource, "default_principal",
-                        staticmethod(lambda: "anorman@FNAL.GOV"))
+    monkeypatch.setattr(ts_module.TicketSource, "default_principal_status",
+                        staticmethod(lambda: ("anorman@FNAL.GOV", None)))
     monkeypatch.setattr(ts_module.TicketSource, "_principal_of",
                         staticmethod(lambda cache: "mu2edaq/mu2e@FNAL.GOV"))
 
@@ -459,22 +464,318 @@ def test_the_ticket_cache_is_requested_with_an_explicit_FILE_type(settings, tmp_
         "KRB5CCNAME must also be set, for any path that ignores --cache"
 
 
-def test_a_clobbered_cache_disables_service_identities_for_the_run(manager):
-    class Clobbering:
-        available = True
-        def identities(self): return ["mu2edaq", "mu2eshift"]
-        def unavailable_reason(self): return ""
-        @staticmethod
-        def default_principal(): return "anorman@FNAL.GOV"
-        def ticket(self, identity, cache, timeout=120):
-            raise TicketSourceError(
-                "minting a ticket for x replaced the default credential cache")
+class Clobbering:
+    """A ticket source whose every mint raises *error* and records the call."""
 
-    manager.tickets = Clobbering()
+    available = True
+
+    def __init__(self, error, identities=("mu2edaq", "mu2eshift", "mu2edcs")):
+        self.error = error
+        self._identities = list(identities)
+        self.minted = []
+
+    def identities(self):
+        return list(self._identities)
+
+    def unavailable_reason(self):
+        return ""
+
+    @staticmethod
+    def default_principal():
+        return "anorman@FNAL.GOV"
+
+    def ticket(self, identity, cache, timeout=120, **kwargs):
+        self.minted.append(identity)
+        raise self.error
+
+
+@pytest.mark.parametrize("error", [
+    DefaultCacheDisplaced("anorman@FNAL.GOV", "mu2edaq/mu2e@FNAL.GOV"),
+    # The wording is for the operator; the type is the signal.
+    DefaultCacheDisplaced("anorman@FNAL.GOV", "mu2edaq/mu2e@FNAL.GOV",
+                          "something reworded entirely"),
+    DefaultCacheUnverifiable("klist is not installed", "unrelated text"),
+])
+def test_a_guard_failure_disables_service_identities_for_the_run(manager, error):
+    manager.tickets = Clobbering(error)
     assert manager.service_credential("mu2edaq") is None
     # ...and no further identity is attempted, because the damage is done.
     assert manager.settings.get("kerberos.use_service_keytabs") is False
     assert [c.name for c in manager.chain()] == ["general"]
+    assert manager.service_credential("mu2eshift") is None
+    assert manager.tickets.minted == ["mu2edaq"]
+    state = manager.fallbacks_disabled
+    assert state is not None and state.kind == error.kind
+    assert state.identity == "mu2edaq"
+    assert "kswitch" in state.note() or "kinit" in state.note()
+
+
+def test_the_old_substring_no_longer_disables_anything(manager):
+    """An ordinary mint failure that happens to mention the default cache.
+
+    The decision used to be ``"default credential cache" in str(exc)``, so a
+    reworded guard message silently downgraded to "skip this identity" -- and
+    this one, an unrelated failure, would have stopped the whole chain.
+    """
+    manager.tickets = Clobbering(TicketSourceError(
+        "get-kerberos-ticket failed for mu2edaq: could not write the default "
+        "credential cache"))
+    manager.chain()
+    assert manager.fallbacks_disabled is None
+    assert manager.settings.get("kerberos.use_service_keytabs") is not False
+    # Only the identity that failed is dropped; the others are still tried.
+    assert manager.tickets.minted == ["mu2edaq", "mu2eshift", "mu2edcs"]
+
+
+def test_one_unrecoverable_clobber_stops_the_whole_chain(manager):
+    """Not just that identity -- the remaining six would do the same damage."""
+    manager.tickets = Clobbering(DefaultCacheDisplaced(
+        "anorman@FNAL.GOV", "mu2edaq/mu2e@FNAL.GOV"))
+    chain = manager.chain()
+    assert [c.name for c in chain] == ["general"]
+    assert manager.tickets.minted == ["mu2edaq"]
+
+
+# ---------------------------------------------------------------------------
+# concurrency: workers ask for chains simultaneously on a cold cache
+# ---------------------------------------------------------------------------
+
+
+class SlowTicketSource(FakeTicketSource):
+    """Mints slowly and tracks how many mints overlap, to catch interleaving."""
+
+    def __init__(self, identities):
+        super().__init__(identities)
+        self.active = 0
+        self.max_active = 0
+        self._count_lock = threading.Lock()
+
+    def ticket(self, identity, cache, timeout=120, **kwargs):
+        with self._count_lock:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+        try:
+            time.sleep(0.02)
+            return super().ticket(identity, cache, timeout)
+        finally:
+            with self._count_lock:
+                self.active -= 1
+
+
+def test_concurrent_cold_chains_mint_each_identity_exactly_once(manager):
+    identities = ["mu2edaq", "mu2eshift", "mu2edcs"]
+    manager.tickets = SlowTicketSource(identities)
+    workers = 12
+    barrier = threading.Barrier(workers)
+    chains, errors = [], []
+
+    def worker():
+        try:
+            barrier.wait()
+            chains.append(manager.chain())
+        except Exception as exc:  # noqa: BLE001 - reported below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(workers)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+
+    assert not errors
+    assert sorted(manager.tickets.minted) == sorted(identities)
+    # One read/mint/restore transaction at a time.
+    assert manager.tickets.max_active == 1
+    # Nobody saw a partially initialised credential: every chain is complete
+    # and every credential carries its cache.
+    assert len(chains) == workers
+    for chain in chains:
+        assert [c.name for c in chain] == ["general", *identities]
+        assert all(c.cache for c in chain[1:])
+    assert sorted(k for k in manager._caches if k.startswith("svc-")) == \
+        sorted(f"svc-{i}" for i in identities)
+
+
+def test_concurrent_guard_failure_mints_once_and_disables_once(manager):
+    manager.tickets = Clobbering(DefaultCacheDisplaced("a@FNAL.GOV", "b@FNAL.GOV"))
+    workers = 8
+    barrier = threading.Barrier(workers)
+
+    def worker():
+        barrier.wait()
+        manager.chain()
+
+    threads = [threading.Thread(target=worker) for _ in range(workers)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+    assert manager.tickets.minted == ["mu2edaq"]
+    assert manager.fallbacks_disabled.identity == "mu2edaq"
+
+
+def test_concurrent_note_success_keeps_one_entry_per_identity(manager):
+    names = ["mu2edaq", "mu2eshift", "mu2edcs", "mu2eraw"]
+    workers = 8
+    barrier = threading.Barrier(workers)
+    errors = []
+
+    def worker(offset):
+        try:
+            barrier.wait()
+            for i in range(400):
+                manager.note_success(Credential(name=names[(i + offset) % 4]))
+                manager.order_chain(names)
+        except Exception as exc:  # noqa: BLE001 - reported below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(n,)) for n in range(workers)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+    assert not errors
+    assert sorted(manager._successful) == sorted(names)
+
+
+def test_warm_fallbacks_mints_every_identity_up_front(manager):
+    usable = manager.warm_fallbacks()
+    assert set(usable) == set(manager.tickets.minted)
+    before = list(manager.tickets.minted)
+    manager.chain()
+    assert manager.tickets.minted == before, "chain() must reuse the warm tickets"
+
+
+def test_warm_fallbacks_does_nothing_with_service_keytabs_off(manager):
+    manager.settings.set("kerberos.use_service_keytabs", False)
+    assert manager.warm_fallbacks() == []
+    assert manager.tickets.minted == []
+
+
+def test_no_mint_starts_after_cleanup(manager, monkeypatch):
+    from mu2edaq_power_recovery.transport import local as local_module
+    monkeypatch.setattr(local_module.LocalTransport, "run",
+                        lambda self, command, **kwargs: CommandResult(
+                            command=" ".join(command), rc=0))
+    manager.cleanup()
+    assert manager.service_credential("mu2edaq") is None
+    assert manager.tickets.minted == []
+
+
+def test_chain_without_minting_describes_candidates_and_mints_nothing(manager):
+    candidates = manager.chain(mint=False, candidates=True)
+    assert manager.tickets.minted == []
+    assert candidates[0].primary
+    assert all(c.pending for c in candidates[1:])
+    assert "not acquired" in candidates[1].describe()
+    # Without candidates only credentials that exist are offered.
+    assert [c.name for c in manager.chain(mint=False)] == ["general"]
+
+
+def test_an_unacquired_designated_principal_is_not_described_as_ambient(manager):
+    manager.settings.set("kerberos.principal", "someone@FNAL.GOV")
+    described = manager.operator_credential().describe()
+    assert "ambient cache" not in described
+    assert "not acquired" in described
+
+
+def test_root_equal_to_general_uses_the_general_cache(manager, monkeypatch):
+    manager.settings.set("kerberos.principal", "anorman@FNAL.GOV")
+    manager.settings.set("kerberos.root_principal", "anorman@FNAL.GOV")
+
+    def fake_ensure(principal, role="general"):
+        manager._caches[role] = manager.cache_for(principal)
+        return TicketInfo(principal=principal, cache=None, valid=True)
+
+    monkeypatch.setattr(manager, "ensure", fake_ensure)
+    manager.prepare()
+    root = manager.operator_credential(root=True)
+    assert root.environ() == manager.operator_credential().environ() != {}
+
+
+# ---------------------------------------------------------------------------
+# the default-cache guard's precondition (#23)
+# ---------------------------------------------------------------------------
+
+
+def _guarded_source(settings, monkeypatch, klist):
+    """A TicketSource whose klist is *klist* and whose mint is recorded."""
+    from mu2edaq_power_recovery.creds import ticketsource as ts_module
+
+    minted = []
+
+    def fake_run(self, command, args, timeout=120, env=None):
+        minted.append(list(args))
+        cache = Path(str(args[args.index("--cache") + 1]).replace("FILE:", ""))
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        cache.write_text("ticket")
+        return type("R", (), {"returncode": 0, "stdout": b"", "stderr": b""})()
+
+    def fake_subprocess_run(argv, **kwargs):
+        if list(argv) != ["klist"]:
+            raise AssertionError(f"unexpected command {argv}")
+        return klist()
+
+    monkeypatch.setattr(ts_module.TicketSource, "_run", fake_run)
+    monkeypatch.setattr(ts_module.TicketSource, "resolve",
+                        lambda self, c: Path("/bin/true"))
+    monkeypatch.setattr(ts_module.TicketSource, "_principal_of",
+                        staticmethod(lambda cache: "mu2edaq/mu2e@FNAL.GOV"))
+    monkeypatch.setattr(ts_module.subprocess, "run", fake_subprocess_run)
+    return ts_module.TicketSource(settings), minted
+
+
+def _completed(rc, stdout=b"", stderr=b""):
+    return subprocess.CompletedProcess(["klist"], rc, stdout, stderr)
+
+
+def _klist_missing():
+    raise FileNotFoundError(2, "No such file or directory", "klist")
+
+
+@pytest.mark.parametrize("klist,reason", [
+    (_klist_missing, "not installed"),
+    # Heimdal with an empty collection; MIT says much the same.
+    (lambda: _completed(1, stderr=b"klist: No ticket file: /tmp/krb5cc_501\n"),
+     "no default credential cache"),
+    (lambda: _completed(0, stdout=b"Credentials cache: API:1234\n  Issued  "
+                                  b"Expires  Principal\n"),
+     "parse"),
+])
+def test_an_unreadable_default_refuses_before_any_mint(settings, tmp_path,
+                                                      monkeypatch, klist, reason):
+    source, minted = _guarded_source(settings, monkeypatch, klist)
+    with pytest.raises(DefaultCacheUnverifiable) as excinfo:
+        source.ticket("mu2edaq", tmp_path / "cache")
+    assert minted == [], "no mint command may run when the guard cannot"
+    assert reason in excinfo.value.reason
+
+
+def test_a_readable_default_lets_the_mint_proceed(settings, tmp_path, monkeypatch):
+    source, minted = _guarded_source(
+        settings, monkeypatch,
+        lambda: _completed(0, stdout=b"Ticket cache: FILE:/tmp/krb5cc_501\n"
+                                     b"Default principal: anorman@FNAL.GOV\n"))
+    ticket = source.ticket("mu2edaq", tmp_path / "cache")
+    assert len(minted) == 1
+    assert ticket.principal == "mu2edaq/mu2e@FNAL.GOV"
+
+
+def test_default_principal_keeps_its_contract(monkeypatch):
+    from mu2edaq_power_recovery.creds import ticketsource as ts_module
+    monkeypatch.setattr(ts_module.subprocess, "run",
+                        lambda argv, **kw: _completed(1, stderr=b"no cache\n"))
+    assert ts_module.TicketSource.default_principal() is None
+    principal, reason = ts_module.TicketSource.default_principal_status()
+    assert principal is None and "no cache" in reason
+
+
+def test_an_unverifiable_default_through_the_manager_keeps_the_operator(
+        manager):
+    manager.tickets = Clobbering(DefaultCacheUnverifiable("no default cache"))
+    chain = manager.chain()
+    assert [c.name for c in chain] == ["general"]
+    assert "kinit" in manager.fallbacks_disabled.guidance
 
 
 # ---------------------------------------------------------------------------
@@ -594,8 +895,8 @@ def test_the_default_cache_pointer_is_restored_after_a_mint(settings, tmp_path,
     monkeypatch.setattr(ts_module.TicketSource, "_run", fake_run)
     monkeypatch.setattr(ts_module.TicketSource, "resolve",
                         lambda self, c: Path("/bin/true"))
-    monkeypatch.setattr(ts_module.TicketSource, "default_principal",
-                        staticmethod(lambda: state["default"]))
+    monkeypatch.setattr(ts_module.TicketSource, "default_principal_status",
+                        staticmethod(lambda: (state["default"], None)))
     monkeypatch.setattr(ts_module.TicketSource, "restore_default", fake_restore)
     monkeypatch.setattr(ts_module.TicketSource, "collection",
                         staticmethod(lambda: {"mu2edaq/mu2e@FNAL.GOV": "API:XYZ"}))
@@ -618,37 +919,16 @@ def test_an_unrestorable_default_aborts_rather_than_continuing(settings, tmp_pat
                         type("R", (), {"returncode": 0, "stdout": b"", "stderr": b""})())
     monkeypatch.setattr(ts_module.TicketSource, "resolve",
                         lambda self, c: Path("/bin/true"))
-    monkeypatch.setattr(ts_module.TicketSource, "default_principal",
-                        staticmethod(lambda: next(principals)))
+    monkeypatch.setattr(ts_module.TicketSource, "default_principal_status",
+                        staticmethod(lambda: (next(principals), None)))
     monkeypatch.setattr(ts_module.TicketSource, "restore_default",
                         lambda self, p: False)
 
-    with pytest.raises(TicketSourceError) as excinfo:
+    with pytest.raises(DefaultCacheDisplaced) as excinfo:
         source.ticket("mu2eraw", tmp_path / "cache")
     assert "kswitch -p anorman@FNAL.GOV" in str(excinfo.value)
-
-
-def test_one_unrecoverable_clobber_stops_the_whole_chain(manager):
-    """Not just that identity -- the remaining six would do the same damage."""
-    class Clobbering:
-        available = True
-        calls = []
-        def identities(self): return ["mu2edaq", "mu2eshift", "mu2edcs"]
-        def unavailable_reason(self): return ""
-        @staticmethod
-        def default_principal(): return "anorman@FNAL.GOV"
-        def ticket(self, identity, cache, timeout=120):
-            Clobbering.calls.append(identity)
-            raise TicketSourceError(
-                "repointed the default credential cache and it could not be "
-                "restored")
-
-    manager.tickets = Clobbering()
-    # The first failure disables service identities for the run...
-    manager.service_credential("mu2edaq")
-    manager.settings.set("kerberos.use_service_keytabs", False)
-    chain = manager.chain()
-    assert [c.name for c in chain] == ["general"]
+    assert (excinfo.value.before, excinfo.value.after) == \
+        ("anorman@FNAL.GOV", "mu2eraw/mu2e@FNAL.GOV")
 
 
 def test_the_real_tool_error_is_surfaced_not_the_usage_hint():
@@ -693,8 +973,8 @@ def test_a_timed_out_mint_still_restores_the_default_pointer(settings, tmp_path,
     monkeypatch.setattr(ts_module.TicketSource, "_run", hang)
     monkeypatch.setattr(ts_module.TicketSource, "resolve",
                         lambda self, c: Path("/bin/true"))
-    monkeypatch.setattr(ts_module.TicketSource, "default_principal",
-                        staticmethod(lambda: state["default"]))
+    monkeypatch.setattr(ts_module.TicketSource, "default_principal_status",
+                        staticmethod(lambda: (state["default"], None)))
     monkeypatch.setattr(ts_module.TicketSource, "restore_default", fake_restore)
 
     with pytest.raises(TicketSourceError, match="timed out"):
@@ -916,3 +1196,344 @@ def test_the_login_check_says_the_host_key_changed(make_context, monkeypatch):
     assert res.data.get("hostkey_changed") is True
     # It must say how to verify, not invite a blind known_hosts edit.
     assert "ssh-keyscan" in res.detail
+
+
+# ---------------------------------------------------------------------------
+# an interrupted mint (SIGTERM -> KeyboardInterrupt) -- M2
+# ---------------------------------------------------------------------------
+
+
+def test_an_interrupted_mint_still_restores_the_default(settings, tmp_path,
+                                                        monkeypatch):
+    from mu2edaq_power_recovery.creds import ticketsource as ts_module
+
+    state = {"default": "anorman@FNAL.GOV", "restored": False}
+
+    def interrupted(self, command, args, timeout=120, env=None):
+        state["default"] = "mu2edaq/mu2e@FNAL.GOV"      # moved, then SIGTERM
+        raise KeyboardInterrupt
+
+    def fake_restore(self, principal):
+        state["default"] = principal
+        state["restored"] = True
+        return True
+
+    source = ts_module.TicketSource(settings)
+    monkeypatch.setattr(ts_module.TicketSource, "_run", interrupted)
+    monkeypatch.setattr(ts_module.TicketSource, "resolve",
+                        lambda self, c: Path("/bin/true"))
+    monkeypatch.setattr(ts_module.TicketSource, "default_principal_status",
+                        staticmethod(lambda: (state["default"], None)))
+    monkeypatch.setattr(ts_module.TicketSource, "restore_default", fake_restore)
+
+    with pytest.raises(KeyboardInterrupt):
+        source.ticket("mu2edaq", tmp_path / "cache")
+    assert state["restored"], "the default must be put back on an interrupt"
+    assert state["default"] == "anorman@FNAL.GOV"
+
+
+def test_a_failed_restore_does_not_replace_the_interrupt(settings, tmp_path,
+                                                         monkeypatch):
+    from mu2edaq_power_recovery.creds import ticketsource as ts_module
+
+    principals = iter(["anorman@FNAL.GOV", "mu2edaq/mu2e@FNAL.GOV"])
+    source = ts_module.TicketSource(settings)
+
+    def interrupted(self, command, args, timeout=120, env=None):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(ts_module.TicketSource, "_run", interrupted)
+    monkeypatch.setattr(ts_module.TicketSource, "resolve",
+                        lambda self, c: Path("/bin/true"))
+    monkeypatch.setattr(ts_module.TicketSource, "default_principal_status",
+                        staticmethod(lambda: (next(principals), None)))
+    monkeypatch.setattr(ts_module.TicketSource, "restore_default",
+                        lambda self, p: False)
+    with pytest.raises(KeyboardInterrupt):
+        source.ticket("mu2edaq", tmp_path / "cache")
+
+
+def test_an_interrupted_mint_leaves_its_cache_for_cleanup(manager, monkeypatch):
+    from mu2edaq_power_recovery.transport import local as local_module
+
+    class Interrupting(FakeTicketSource):
+        def ticket(self, identity, cache, timeout=120, **kwargs):
+            # The tool wrote the cache, then the run was told to stop.
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            cache.write_text("half a ticket")
+            raise KeyboardInterrupt
+
+    manager.tickets = Interrupting(["mu2edaq"])
+    with pytest.raises(KeyboardInterrupt):
+        manager.service_credential("mu2edaq")
+    cache = manager.cache_for("svc-mu2edaq")
+    assert manager._caches["svc-mu2edaq"] == cache
+
+    calls = []
+
+    def fake_run(self, command, timeout=None, user=None, input_text=None,
+                 check=False):
+        calls.append(list(command))
+        return CommandResult(command=" ".join(command), rc=0)
+
+    monkeypatch.setattr(local_module.LocalTransport, "run", fake_run)
+    manager.cleanup()
+    assert ["kdestroy", "-c", f"FILE:{cache}"] in calls
+    assert not cache.exists()
+
+
+def test_cleanup_tolerates_a_cache_the_mint_never_created(manager, monkeypatch):
+    from mu2edaq_power_recovery.transport import local as local_module
+
+    class InterruptedEarly(FakeTicketSource):
+        def ticket(self, identity, cache, timeout=120, **kwargs):
+            raise KeyboardInterrupt          # before anything was written
+
+    manager.tickets = InterruptedEarly(["mu2edaq"])
+    with pytest.raises(KeyboardInterrupt):
+        manager.service_credential("mu2edaq")
+
+    def missing(self, command, timeout=None, user=None, input_text=None,
+                check=False):
+        return CommandResult(command=" ".join(command), rc=1,
+                             stderr="kdestroy: No credentials cache found")
+
+    monkeypatch.setattr(local_module.LocalTransport, "run", missing)
+    manager.cleanup()          # must not raise
+    assert not manager.cache_for("svc-mu2edaq").exists()
+
+
+# ---------------------------------------------------------------------------
+# minting from "no default" when the run uses no default cache (S2)
+# ---------------------------------------------------------------------------
+
+
+def _no_default():
+    from mu2edaq_power_recovery.creds.ticketsource import NoDefaultCache
+    return None, NoDefaultCache("there is no default credential cache "
+                                "(klist: No credentials cache found)")
+
+
+def _patched_source(settings, monkeypatch, statuses, destroyed=None,
+                    destroy_ok=True):
+    """A TicketSource whose klist answers from *statuses*, in order."""
+    from mu2edaq_power_recovery.creds import ticketsource as ts_module
+
+    minted = []
+    seq = iter(statuses)
+    state = {"last": None}
+
+    def status():
+        state["last"] = next(seq, state["last"])
+        return state["last"]
+
+    def fake_run(self, command, args, timeout=120, env=None):
+        minted.append(list(args))
+        cache = Path(str(args[args.index("--cache") + 1]).replace("FILE:", ""))
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        cache.write_text("ticket")
+        return type("R", (), {"returncode": 0, "stdout": b"", "stderr": b""})()
+
+    def destroy(self, principal):
+        if destroyed is not None:
+            destroyed.append(principal)
+        if destroy_ok:
+            state["last"] = (None, state["last"][1])
+        return destroy_ok
+
+    monkeypatch.setattr(ts_module.TicketSource, "_run", fake_run)
+    monkeypatch.setattr(ts_module.TicketSource, "resolve",
+                        lambda self, c: Path("/bin/true"))
+    monkeypatch.setattr(ts_module.TicketSource, "_principal_of",
+                        staticmethod(lambda cache: "mu2edaq/mu2e@FNAL.GOV"))
+    monkeypatch.setattr(ts_module.TicketSource, "default_principal_status",
+                        staticmethod(lambda: (status()[0], status_reason(state))))
+    monkeypatch.setattr(ts_module.TicketSource, "destroy_default", destroy)
+    return ts_module.TicketSource(settings), minted
+
+
+def status_reason(state):
+    return state["last"][1] if state["last"] else None
+
+
+def test_private_primaries_and_no_default_let_the_mint_proceed(settings, tmp_path,
+                                                              monkeypatch):
+    source, minted = _patched_source(settings, monkeypatch,
+                                     [_no_default(), _no_default()])
+    ticket = source.ticket("mu2edaq", tmp_path / "cache", private_primary=True)
+    assert len(minted) == 1
+    assert ticket.cache == str(tmp_path / "cache")
+
+
+def test_a_service_default_left_by_the_mint_is_destroyed(settings, tmp_path,
+                                                         monkeypatch):
+    no = _no_default()
+    destroyed = []
+    source, minted = _patched_source(
+        settings, monkeypatch,
+        [no, ("mu2edaq/mu2e@FNAL.GOV", None)], destroyed=destroyed)
+    source.ticket("mu2edaq", tmp_path / "cache", private_primary=True)
+    assert destroyed == ["mu2edaq/mu2e@FNAL.GOV"]
+
+
+def test_a_service_default_that_cannot_be_destroyed_is_displaced(settings, tmp_path,
+                                                                 monkeypatch):
+    source, _ = _patched_source(
+        settings, monkeypatch,
+        [_no_default(), ("mu2edaq/mu2e@FNAL.GOV", None)], destroy_ok=False)
+    with pytest.raises(DefaultCacheDisplaced) as excinfo:
+        source.ticket("mu2edaq", tmp_path / "cache", private_primary=True)
+    assert excinfo.value.before is None
+    assert excinfo.value.after == "mu2edaq/mu2e@FNAL.GOV"
+
+
+def test_a_foreign_default_appearing_is_left_alone(settings, tmp_path, monkeypatch):
+    destroyed = []
+    source, _ = _patched_source(
+        settings, monkeypatch,
+        [_no_default(), ("anorman@FNAL.GOV", None)], destroyed=destroyed)
+    source.ticket("mu2edaq", tmp_path / "cache", private_primary=True)
+    assert destroyed == []
+
+
+def test_an_ambient_primary_with_no_default_is_still_refused(settings, tmp_path,
+                                                             monkeypatch):
+    source, minted = _patched_source(settings, monkeypatch, [_no_default()])
+    with pytest.raises(DefaultCacheUnverifiable):
+        source.ticket("mu2edaq", tmp_path / "cache", private_primary=False)
+    assert minted == []
+
+
+def test_private_primaries_do_not_excuse_an_unreadable_klist(settings, tmp_path,
+                                                             monkeypatch):
+    # Not "no default": klist output that did not parse. Nothing could be
+    # checked afterwards either, so the mint is refused regardless.
+    source, minted = _patched_source(
+        settings, monkeypatch, [(None, "klist listed a default cache but named "
+                                       "no principal")])
+    with pytest.raises(DefaultCacheUnverifiable):
+        source.ticket("mu2edaq", tmp_path / "cache", private_primary=True)
+    assert minted == []
+
+
+def test_the_manager_passes_private_primary_only_when_both_roles_are_private(
+        manager):
+    seen = []
+
+    class Recording(FakeTicketSource):
+        def ticket(self, identity, cache, timeout=120, **kwargs):
+            seen.append(kwargs.get("private_primary"))
+            return super().ticket(identity, cache, timeout)
+
+    manager.tickets = Recording(["mu2edaq", "mu2eshift"])
+    manager.service_credential("mu2edaq")
+    assert seen == [False], "the ambient cache is in use: not private"
+
+    manager.settings.set("kerberos.principal", "anorman@FNAL.GOV")
+    manager.settings.set("kerberos.root_principal", "anorman/root@FNAL.GOV")
+    manager._caches["general"] = manager.cache_for("anorman@FNAL.GOV")
+    manager._caches["root"] = manager.cache_for("anorman/root@FNAL.GOV")
+    manager.service_credential("mu2eshift")
+    assert seen == [False, True]
+
+
+def test_a_root_role_on_the_ambient_cache_is_not_private(manager):
+    manager.settings.set("kerberos.principal", "anorman@FNAL.GOV")
+    manager._caches["general"] = manager.cache_for("anorman@FNAL.GOV")
+    # No root principal: root sessions use the ambient cache.
+    assert not manager._primaries_private()
+    assert not manager._primaries_private(planned=True)
+
+
+def _kinit_harness(manager, monkeypatch, status):
+    import getpass as getpass_module
+
+    from mu2edaq_power_recovery.transport import local as local_module
+
+    ran = []
+    prompted = []
+
+    def fake_run(self, command, timeout=None, user=None, input_text=None,
+                 check=False):
+        ran.append(list(command))
+        return CommandResult(command=" ".join(command), rc=0)
+
+    monkeypatch.setattr(getpass_module, "getpass",
+                        lambda prompt="": prompted.append(prompt) or "pw")
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(local_module.LocalTransport, "run", fake_run)
+    manager.tickets.default_principal_status = lambda: status
+    return ran, prompted
+
+
+def test_kinit_on_a_fresh_login_proceeds(manager, monkeypatch):
+    # The documented setup: kerberos.principal in config/.env, no ticket yet.
+    # kinit mints the operator's own principal; that becoming the default is
+    # what the guard protects, not a displacement, so it must not be refused.
+    manager.settings.set("kerberos.principal", "anorman@FNAL.GOV")
+    ran, prompted = _kinit_harness(manager, monkeypatch, _no_default())
+    cache = manager.cache_for("anorman@FNAL.GOV")
+    manager._kinit("anorman@FNAL.GOV", cache, "general")
+    assert ran == [["kinit", "-c", f"FILE:{cache}", "anorman@FNAL.GOV"]]
+    assert prompted, "the operator is prompted for the password"
+
+
+def test_kinit_with_no_default_and_private_primaries_proceeds(manager, monkeypatch):
+    manager.settings.set("kerberos.principal", "anorman@FNAL.GOV")
+    manager.settings.set("kerberos.root_principal", "anorman/root@FNAL.GOV")
+    ran, _ = _kinit_harness(manager, monkeypatch, _no_default())
+    cache = manager.cache_for("anorman@FNAL.GOV")
+    manager._kinit("anorman@FNAL.GOV", cache, "general")
+    assert ran == [["kinit", "-c", f"FILE:{cache}", "anorman@FNAL.GOV"]]
+
+
+def test_kinit_with_an_unparsable_default_is_refused_even_when_private(
+        manager, monkeypatch):
+    manager.settings.set("kerberos.principal", "anorman@FNAL.GOV")
+    manager.settings.set("kerberos.root_principal", "anorman/root@FNAL.GOV")
+    ran, _ = _kinit_harness(manager, monkeypatch,
+                            (None, "klist named no principal"))
+    with pytest.raises(KerberosError):
+        manager._kinit("anorman@FNAL.GOV",
+                       manager.cache_for("anorman@FNAL.GOV"), "general")
+    assert ran == []
+
+
+def test_destroy_default_names_the_cache_never_a_bare_kdestroy(settings,
+                                                               monkeypatch):
+    from mu2edaq_power_recovery.creds import ticketsource as ts_module
+
+    calls = []
+    principals = iter([None])          # after the kdestroy: no default
+
+    def fake_run(argv, **kwargs):
+        calls.append((list(argv), "KRB5CCNAME" in (kwargs.get("env") or {})))
+        return _completed(0)
+
+    monkeypatch.setattr(ts_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(ts_module.TicketSource, "collection",
+                        staticmethod(lambda: {"mu2edaq/mu2e@FNAL.GOV": "API:77"}))
+    monkeypatch.setattr(ts_module.TicketSource, "default_principal",
+                        staticmethod(lambda: next(principals, None)))
+    source = ts_module.TicketSource(settings)
+    assert source.destroy_default("mu2edaq/mu2e@FNAL.GOV")
+    assert calls == [(["kdestroy", "-c", "API:77"], False)]
+
+
+def test_identity_discovery_runs_once_per_manager(manager):
+    calls = []
+    original = manager.tickets.identities
+
+    def counting():
+        calls.append(1)
+        return original()
+
+    manager.tickets.identities = counting
+    for _ in range(5):
+        manager.chain()
+        manager.chain(root=True)
+    assert manager.available_identities()[:2] == ["mu2edaq", "mu2eshift"]
+    assert len(calls) == 1
+    # The live switch still applies: memoised discovery is not memoised policy.
+    manager.settings.set("kerberos.use_service_keytabs", False)
+    assert manager.available_identities() == []

@@ -51,6 +51,8 @@ src/mu2edaq_power_recovery/
   cli.py           the driver and the four single-phase entry points
   creds/           kerberos.py (kinit/klist, credential chains),
                    ticketsource.py (adapter over mu2edaq-kerberos),
+                   bootstrap.py (credential_session: the one way the run
+                   and the ssh/ipmi diagnostics open credentials),
                    vault.py (hvac: IPMI and ECL secrets)
   transport/       base.py, local.py, ssh.py, ipmi.py, fake.py
   checks/          base.py (registry), parsers.py, and one module per area
@@ -213,8 +215,40 @@ could fire for two nodes or for neither.
   *displaces* — never destroys — the operator's. Anything handling a cache must
   accept a name: `FILE:API:<uuid>` names nothing, and a bare `kdestroy` steered
   only by `KRB5CCNAME` destroys the default. Record the default principal before
-  each mint and restore it after. `cleanup()` names each cache to `kdestroy -c`
-  and refuses any file cache outside the run's own temporary directory.
+  each mint and restore it after -- on *any* exit from the mint, including
+  KeyboardInterrupt (`TicketSource.ticket()`'s `except BaseException`). A
+  service cache is put in `_caches` before the mint so an interrupted one is
+  still destroyed. `cleanup()` names each cache to `kdestroy -c`, tolerates
+  one that was never created, and refuses any file cache outside the run's
+  own temporary directory.
+- **A readable default is a precondition for a service mint.**
+  `TicketSource.ticket()` raises `DefaultCacheUnverifiable` before
+  `get-kerberos-ticket` runs when `default_principal_status()` cannot name the
+  default principal, and `DefaultCacheDisplaced(before, after)` when a restore
+  fails. Both are `DefaultCacheGuardError`; `service_credential` catches that
+  *type* and sets `fallbacks_disabled` for the run. The one exception: with
+  both primary roles on private caches (`_primaries_private()`) and klist
+  reporting `NoDefaultCache` (a type, not a message), the mint proceeds and a
+  default it leaves naming the identity is destroyed by name
+  (`destroy_default`), else `DefaultCacheDisplaced(None, after)`. `_kinit`
+  (`_guard_kinit`) proceeds on `NoDefaultCache` -- it mints the operator's own
+  principal, whose becoming the default is no displacement -- and refuses, before
+  the prompt, only a default that exists but cannot be read. Never key control flow on a
+  message again — the substring test this replaced is how a reworded error could
+  have let the chain keep minting under a displaced default.
+- **Every mint holds `KerberosManager._mint_lock`** (an RLock): read default,
+  mint, collection lookup, restore, as one transaction, with a double-checked
+  fast path and results published to `_service` last. `_kinit` takes it too.
+  `_successful` has its own small lock so an ssh success callback never waits
+  behind a mint. `vault-client identities` runs once per manager
+  (`_discovered`); the `use_service_keytabs` switch is still read live. `warm_fallbacks()` mints every fallback before workers start
+  — only with `use_service_keytabs` on, never under `--simulate` or in a
+  show-only diagnostic.
+- **Open credentials through `creds/bootstrap.py:credential_session`**, not by
+  building a `KerberosManager` and `SSHFactory` by hand. It is what makes the
+  diagnostics reproduce the run, and its `finally` is what destroys the private
+  caches. `prepare=False` is describe-only: it sets `minting = False` and
+  acquires nothing.
 - **Never weaken the protected-host refusal.** It is the one place the tool
   declines to do what it is told, and it is deliberate.
 - **Keep FAIL and UNKNOWN distinct.** "It is broken" and "we could not look"
@@ -264,13 +298,6 @@ could fire for two nodes or for neither.
   `vault.ipmi_path` / `ipmi_*_field` fix it without a code change.
 - **`ecl-client`'s Python surface is version-dependent.** `report/ecl.py` tries
   the module-level `post()` first and the class API second.
-- **Abandoning the service identities is decided by a substring.**
-  `KerberosManager.service_credential` tests
-  `"default credential cache" in str(exc)` to tell an unrecoverable
-  displacement from an ordinary "no keytab for this identity". Reword that
-  message in `ticketsource.py` and the run silently downgrades the first to the
-  second and carries on minting under a displaced default. Carrying the
-  decision on the exception *type* would fix it.
 - **Phase 2 waits for nodes one at a time.** `_wait_for_nodes` walks a stage's
   nodes in sequence, so one node that never returns costs the whole
   `boot_timeout` before the next is tried. The `readout` stage has 28 nodes.
@@ -280,13 +307,17 @@ could fire for two nodes or for neither.
   the config, `.env` or the environment arms live power commands with no flag.
   Several documents claimed two gates; they have been corrected to describe
   this. `--simulate` is the only genuinely independent gate.
-- **Nothing installs a SIGTERM handler.** No module under `src/` imports
-  `signal`; `cli.py` catches `KeyboardInterrupt` only. So
-  `stop-mu2edaq-power-recovery.sh` kills the run outright: the store is left
-  saying `running` and `KerberosManager.cleanup()` never runs, leaving the
-  run's private root-capable caches behind. SIGINT is the clean path.
+- **SIGKILL is not a clean stop.** SIGTERM is: `cli.install_sigterm_handler()`
+  raises KeyboardInterrupt, `assess_nodes` and the mesh probe shut their pools
+  down with `cancel_futures=True` instead of waiting out the queue, and
+  `KerberosManager.cleanup()` runs. Workers already mid-command keep the
+  process alive until that command ends (ThreadPoolExecutor threads are
+  joined at interpreter exit), so a stop script's SIGKILL after its grace
+  period can still arrive -- after cleanup. `sweep.py` still uses a `with`
+  pool; its work items are single short connects.
 - **The Kerberos startup guard warns; it does not stop the run.**
-  `orchestrator.py:230-233` logs `ambient_warning()` and continues.
+  `creds/bootstrap.py:credential_session` logs `ambient_warning()` and
+  continues.
   `ambient_warning()` covers one fatal condition and one benign one, so making
   it halt means separating them first.
 - **An unmatched `--from`/`--until` stage name is silently ignored**

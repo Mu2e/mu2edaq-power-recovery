@@ -4,6 +4,12 @@ When a check reports "could not reach the node", the next question is always
 what command was actually issued, and through which gateway.  This prints that
 command verbatim, so it can be copied into a shell and debugged by hand -- and
 with --run, executes it and shows what came back.
+
+Credentials come from the same bootstrap the run uses (creds/bootstrap.py):
+with --run the designated principals are acquired into private caches and the
+service fallbacks minted before any node is contacted, and every private cache
+is destroyed on the way out. Without --run nothing is acquired or minted; the
+candidates a run would try are listed, and any not yet acquired says so.
 """
 from __future__ import annotations
 
@@ -14,11 +20,13 @@ import sys
 from typing import List, Optional, Sequence
 
 from .. import console
-from ..creds import KerberosManager
+from ..cli import install_sigterm_handler
+from ..creds import KerberosError
+from ..creds.bootstrap import CredentialSession, credential_session
 from ..topology import TopologyError
-from ..transport import LocalTransport, SSHFactory
+from ..transport import LocalTransport
 from ..transport.base import TransportError
-from ._common import add_common_arguments, bootstrap
+from ._common import add_common_arguments, add_credential_arguments, bootstrap
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -53,11 +61,27 @@ examples
     parser.add_argument("--no-chain", action="store_true",
                         help="use only the ambient ticket, instead of the full "
                              "credential chain a real run would try")
+    add_credential_arguments(parser)
     return add_common_arguments(parser)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
+    # SIGTERM takes the same path as Ctrl-C, so the private caches are
+    # destroyed by credential_session's finally rather than left behind.
+    install_sigterm_handler()
+    try:
+        return probe(args)
+    except KerberosError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        print("\n  interrupted; the private Kerberos caches have been "
+              "destroyed.", file=sys.stderr)
+        return 3
+
+
+def probe(args: argparse.Namespace) -> int:
     settings, topology = bootstrap(args)
 
     locations = [args.location] if args.location else \
@@ -77,16 +101,32 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 2
 
     local = LocalTransport(default_timeout=settings.get("ssh.command_timeout", 120))
+    if args.no_chain and (settings.get("kerberos.principal") or
+                          settings.get("kerberos.root_principal")):
+        print("  note: --no-chain uses the ambient ticket only; the designated "
+              "principal(s) are ignored.\n")
     # With the credential chain, because the point of this tool is to reproduce
     # what a real run does. Without it the probe tests only the ambient ticket
     # and ssh_config's login, which is how a probe can succeed against a host
     # the actual run cannot reach -- exactly the confusion it exists to prevent.
-    kerberos = None if args.no_chain else KerberosManager(settings, local=local)
-    if kerberos is not None:
-        warning = kerberos.ambient_warning()
-        if warning:
-            print(f"  note: {warning}\n")
-    factory = SSHFactory(settings, topology, local=local, kerberos=kerberos)
+    # Show-only acquires nothing: describing a command is no reason to prompt
+    # for a password or mint seven service tickets.
+    with credential_session(settings, topology, local,
+                            chain=not args.no_chain,
+                            prepare=bool(args.run)) as session:
+        if session.warning:
+            print(f"  note: {session.warning}\n")
+        for note in session.notes:
+            if note != session.warning:
+                print(f"  note: {note}\n")
+        return probe_nodes(args, nodes, session)
+
+
+def probe_nodes(args: argparse.Namespace, nodes: Sequence,
+                session: CredentialSession) -> int:
+    """Show, or run, the command for each node under *session*."""
+    factory = session.factory
+    kerberos = session.kerberos
     command = args.run or "true"
 
     rows: List[List[str]] = []
@@ -127,8 +167,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         else:
             rows.append([node.short, transport.jump or "(direct)", "",
                          entry["command"]])
-            for credential in getattr(transport, "credentials", []) or []:
-                rows.append(["", "", "", f"  would try: {credential.describe()}"])
+            # Candidates, not the transport's chain: nothing was minted, so
+            # the transport holds only what exists, and the listing should
+            # show what a run would try -- each unacquired one marked as such.
+            candidates = kerberos.chain(root=args.root, mint=False,
+                                        candidates=True) \
+                if kerberos is not None else []
+            entry["would_try"] = [c.as_dict() for c in candidates]
+            for credential in candidates:
+                # The acquired/not-acquired mark leads, because the table
+                # truncates the end of the line on a narrow terminal.
+                mark = "would try (not acquired)" if credential.pending \
+                    else "would try"
+                rows.append(["", "", "", f"  {mark}: {credential.describe()}"])
         payload.append(entry)
 
     if args.json:

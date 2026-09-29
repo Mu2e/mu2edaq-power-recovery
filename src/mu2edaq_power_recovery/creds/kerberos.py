@@ -18,6 +18,16 @@ The general and root principals are kept in *separate* caches
 (``KRB5CCNAME=FILE:...``) rather than a cache collection, so acquiring the root
 ticket cannot silently replace the ordinary one, and an SSH command can select
 which identity it runs under simply by which environment it is given.
+
+Concurrency
+-----------
+Nodes are assessed a thread apiece, and every transport asks for a credential
+chain. Minting is therefore one serialised transaction under ``_mint_lock``:
+read the default cache, mint, look the ticket up in the collection, restore
+the default. Two of those interleaved can restore each other's "before" and
+leave the operator's default displaced, which is the failure the whole guard
+exists to prevent. A mint's results are published to the shared maps last, so
+the lock-free fast path never sees a half-initialised credential.
 """
 from __future__ import annotations
 
@@ -27,6 +37,7 @@ import os
 import re
 import shutil
 import tempfile
+import threading
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -34,7 +45,9 @@ from typing import Any, Dict, List, Optional, Sequence
 
 from ..transport.base import TransportError
 from ..transport.local import LocalTransport
-from .ticketsource import TicketSource, TicketSourceError
+from .ticketsource import (DefaultCacheDisplaced, DefaultCacheGuardError,
+                           DefaultCacheUnverifiable, NoDefaultCache,
+                           TicketSource, TicketSourceError)
 
 log = logging.getLogger(__name__)
 
@@ -84,6 +97,13 @@ class Credential:
     #: the run returns to it; the service identities are only ever fallbacks.
     primary: bool = False
 
+    #: Why this credential's ticket has not been acquired, or None when it
+    #: has (or when it is the ambient cache, which needs no acquiring). Set
+    #: only on credentials built for *describing* a chain -- see
+    #: KerberosManager.chain(candidates=True) -- so a display never claims a
+    #: cache will be used that does not exist yet.
+    pending: Optional[str] = None
+
     def environ(self) -> Dict[str, str]:
         """Environment additions selecting this credential's cache."""
         return {"KRB5CCNAME": ccache_name(self.cache)} if self.cache else {}
@@ -99,8 +119,11 @@ class Credential:
         return replace(self, login=login)
 
     def as_dict(self) -> Dict[str, Any]:
-        return {"name": self.name, "login": self.login,
-                "principal": self.principal, "source": self.source}
+        out = {"name": self.name, "login": self.login,
+               "principal": self.principal, "source": self.source}
+        if self.pending:
+            out["pending"] = self.pending
+        return out
 
     def __str__(self) -> str:
         return f"{self.name} ({self.principal or self.login or 'ambient'})"
@@ -115,8 +138,56 @@ class Credential:
         """
         login = self.login or "(ssh default)"
         principal = self.principal or "(principal unknown)"
-        cache = ccache_name(self.cache) if self.cache else "ambient cache"
+        if self.pending:
+            cache = f"not acquired: {self.pending}"
+        else:
+            cache = ccache_name(self.cache) if self.cache else "ambient cache"
         return f"login {login:<16} ticket {principal:<34} [{cache}]"
+
+
+@dataclass
+class FallbacksDisabled:
+    """Why the service identities were abandoned for the rest of a run.
+
+    Carried as data, not inferred from a message: the decision is made on the
+    exception *type* (:class:`DefaultCacheGuardError`), and this records which
+    kind it was and what the operator should do about it.
+    """
+
+    #: 'displaced' or 'unverifiable' -- DefaultCacheGuardError.kind.
+    kind: str
+    #: The identity whose mint raised it.
+    identity: str
+    #: The exception's own message.
+    detail: str
+    #: What the operator should do.
+    guidance: str
+
+    def note(self) -> str:
+        """One note for the phase report, the run store and the console."""
+        return (f"service identities disabled for the rest of this run "
+                f"({self.kind}, while minting {self.identity}): {self.detail}. "
+                f"{self.guidance}")
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {"kind": self.kind, "identity": self.identity,
+                "detail": self.detail, "guidance": self.guidance}
+
+
+def _guidance(exc: DefaultCacheGuardError) -> str:
+    """What to do about a guard failure, by type."""
+    if isinstance(exc, DefaultCacheDisplaced):
+        before = exc.before or "<you>@FNAL.GOV"
+        return (f"The operator's ticket is still in the collection: run "
+                f"'kswitch -p {before}' (or 'kinit {before}') before the next "
+                f"run, and set kerberos.use_service_keytabs: false if it "
+                f"recurs. This run continues on the operator credential alone.")
+    if isinstance(exc, DefaultCacheUnverifiable):
+        return ("Run 'kinit <you>@FNAL.GOV' so the default cache holds your own "
+                "ticket (check with 'klist'), then re-run to use the service "
+                "identities. This run continues on the operator credential "
+                "alone.")
+    return "This run continues on the operator credential alone."
 
 
 @dataclass
@@ -178,6 +249,27 @@ class KerberosManager:
         self._successful: List[str] = []
         #: Cached principal of the default credential cache.
         self._ambient: Any = _UNSET
+        #: Serialises every mint -- service identities and the designated
+        #: principals alike -- as one read/mint/lookup/restore transaction.
+        #: Re-entrant because warm_fallbacks() and chain() reach
+        #: service_credential() while a caller may already hold it.
+        self._mint_lock = threading.RLock()
+        #: Guards _successful. Separate from the mint lock on purpose: an ssh
+        #: success callback must not wait behind a two-minute mint.
+        self._state_lock = threading.Lock()
+        #: Set once a default-cache guard failure has abandoned the service
+        #: identities; None while they are usable.
+        self.fallbacks_disabled: Optional[FallbacksDisabled] = None
+        #: False for a describe-only session (mu2e-ssh-probe without --run):
+        #: chain() then never mints, it only reports what would be tried.
+        self.minting: bool = True
+        #: Set by cleanup(); no mint is started after it.
+        self._closed = False
+        #: `vault-client identities`, run once per manager: every chain() --
+        #: one per transport, so per node -- asks for the identity list, and
+        #: the answer does not change during a run.
+        self._discovered: Optional[List[str]] = None
+        self._discover_lock = threading.Lock()
 
     # -- inspection --------------------------------------------------------
 
@@ -316,6 +408,9 @@ class KerberosManager:
             )
         if not shutil.which("kinit"):
             raise KerberosError("kinit is not on PATH; install the Kerberos client tools")
+        # Before the prompt, so an operator is not asked for a password only
+        # to be refused; checked again under the lock below.
+        self._guard_kinit(principal, self._default_status())
 
         cache.parent.mkdir(parents=True, exist_ok=True)
         print(f"\nA Kerberos ticket is needed for the {role} principal.")
@@ -333,18 +428,76 @@ class KerberosManager:
         # one other place this project mints a ticket -- and the riskier one,
         # because this is the operator's own, root-capable principal. -c is
         # what kinit documents; KRB5CCNAME alone is what Heimdal ignores.
-        before = self.tickets.default_principal()
-        try:
-            result = runner.run(["kinit", "-c", target, principal],
-                                timeout=60, input_text=password)
-        finally:
-            del password
-        self._restore_default_if_displaced(principal, before)
+        # Under the mint lock like every other mint, so it cannot interleave
+        # with a service mint's read-before/restore.
+        with self._mint_lock:
+            before, why = self._default_status()
+            self._guard_kinit(principal, (before, why))
+            try:
+                result = runner.run(["kinit", "-c", target, principal],
+                                    timeout=60, input_text=password)
+            finally:
+                del password
+            self._restore_default_if_displaced(principal, before)
+            if not before:
+                # A default may exist now (this principal's); re-read it.
+                self._ambient = _UNSET
         if not result.ok:
             detail = (result.stderr or result.stdout).strip().splitlines()
             raise KerberosError(f"kinit failed for {principal}: "
                                 f"{detail[-1] if detail else 'unknown error'}")
         log.info("acquired %s ticket for %s", role, principal)
+
+    def _default_status(self):
+        """``(principal, reason)`` for the default cache, via the ticket source."""
+        status = getattr(self.tickets, "default_principal_status", None)
+        if status is not None:
+            return status()
+        principal = self.tickets.default_principal()
+        return principal, (None if principal else "default cache not readable")
+
+    def _primaries_private(self, planned: bool = False) -> bool:
+        """True when every primary role (general *and* root) has a private cache.
+
+        Then nothing the run does depends on the default credential cache,
+        which is what makes minting from "no default at all" safe. Root with no
+        root principal designated runs on the ambient cache (see
+        operator_credential), so it needs one -- or the same principal as
+        general, which prepare() gives the general cache. *planned* answers
+        from the configuration alone, for use while prepare() is still
+        acquiring them; otherwise both caches must exist too.
+        """
+        general = self.settings.get("kerberos.principal")
+        root = self.settings.get("kerberos.root_principal")
+        if not (general and root):
+            return False
+        if planned:
+            return True
+        return all(self._caches.get(role) for role in ("general", "root"))
+
+    def _guard_kinit(self, principal: str, status) -> None:
+        """The service-mint rule, for kinit: never mint unguarded.
+
+        A readable default can be compared and restored afterwards. When klist
+        says there simply is no default (``NoDefaultCache`` -- a fresh login),
+        kinit is allowed: what it mints is the *operator's* designated
+        principal, and that principal becoming the default is exactly what the
+        guard exists to preserve, not a displacement. (Service mints are held
+        to the stricter rule in ``TicketSource.ticket``.) A default that exists
+        but cannot be read is refused, before the password prompt, because a
+        kinit could then displace an identity the run cannot restore.
+        """
+        before, why = status
+        if before or isinstance(why, NoDefaultCache):
+            return
+        raise KerberosError(
+            f"cannot acquire a ticket for {principal}: the default credential "
+            f"cache could not be read ({why or 'no principal reported'}), so "
+            f"the kinit could not be checked for displacing it, and this run "
+            f"uses the default cache for "
+            f"{'root sessions' if self.settings.get('kerberos.principal') else 'its sessions'}.\n"
+            f"Run 'klist' to see what is wrong with the default cache, or "
+            f"'kinit <you>@FNAL.GOV' to replace it, then re-run.")
 
     def _restore_default_if_displaced(self, principal: str,
                                       before: Optional[str]) -> None:
@@ -392,7 +545,10 @@ class KerberosManager:
                                            ["mu2edaq", "mu2eshift"]) or [])
         discovered: List[str] = []
         if self.settings.get("kerberos.discover_identities", True):
-            discovered = self.tickets.identities()
+            with self._discover_lock:
+                if self._discovered is None:
+                    self._discovered = list(self.tickets.identities())
+                discovered = list(self._discovered)
         if not discovered:
             return preferred
         ordered = [i for i in preferred if i in discovered]
@@ -409,40 +565,104 @@ class KerberosManager:
         A failure is cached as None. An identity whose keytab is missing, or
         whose kinit fails, will fail identically for every other node, and
         rediscovering that once per node would dominate a fifty-node run.
+
+        Thread-safe. The fast path reads the published result without the
+        lock; a miss takes the lock and checks again, so concurrent cold
+        requests for one identity mint it once, and mints of different
+        identities never interleave their default-cache restores.
         """
         if identity in self._service:
             return self._service[identity]
 
-        credential: Optional[Credential] = None
-        if not self.tickets.available:
-            log.debug("%s", self.tickets.unavailable_reason())
-        else:
-            cache = self.cache_for(f"svc-{identity}")
-            try:
-                ticket = self.tickets.ticket(identity, cache)
-            except TicketSourceError as exc:
-                message = str(exc)
-                if "default credential cache" in message:
-                    # The operator's own ticket has been replaced. Stop dead:
-                    # every later login would run as the wrong identity.
-                    log.error("%s", message)
-                    self.settings.set("kerberos.use_service_keytabs", False,
-                                      source="runtime (ccache was clobbered)")
+        with self._mint_lock:
+            if identity in self._service:
+                return self._service[identity]
+            if self._closed or self.fallbacks_disabled is not None:
+                # Cleaned up, or the default cache can no longer be trusted:
+                # a thread that queued behind the failing mint must not start
+                # another one.
+                return None
+
+            credential: Optional[Credential] = None
+            cache_key = f"svc-{identity}"
+            ticket_cache: Any = None
+            if not self.tickets.available:
+                log.debug("%s", self.tickets.unavailable_reason())
+            else:
+                cache = self.cache_for(cache_key)
+                private = self._primaries_private()
+                # Recorded for cleanup() *before* the mint, so a mint that is
+                # interrupted (SIGTERM -> KeyboardInterrupt) after writing the
+                # cache still has it destroyed. cleanup() tolerates a cache
+                # that was never created. Replaced below by the ticket's real
+                # cache, which on macOS may be a collection name instead.
+                self._caches[cache_key] = cache
+                try:
+                    ticket = self.tickets.ticket(identity, cache,
+                                                 private_primary=private)
+                except DefaultCacheGuardError as exc:
+                    # Decided on the type, never the wording. Either the
+                    # operator's default has been displaced and could not be
+                    # put back, or it could not be read so a mint could not be
+                    # checked at all; in both cases every further mint carries
+                    # the same risk, so stop them all.
+                    self._disable_fallbacks(identity, exc)
                     self._service[identity] = None
                     return None
-                log.warning("cannot use the %s service identity: %s", identity, exc)
-            else:
-                credential = Credential(
-                    name=identity, login=identity, cache=ticket.cache,
-                    principal=ticket.principal,
-                    source="mu2edaq-kerberos (Vault keytab)")
-                self._caches[f"svc-{identity}"] = ticket.cache
-                self._acquired.append(ticket.principal or identity)
-                log.info("acquired a ticket for the %s service identity (%s)",
-                         identity, ticket.principal or "principal unknown")
+                except TicketSourceError as exc:
+                    log.warning("cannot use the %s service identity: %s",
+                                identity, exc)
+                else:
+                    credential = Credential(
+                        name=identity, login=identity, cache=ticket.cache,
+                        principal=ticket.principal,
+                        source="mu2edaq-kerberos (Vault keytab)")
+                    ticket_cache = ticket.cache
+                    log.info("acquired a ticket for the %s service identity (%s)",
+                             identity, ticket.principal or "principal unknown")
 
-        self._service[identity] = credential
-        return credential
+            # Published last, _service last of all: a reader on the fast path
+            # that sees the credential also sees its cache recorded for
+            # cleanup. (A failed mint keeps the pre-recorded path: whatever
+            # it left there is ours to destroy.)
+            if credential is not None:
+                self._caches[cache_key] = ticket_cache
+                self._acquired.append(credential.principal or identity)
+            self._service[identity] = credential
+            return credential
+
+    def _disable_fallbacks(self, identity: str,
+                           exc: DefaultCacheGuardError) -> None:
+        """Abandon the service identities for the rest of the run."""
+        if self.fallbacks_disabled is None:
+            self.fallbacks_disabled = FallbacksDisabled(
+                kind=getattr(exc, "kind", "guard"), identity=identity,
+                detail=str(exc), guidance=_guidance(exc))
+            log.error("%s", self.fallbacks_disabled.note())
+        self.settings.set("kerberos.use_service_keytabs", False,
+                          source=f"runtime (default-cache guard: "
+                                 f"{self.fallbacks_disabled.kind})")
+
+    def warm_fallbacks(self) -> List[str]:
+        """Mint every fallback identity once, before any worker starts.
+
+        The lock already makes a lazy mint safe; doing them here as well means
+        no mint -- and so no moment in which the default cache may be
+        displaced -- overlaps worker threads running ssh under the ambient
+        cache. Only called when kerberos.use_service_keytabs is on, and never
+        for a simulated or describe-only session. Returns the identities that
+        are now usable.
+        """
+        if not self.settings.get("kerberos.use_service_keytabs", True):
+            return []
+        usable: List[str] = []
+        with self._mint_lock:
+            for identity in self.available_identities():
+                if self.fallbacks_disabled is not None:
+                    break
+                if self.service_credential(identity) is not None:
+                    usable.append(identity)
+        return usable
 
     # -- credential chains ----------------------------------------------------
 
@@ -486,11 +706,21 @@ class KerberosManager:
             principal = self.ambient_principal()
         login = self.settings.get("ssh.root_user", "root") if root else \
             self.operator_login()
+        cache = self._caches.get(role)
+        designated = self.settings.get(
+            "kerberos.root_principal" if root else "kerberos.principal")
+        # A designated principal whose ticket has not been acquired would
+        # otherwise print as "[ambient cache]" -- a claim about a cache that
+        # may hold somebody else entirely.
+        pending = "designated principal, not yet acquired" \
+            if designated and not cache else None
         return Credential(name=role, login=login,
-                          cache=self._caches.get(role), principal=principal,
-                          source="operator ticket", primary=True)
+                          cache=cache, principal=principal,
+                          source="operator ticket", primary=True,
+                          pending=pending)
 
-    def chain(self, root: bool = False) -> List[Credential]:
+    def chain(self, root: bool = False, mint: Optional[bool] = None,
+              candidates: bool = False) -> List[Credential]:
         """Credentials to try for a node, in order.
 
         **The operator's own principal is always first**, for root sessions as
@@ -504,7 +734,14 @@ class KerberosManager:
         only the *ticket*: authenticating as ``mu2edaq`` and logging in to the
         root account is a thing a node's ``root/.k5login`` can authorise, and
         it is the reason root has fallbacks at all.
+
+        *mint* (default: :attr:`minting`) False never mints: identities not
+        already acquired are left out, or -- with *candidates* -- included as
+        :attr:`Credential.pending` placeholders, which is how a describe-only
+        diagnostic shows what a run would try without acquiring any of it.
         """
+        if mint is None:
+            mint = self.minting
         primary = self.operator_credential(root=root)
         chain = [primary]
         if root and not self.settings.get("kerberos.root_fallback", True):
@@ -516,7 +753,17 @@ class KerberosManager:
                 # be put back. Stop the whole chain rather than working through
                 # the remaining six doing the same damage.
                 break
-            credential = self.service_credential(identity)
+            if mint:
+                credential = self.service_credential(identity)
+            elif identity in self._service:
+                credential = self._service[identity]
+            elif candidates:
+                credential = Credential(
+                    name=identity, login=identity,
+                    source="mu2edaq-kerberos (Vault keytab)",
+                    pending="would be minted from Vault by a real run")
+            else:
+                credential = None
             if credential is None:
                 continue
             # Root: same login, different ticket. Ordinary: the identity's own
@@ -536,7 +783,9 @@ class KerberosManager:
         displaced -- a service identity having worked somewhere is not a reason
         to stop offering the personal ticket first.
         """
-        promoted = [i for i in self._successful if i in identities]
+        with self._state_lock:
+            successful = list(self._successful)
+        promoted = [i for i in successful if i in identities]
         return promoted + [i for i in identities if i not in promoted]
 
     #: Principals that are service identities rather than a person. Used only
@@ -589,9 +838,13 @@ class KerberosManager:
         name = credential.name
         if name in ("general", "root"):
             return
-        if name in self._successful:
-            self._successful.remove(name)
-        self._successful.insert(0, name)
+        # Called from every worker's ssh success callback, so the
+        # remove-then-insert must be atomic: two threads interleaving it can
+        # duplicate a name or raise ValueError on the remove.
+        with self._state_lock:
+            if name in self._successful:
+                self._successful.remove(name)
+            self._successful.insert(0, name)
 
     # -- use ---------------------------------------------------------------
 
@@ -621,6 +874,11 @@ class KerberosManager:
             # One principal doing both jobs; record it under both roles so the
             # report does not imply a root identity that was never used.
             tickets["root"] = tickets["general"]
+            if root == general and "general" in self._caches:
+                # And select its cache for root sessions too: without this a
+                # root session named that principal while ssh was handed the
+                # ambient cache, which may hold somebody else.
+                self._caches["root"] = self._caches["general"]
         return tickets
 
     def cleanup(self) -> None:
@@ -643,9 +901,18 @@ class KerberosManager:
         A file cache outside the run's own directory is refused outright: the
         plausible foreign path is the operator's own.
         """
+        # Under the mint lock: a mint in flight finishes (and records its cache)
+        # before the sweep, and none starts after it.
+        with self._mint_lock:
+            self._closed = True
+            caches = list(self._caches.values())
         cache_dir = self._cache_dir.resolve()
-        for cache in self._caches.values():
+        seen = set()
+        for cache in caches:
             target = ccache_name(cache)
+            if target in seen:
+                continue      # root and general sharing one principal's cache
+            seen.add(target)
             if target.startswith("FILE:"):
                 path = Path(target[len("FILE:"):])
                 try:

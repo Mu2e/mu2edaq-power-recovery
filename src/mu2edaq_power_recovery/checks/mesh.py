@@ -478,7 +478,10 @@ class MeshProbe:
             return self._probe_source(name, make_transport(), target_names,
                                       network, mtu_probe)
 
-        with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
+        # Not a `with` block: its __exit__ would wait for every queued source
+        # after a Ctrl-C/SIGTERM (KeyboardInterrupt) before cleanup could run.
+        pool = ThreadPoolExecutor(max_workers=self.max_workers)
+        try:
             futures = {pool.submit(job, plan): plan for plan in plans}
             for future in as_completed(futures):
                 name, _, target_names = futures[future]
@@ -492,6 +495,11 @@ class MeshProbe:
                         _untested(name, t, network,
                                   f"probe raised {type(exc).__name__}: {exc}")
                         for t in target_names)
+        except BaseException:
+            log.warning("mesh %s interrupted: cancelling queued probes", network)
+            pool.shutdown(wait=False, cancel_futures=True)
+            raise
+        pool.shutdown(wait=True)
         out.edges.sort(key=lambda e: (e.source, e.target))
         if origin == "gateways":
             self._note_gateway_coverage(out)

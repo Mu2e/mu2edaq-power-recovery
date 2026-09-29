@@ -339,17 +339,16 @@ is how the probe could succeed against a host the recovery itself could not
 reach — exactly the confusion it exists to prevent. `--no-chain` restores the
 ambient-only behaviour, which is worth having when you want to compare the two.
 
-One divergence remains, and it matters when you have set
-`kerberos.principal`. The probe builds the same *list* of credentials, but it
-does not mint tickets: it never calls `KerberosManager.prepare()`, so the
-operator credential it uses carries your configured principal's **name** while
-pointing at the **ambient** cache, and the chain's service identities are
-listed rather than acquired. A real run kinits each principal into a private
-cache and hands `ssh` a `KRB5CCNAME` for it. So `would try: login … ticket
-you@FNAL.GOV [ambient cache]` names the principal from your config, not
-necessarily the one actually in the default cache — check that with `klist`
-(`klist -l` on macOS) rather than reading it off the probe. There is no
-`--principal` flag to make the probe mint one.
+With `--run` the probe also acquires what a run acquires, through the same
+bootstrap (`creds/bootstrap.py`): a configured `kerberos.principal` (or
+`--principal` / `--root-principal`) is kinit'd into a private cache and `ssh` is
+handed a `KRB5CCNAME` for it, the service identities are minted once up front,
+and every private cache is destroyed on exit — including Ctrl-C and SIGTERM.
+Without `--run` nothing is acquired or minted, and the listing says so: an
+unacquired credential reads `would try (not acquired): … [not acquired: …]`,
+never `[ambient cache]`. `mu2e-ipmi-tool` opens its gateway session the same
+way, so it too leads with your principal and falls back to the service
+identities exactly as a run does.
 
 `mu2e-ipmi-tool --show-command` prints the invocation without running it, for
 comparison against a known-working one. It contains no password.

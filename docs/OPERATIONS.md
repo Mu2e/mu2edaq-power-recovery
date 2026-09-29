@@ -41,16 +41,17 @@ the cheapest command that actually logs in.
 With `--run`, the probe builds the same credential chain a real run builds and
 names the credential that got in. (It did not always: an earlier version tested
 only your ambient ticket, which is how probing a gateway could succeed while the
-recovery failed against it.) One difference survives: the probe does not mint
-tickets, so it uses whatever is in your **ambient** cache even when
-`kerberos.principal` names something else, and lists the service identities
-rather than acquiring them. That makes `klist` below the authority on which
-ticket you actually hold, not the probe's output.
+recovery failed against it.) It also acquires what a run acquires: a
+configured `kerberos.principal` (or `--principal`) is kinit'd into a private
+cache that `ssh` is pointed at, and the service identities are minted up front
+and destroyed on exit. Without `--run` nothing is acquired, and any credential
+that has no ticket yet is listed as `would try (not acquired)`.
 
-`mu2e-ipmi-tool` tests the *BMC* credentials, not the run's SSH access: it
-reaches the gateway with your ambient ticket only, with no credential chain and
-no check of the default cache. Do not read a working `mu2e-ipmi-tool` as
-evidence that the recovery can log in.
+`mu2e-ipmi-tool` opens its gateway session through the same credential
+bootstrap as a run (your principal first, then the service identities, with
+the default-cache check), so a gateway it cannot reach is one the run cannot
+reach either. It still tests the *BMC* credentials first and foremost; whether
+the run can log in to the *nodes* is `mu2e-ssh-probe --run true`.
 
 `klist` matters more than it looks. If the default credential cache holds a
 service identity rather than you, every login in the run is attempted as that
@@ -449,10 +450,19 @@ mu2e-power-state --node mu2e-trk-03 -v
 On Windows the equivalents are `stop-mu2edaq-power-recovery.ps1 -Status`,
 `-Force` and `-Grace <seconds>` (default 30).
 
-**Stopping a run is not clean, and you have to tidy up after it.** The stop
-script sends SIGTERM, but nothing in the driver installs a SIGTERM handler, so
-the process dies where it stands. Two consequences, neither of which the run
-can report for itself:
+**SIGTERM is a clean stop; SIGKILL is not.** The driver's SIGTERM handler
+raises the same KeyboardInterrupt as Ctrl-C. Mid-phase, the worker pool is shut
+down without waiting (`cancel_futures`): queued nodes and mesh sources are
+never started, the interruption is recorded, the run is marked `interrupted`,
+and the private Kerberos caches are destroyed straight away — including one a
+service mint was writing when the signal arrived, and with the default cache
+restored if that mint had displaced it. Nodes already mid-command finish that
+command in the background before the process exits, which can take up to
+`ssh.command_timeout`; if the stop script's grace period expires first it
+sends SIGKILL, by which time cleanup has already run.
+
+Only after SIGKILL (`--force`, or a grace period that expired *before* the
+interrupt was handled) do these apply:
 
 - **The run is left as `running` in the store.** It is never marked
   `interrupted`, and the phase in progress records no end. `mu2e-power-report

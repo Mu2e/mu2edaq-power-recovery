@@ -10,6 +10,10 @@ mu2e-ssh-probe \- show, or run, the exact ssh command the recovery tools use
 .RB [ \-\-run
 .IR COMMAND ]
 .RB [ \-\-no\-chain ]
+.RB [ \-\-principal
+.IR PRINCIPAL ]
+.RB [ \-\-root\-principal
+.IR PRINCIPAL ]
 .RI [ options ]
 .SH DESCRIPTION
 When a check reports that a node could not be reached, the next question is
@@ -19,10 +23,11 @@ and debugged by hand, and with
 .B \-\-run
 executes it and shows what came back.
 .PP
-.B "Without \-\-run nothing is executed and no connection is opened."
+.B "Without \-\-run nothing is executed on the node, and no ticket is acquired or minted."
 The tool prints the argument vector and the credentials it would try, reports
 that nothing was run, and exits 0 \(em whether or not the host would have
-answered. A bare invocation is therefore useless as a test of access: use
+answered. (Picking a jump host for a non-gateway node still probes the
+gateways, under whatever credentials already exist.) A bare invocation is therefore useless as a test of access: use
 .B \-\-run true
 whenever the question is whether a login succeeds.
 .PP
@@ -64,29 +69,32 @@ and so on whatever
 says. That is deliberate \(em it is the account the service identity owns \(em
 but it means the login can change as the chain advances.
 .PP
-The chain it builds is the same
-.I list
-a run builds, but the
-.I tickets
-are not the same. The probe never calls the run's Kerberos preparation step, so
-it mints nothing: the operator credential it reports carries the principal named
-by
-.I kerberos.principal
-while pointing at the
-.B ambient
-credential cache, and the service identities are listed rather than acquired. A
-real run kinits each principal into a cache private to the run and hands
+Credentials come from the same bootstrap a run uses. With
+.BR \-\-run ,
+a designated principal
+.RI ( kerberos.principal ", " kerberos.root_principal ,
+or the options below) is acquired into a cache private to the probe \(em
+prompting for its password if it has no valid ticket \(em and
 .BR ssh (1)
-a
+is given a
 .B KRB5CCNAME
-for it. So a line reading
-.B "ticket you@FNAL.GOV [ambient cache]"
-names the configured principal, not necessarily the one actually in the default
-cache \(em confirm that with
-.BR klist (1),
-or
-.B klist \-l
-on macOS. There is no option to make the probe mint a ticket.
+for that cache; the service identities are minted once, up front; and every
+private cache is destroyed on exit, including on an error, Ctrl-C or
+.BR SIGTERM .
+.PP
+Without
+.B \-\-run
+nothing is acquired or minted, and the listing says so rather than implying
+otherwise. A credential whose ticket does not exist yet is shown as
+.B "would try (not acquired)"
+with the reason in brackets \(em
+.B "designated principal, not yet acquired"
+for a configured principal, and
+.B "would be minted from Vault by a real run"
+for a service identity.
+.B "[ambient cache]"
+appears only for a credential that really is the ambient cache, which is the
+operator's own when no principal is designated.
 .PP
 Without
 .BR \-\-run ,
@@ -99,6 +107,11 @@ the
 column names the one that actually got in. When every credential is refused,
 each login and ticket pair is listed with its own reason rather than collapsed
 into one error for the whole chain.
+.PP
+When a service ticket cannot be minted safely \(em the default cache could not
+be read before the mint, or a mint displaced it and it could not be restored
+\(em the service identities are abandoned for the rest of the probe with a
+note saying which, and the probe continues on the operator credential alone.
 .PP
 Before any connection is attempted the probe checks the default credential
 cache and warns when it holds a service identity instead of a personal
@@ -143,7 +156,15 @@ Use only the ambient ticket and the login
 would choose, instead of the credential chain a real run would try. Use it to
 answer the narrower question "does my own ticket reach this host", and to
 confirm that a difference between the probe and a run is the chain rather than
-the network.
+the network. A designated principal is ignored, with a note.
+.TP
+.BI \-\-principal " PRINCIPAL"
+Kerberos principal for ordinary logins; overrides
+.IR kerberos.principal .
+.TP
+.BI \-\-root\-principal " PRINCIPAL"
+Root-capable principal; overrides
+.IR kerberos.root_principal .
 .TP
 .BI \-\-config " FILE"
 Main configuration file. Default:
@@ -204,7 +225,12 @@ Every probe succeeded, or nothing was run.
 At least one node failed.
 .TP
 .B 2
-No node was named.
+No node was named, or a designated principal could not be acquired.
+.TP
+.B 3
+Interrupted (Ctrl-C or
+.BR SIGTERM );
+the private caches were destroyed.
 .SH SEE ALSO
 .BR mu2e-power-recovery (1),
 .BR mu2e-power-state (1),

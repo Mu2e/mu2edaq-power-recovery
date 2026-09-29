@@ -377,3 +377,75 @@ def test_report_does_not_post_unless_asked(orch):
     result = phase4_report.run(orch, post=False)
     assert any("not enabled" in note for note in result.notes)
     assert "ecl" not in result.data
+
+
+# ---------------------------------------------------------------------------
+# an interrupt mid-phase does not wait for the queued nodes (S1)
+# ---------------------------------------------------------------------------
+
+import signal as _signal  # noqa: E402
+import threading as _threading  # noqa: E402
+import time  # noqa: E402
+
+from mu2edaq_power_recovery.orchestrator import NodeAssessment  # noqa: E402
+
+
+def _sigterm_main_when(event):
+    """Deliver a real SIGTERM to the main thread once *event* is set."""
+    def fire():
+        if event.wait(10):
+            _signal.pthread_kill(_threading.main_thread().ident, _signal.SIGTERM)
+    t = _threading.Thread(target=fire, daemon=True)
+    t.start()
+    return t
+
+
+@pytest.fixture
+def sigterm_handler():
+    from mu2edaq_power_recovery.cli import install_sigterm_handler
+    previous = _signal.getsignal(_signal.SIGTERM)
+    install_sigterm_handler()
+    yield
+    _signal.signal(_signal.SIGTERM, previous)
+
+
+@pytest.mark.skipif(not hasattr(_signal, "pthread_kill"), reason="POSIX only")
+def test_sigterm_mid_phase_cancels_the_queued_nodes(orch, monkeypatch,
+                                                    sigterm_handler):
+    nodes = orch.nodes()[:6]
+    started, running, release = [], _threading.Event(), _threading.Event()
+
+    def assess_node(node, *args, **kwargs):
+        started.append(node.hostname)
+        running.set()
+        release.wait(10)             # a slow node, still running at SIGTERM
+        return NodeAssessment(node=node)
+
+    monkeypatch.setattr(orch, "assess_node", assess_node)
+    _sigterm_main_when(running)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            orch.assess_nodes(nodes, concurrency=1)
+    finally:
+        release.set()
+    assert started == [nodes[0].hostname], "a queued node was started"
+
+
+def test_an_interrupt_from_a_worker_is_not_swallowed_or_waited_out(orch,
+                                                                   monkeypatch):
+    nodes = orch.nodes()[:8]
+    started = []
+
+    def assess_node(node, *args, **kwargs):
+        started.append(node.hostname)
+        if node is nodes[0]:
+            raise KeyboardInterrupt
+        time.sleep(0.2)          # busy enough for the main thread to cancel
+        return NodeAssessment(node=node)
+
+    monkeypatch.setattr(orch, "assess_node", assess_node)
+    with pytest.raises(KeyboardInterrupt):
+        orch.assess_nodes(nodes, concurrency=1)
+    # The one worker may already have taken the next node off the queue
+    # before the main thread saw the interrupt; nothing after that runs.
+    assert len(started) <= 2

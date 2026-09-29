@@ -9,20 +9,29 @@ differences that matter during a recovery:
   mu2e-dcs-01) before the command is built;
 * state-changing verbs require --execute, so a mistyped host name in a hurry
   reads a power state instead of changing one.
+
+The gateway session uses the recovery run's own credential bootstrap
+(creds/bootstrap.py): the operator's principal first, then the service
+fallbacks, with the run's private caches destroyed on every exit path. A
+diagnostic that logged in differently from the run could pass or fail where
+the run would not.
 """
 from __future__ import annotations
 
 import argparse
 import json
 import sys
+from contextlib import ExitStack
 from typing import Any, List, Optional, Sequence, Tuple
 
 from .. import console
-from ..creds import VaultCredentials, VaultError
-from ..transport import IPMIClient, LocalTransport, SSHFactory
+from ..cli import install_sigterm_handler
+from ..creds import KerberosError, VaultCredentials, VaultError
+from ..creds.bootstrap import credential_session
+from ..transport import IPMIClient, LocalTransport
 from ..transport.base import TransportError
 from ..transport.ipmi import DESTRUCTIVE_VERBS, STATE_CHANGING_VERBS
-from ._common import add_common_arguments, bootstrap
+from ._common import add_common_arguments, add_credential_arguments, bootstrap
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -75,10 +84,28 @@ notes
                              "(power on/off/cycle/reset)")
     parser.add_argument("--yes", action="store_true",
                         help="do not ask for confirmation before a destructive verb")
+    add_credential_arguments(parser)
     return add_common_arguments(parser)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    # SIGTERM takes the same path as Ctrl-C, so the private caches are
+    # destroyed by credential_session's finally rather than left behind.
+    install_sigterm_handler()
+    try:
+        with ExitStack() as credentials:
+            return run(argv, credentials)
+    except KerberosError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        print("\n  interrupted; the private Kerberos caches have been "
+              "destroyed.", file=sys.stderr)
+        return 3
+
+
+def run(argv: Optional[Sequence[str]], credentials: ExitStack) -> int:
+    """The tool proper; *credentials* holds the credential session open."""
     args = build_parser().parse_args(argv)
     settings, topology = bootstrap(args)
 
@@ -134,7 +161,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
-    factory = SSHFactory(settings, topology, local=local)
+    # The run's own bootstrap. --show-command acquires and mints nothing:
+    # printing an invocation is no reason to prompt for a password. warm is
+    # off because this is one session, not a worker pool -- a lazy mint under
+    # the manager's lock is the same transaction.
+    session = credentials.enter_context(credential_session(
+        settings, topology, local, prepare=not args.show_command, warm=False))
+    if session.warning and not args.quiet:
+        print(f"  note: {session.warning}\n")
+    factory = session.factory
     gateway_host = args.gateway or factory.gateway_for(location)
     if not gateway_host:
         print(f"error: no gateway for {location} answered ssh; ipmitool cannot "

@@ -10,6 +10,8 @@ mu2e-ipmi-tool \- run an ipmitool command against Mu2e DAQ BMCs, from a gateway
 .RB [ \-\-execute ]
 .RB [ \-\-diagnose ]
 .RB [ \-\-show\-command ]
+.RB [ \-\-principal
+.IR PRINCIPAL ]
 .I ARG...
 .SH DESCRIPTION
 Issues one
@@ -37,28 +39,46 @@ is run
 .I on the gateway,
 not locally: the IPMI subnets (192.168.157.0/24 at MC-2, 192.168.150.0/24 at
 the teststand) are not routable from off site.
-.SH WHAT THIS TOOL DOES NOT TEST
-It reaches the gateway with the
-.I ambient
-Kerberos ticket only. Unlike a real run and unlike
-.BR mu2e-ssh-probe (1),
-it builds no credential chain \(em no service-identity fallbacks \(em and it
-does not check whether the default credential cache holds a personal principal.
-Two consequences, both of which have been mistaken for something else:
+.SH CREDENTIALS
+The gateway session is opened through the same credential bootstrap a
+recovery run uses, so a result here is evidence about what the run would see:
 .IP \(bu 2
-It can fail against a gateway a real run would open, because the run would
-have fallen back to a service identity and this will not.
+The default credential cache is checked first, and a warning is printed when it
+holds a service identity or a principal other than
+.IR kerberos.principal .
 .IP \(bu 2
-It can succeed while a real run fails, or the other way round, when the default
-cache has been displaced by a service ticket \(em on macOS the usual residue of
-an earlier run.
+A designated principal
+.RI ( kerberos.principal ", " kerberos.root_principal ,
+or
+.BR \-\-principal / \-\-root\-principal )
+is acquired into a cache private to the invocation \(em prompting for its
+password if it has no valid ticket \(em and that cache is what
+.BR ssh (1)
+is given.
+.IP \(bu 2
+The operator's own principal leads the chain; the Mu2e service identities from
+Vault follow as fallbacks, tried only on an authentication refusal, exactly as
+in a run. A default-cache guard failure while minting one (the default could
+not be read beforehand, or was displaced and could not be restored) abandons
+the fallbacks and continues on the operator credential alone.
+.IP \(bu 2
+Every private cache is destroyed on the way out \(em on success, on an error,
+and on Ctrl-C or
+.B SIGTERM
+(which takes the same path).
 .PP
-Treat a working
+.B \-\-show\-command
+acquires and mints nothing: printing an invocation is no reason to prompt for a
+password. If it has to pick a gateway (no
+.BR \-\-gateway ),
+that probe runs with the credentials that already exist.
+.PP
+A working
 .B mu2e-ipmi-tool
-as evidence about the
+is still primarily evidence about the
 .I BMC
-credentials, never as evidence that the recovery can log in. For that, use
-.B mu2e-ssh-probe \-\-run true.
+credentials. Whether the recovery can log in to the nodes is
+.BR "mu2e-ssh-probe \-\-run true" .
 .SH OPTIONS
 .TP
 .BI \-n " HOST" "\fR, \fP" \-\-node " HOST"
@@ -138,6 +158,15 @@ that full list of targets, never to a count.
 .TP
 .B \-\-json
 Emit the per-node results as JSON.
+.TP
+.BI \-\-principal " PRINCIPAL"
+Kerberos principal for the gateway login; overrides
+.IR kerberos.principal .
+A password is prompted for when it has no valid ticket.
+.TP
+.BI \-\-root\-principal " PRINCIPAL"
+Root-capable principal; overrides
+.IR kerberos.root_principal .
 .TP
 .BI \-\-config " FILE"
 Main configuration file. Default:
@@ -321,10 +350,14 @@ The command succeeded on every target.
 It failed, or was refused, on at least one target.
 .TP
 .B 2
-No selected node has a BMC, no credentials, or no gateway to run from.
+No selected node has a BMC, no credentials (BMC, or a designated Kerberos
+principal), or no gateway to run from.
 .TP
 .B 3
-The operator declined the confirmation prompt.
+The operator declined the confirmation prompt, or the tool was interrupted
+(Ctrl-C or
+.BR SIGTERM ;
+the private caches were destroyed).
 .SH SEE ALSO
 .BR mu2e-power-on (1),
 .BR mu2e-vault-ipmi (1),

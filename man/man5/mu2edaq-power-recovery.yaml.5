@@ -359,6 +359,15 @@ refused by a host. Default
 .BR true .
 The operator's own principal is always tried first regardless; these are only
 ever fallbacks, and the run returns to the personal ticket after each node.
+When on, each identity is minted once before the worker threads start. The run
+turns it off for itself, with an error event and a phase note, when the default
+credential cache cannot be read before a mint or cannot be restored after one
+\(em except that with both
+.I principal
+and
+.I root_principal
+designated, "there is no default cache" is not a reason to refuse: the run uses
+no default, and a service default left by the mint is destroyed.
 .TP
 .I root_fallback
 Apply the same fallback to root sessions. Default
