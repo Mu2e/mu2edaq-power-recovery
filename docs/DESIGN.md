@@ -561,6 +561,56 @@ the evidence tables beside it. Follow-ups are derived too: a check that failed
 on three or more nodes is called out as one likely shared cause rather than as
 three separate problems.
 
+**Report data flow.** `cli.main` runs phases 1-3 (`run_phases`), persists each
+returned `PhaseResult`'s verdict, title, notes and duration into its phase row
+(`data._result`), and then *finishes the run* — status and `finished_at` —
+before anything is assembled, rendered or posted (#4). On the error and
+interrupt paths the terminal status is written first too, and the bundle is
+still rendered, never posted or published. Then:
+
+1. `phase4_report.assemble(store, run_id)` records the `report` phase row and
+   an event against `run_id` explicitly (`RunStore.start_phase/record_event/
+   finish_phase` take an explicit run or phase id) and builds the narrative
+   from the final `export_run(run_id)`.
+2. `ReportWriter.render_run(export, narrative, version)` renders
+   `runs/<rid>/` (pages + `data/`) from that export only, emptying the
+   directory first; a phase absent from the run has no page, no data file and
+   no nav link (`present`). When `rid` is the newest run the same set is
+   rendered at the top level — the latest view — and the top-level pages and
+   data of phases it lacks are removed. It returns a `Bundle` whose `paths`
+   are the bundle's HTML pages.
+3. `phase4_report.post(orch, rid, narrative, bundle.paths)` posts to the ECL.
+   Vault is created lazily here (`make_vault`), never by
+   `prepare_credentials` for this purpose; under `--simulate` nothing is
+   posted. The outcome is an event on `rid` and goes into the bundle's
+   `data/report.json`; a failure leaves the local report complete (#18).
+4. `Publisher.publish()` runs once, with the bundle final; `report.keep_runs`
+   prunes old bundles.
+
+Report-only invocations (`--phase report`, optional `--run-id N`) validate
+the run before anything else touches credentials, `RunStore.attach(N)` it
+without inserting a row, never call `prepare_credentials`, and never change
+its status (#3). The latest view is rendered again rather than copied because
+its one cross-run link (run history) has a different relative path from
+`runs/<id>/`; the JSON is identical.
+
+**Reconciliation (#5).** `phase4_report.reconcile` takes the newest result
+per `(hostname, check_id)` across phases 1-3. A superseded failure whose
+current result is good goes to `resolved` (the original rows stay in the
+evidence and the timeline); only current bad results are `outstanding`.
+Phase-2 profiles re-check subsets, so a phase-1 failure of a check phase 2 did
+not run stays outstanding. A node's status is the roll-up of its current
+checks, or UNKNOWN if its latest assessment could not reach it. The headline,
+counts, verdict, next steps, ECL body and the driver's exit status all derive
+from this one table plus the latest phase-3 verdict — so a node that failed
+phase 1 and passed phase 2 exits 0.
+
+**`--json` (#24).** stdout is reserved for one document: all human-readable
+output is written to stderr (`out`), `sys.stdout` is redirected to stderr for
+the duration so stray prints cannot leak, and the self-update rebuild's
+output is sent to stderr. The document is written last, on the error and
+interrupt paths too (with `error`).
+
 ## 5. State
 
 SQLAlchemy Core over SQLite, with a URL switch to Postgres. Tables: `runs`,
@@ -585,6 +635,13 @@ attached to a logbook entry, and any of those rules out a running application.
 Every page has a JSON companion, so the report is consumable by the next tool
 and not only by a human. The heavy full run export is a separate file from the
 readable narrative, so `data/report.json` stays small enough to read.
+
+Every file under `runs/<id>/` is derived from run `<id>`'s stored rows: the
+pages are rendered from the store, not copied from the shared top level
+(the old `archive_run` copied every existing page and all of `data/`, so a
+network-only run's archive inherited an earlier run's assessment). The top
+level is a latest view, the newest run's bundle; it is not a merge of the most
+recent page of each phase across runs.
 
 Per-class and per-area tables are compact roll-ups rather than repeats of the
 all-nodes table — rendering the full per-check detail twice doubled the page

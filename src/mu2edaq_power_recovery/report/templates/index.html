@@ -10,8 +10,9 @@
   <h2 class="mb-3 text-lg font-semibold">Current node state</h2>
   {{ m.counts_bar(counts) }}
   <p class="mt-2 text-sm text-slate-500 dark:text-slate-400">
-    Totals are from the most recent phase that assessed nodes, not a sum across
-    phases &mdash; a node appearing in both the survey and the power-on is one node.
+    The run's current state: the newest result of every check on every node.
+    A failure that a later phase re-checked and passed is resolved, not
+    counted here; a node appearing in both the survey and the power-on is one node.
   </p>
 </section>
 
@@ -32,7 +33,7 @@
         <td class="px-3 py-2">{{ p.summary }}</td>
         <td class="whitespace-nowrap px-3 py-2 text-xs text-slate-500">{{ p.duration|duration }}</td>
         <td class="px-3 py-2">
-          {% if p.name in pages %}
+          {% if p.name in pages and p.name in present %}
           <a class="text-sky-700 underline dark:text-sky-400" href="{{ pages[p.name][0] }}">{{ pages[p.name][1] }}</a>
           {% endif %}
         </td>

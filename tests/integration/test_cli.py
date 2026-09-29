@@ -131,11 +131,12 @@ def test_single_phase_entry_points_pin_their_phase():
 
 
 def test_json_output_is_machine_readable(tmp_path, capsys):
+    # The whole of stdout is the document -- no scanning for the first '['.
     run_cli(tmp_path, "--phase", "assess", "--node", "mu2e-trk-01", "--json")
-    out = capsys.readouterr().out
-    payload = json.loads(out[out.index("["):])
-    assert payload[0]["name"] == "assess"
-    assert payload[0]["counts"]["total"] == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["phases"][0]["name"] == "assess"
+    assert payload["phases"][0]["counts"]["total"] == 1
+    assert payload["run_id"] == 1 and payload["exit_code"] == 0
 
 
 # ---------------------------------------------------------------------------

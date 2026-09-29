@@ -345,7 +345,7 @@ def test_mesh_edges_come_back_in_a_stable_order(orch):
 
 def test_report_summarises_the_stored_run(orch):
     phase1_assess.run(orch, _nodes(orch, "mu2egateway01", "mu2e-trk-01"))
-    result = phase4_report.run(orch, post=False)
+    result = phase4_report.run(orch)
     narrative = result.data["narrative"]
     assert narrative["counts"]["total"] == 2
     assert "verified healthy" in narrative["headline"]
@@ -357,7 +357,7 @@ def test_report_lists_outstanding_problems_and_next_steps(orch):
                                        ScriptedResponse(rc=1))
     phase1_assess.run(orch, _nodes(orch, "mu2e-trk-01", "mu2e-trk-02",
                                    "mu2e-trk-03"))
-    narrative = phase4_report.run(orch, post=False).data["narrative"]
+    narrative = phase4_report.run(orch).data["narrative"]
     assert narrative["counts"]["fail"] == 3
     outstanding = {item["check"] for item in narrative["outstanding"]}
     assert "disk.mounts" in outstanding
@@ -368,15 +368,19 @@ def test_report_lists_outstanding_problems_and_next_steps(orch):
 def test_report_probes_nothing(orch):
     phase1_assess.run(orch, _nodes(orch, "mu2e-trk-01"))
     before = len(orch.ssh_factory.base.calls)
-    phase4_report.run(orch, post=False)
+    phase4_report.run(orch)
     assert len(orch.ssh_factory.base.calls) == before
 
 
 def test_report_does_not_post_unless_asked(orch):
+    # Assembly never posts; the driver posts afterwards, and only when asked.
+    from mu2edaq_power_recovery import cli
     phase1_assess.run(orch, _nodes(orch, "mu2e-trk-01"))
-    result = phase4_report.run(orch, post=False)
-    assert any("not enabled" in note for note in result.notes)
+    result = phase4_report.run(orch)
     assert "ecl" not in result.data
+    skipped = cli._post_or_skip(orch, orch.store.run_id,
+                                result.data["narrative"], [], post=False)
+    assert skipped["posted"] is False and "not enabled" in skipped["reason"]
 
 
 # ---------------------------------------------------------------------------

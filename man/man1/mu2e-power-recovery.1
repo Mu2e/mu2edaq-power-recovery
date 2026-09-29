@@ -48,8 +48,10 @@ with a missing VLAN or the wrong MTU, which leaves every node individually
 healthy while the DAQ cannot move data.
 .TP
 .B 4. report
-The consolidated narrative, assembled from the stored run and optionally posted
-to the electronic logbook. It probes nothing and can be re-run at any time.
+The consolidated narrative, assembled from the stored run after the run has
+been finished, and optionally posted to the electronic logbook. It probes
+nothing and can be re-run at any time (see
+.BR "REPORT LIFECYCLE" ).
 .PP
 Before any phase, a run that will contact the cluster checks its GitHub remote
 for a newer revision, fast-forwards if it is behind, rebuilds if the pull
@@ -293,9 +295,16 @@ Post the phase-4 report to the electronic logbook. Requires the
 package and ECL credentials in Vault.
 .TP
 .BI \-\-run\-id " N"
-Operate on an existing run rather than starting a new one. Used with
-.B \-\-phase report
-to regenerate or repost an earlier run's report.
+Regenerate (and with
+.BR \-\-post\-ecl ,
+repost) the report of stored run
+.IR N .
+Valid only with
+.BR "\-\-phase report" ;
+with any other phase it is an error (exit 2), because it would mean reporting
+on one run while recording another. A run id that is not in the store is a
+usage error (exit 2): no run row is created and no credential is touched.
+Without it, the report phase reports on the newest run.
 .SS General
 .TP
 .BR \-h ", " \-\-help
@@ -338,13 +347,119 @@ Print every registered check and exit.
 Print the node inventory and exit.
 .TP
 .B \-\-json
-Print the result as JSON on stdout instead of tables.
+Reserve stdout for exactly one JSON document; every human-readable line
+(banner, mode notice, phase tables, notes, report and self-update messages, and
+a self-update rebuild's output) goes to stderr. See
+.BR "JSON OUTPUT" .
 .TP
 .BR \-v ", " \-\-verbose
 Debug logging.
 .TP
 .BR \-q ", " \-\-quiet
 Warnings and errors only.
+.SH REPORT LIFECYCLE
+The run store is the record; the pages are rendered from it. The order within
+an invocation is fixed:
+.IP 1. 4
+phases 1 to 3 run and store their results;
+.IP 2. 4
+the run's final status (\fBcomplete\fR, \fBcomplete_with_failures\fR, or on
+the failure paths \fBerror\fR or \fBinterrupted\fR) and
+.I finished_at
+are written;
+.IP 3. 4
+phase 4 records its
+.B report
+phase and an event against the run and assembles the narrative from the final
+export;
+.IP 4. 4
+the run's bundle is rendered, the logbook entry is posted with that bundle's
+pages attached, the logbook outcome is written into the bundle's
+.I data/report.json
+and recorded as an event, and only then is the site published, once.
+.PP
+So no page, JSON file or logbook entry of a finished run says it is in
+progress. After an error or an interrupt the bundle is still rendered (never
+posted or published) and carries the terminal status.
+.PP
+.B Current state is reconciled.
+For each node and check the newest result wins. A failure that a later phase
+re-checked and passed is listed as
+.I resolved
+(still visible in its phase's page, the evidence and the timeline); only
+failures that are still current are
+.IR outstanding .
+Phase 2's profiles re-check subsets, so a phase-1 failure of a check phase 2
+did not run again stays outstanding. A node's status is the roll-up of its
+current checks, or UNREACHABLE when its latest assessment could not reach it.
+The headline, counts, next steps, the logbook text and the exit status are all
+derived from this one reconciled table, together with the latest phase-3
+verdict.
+.PP
+.B Regeneration
+.RB ( "\-\-phase report" ,
+optionally
+.BR "\-\-run\-id N" )
+attaches to the selected run instead of opening a new one, never calls the
+credential bootstrap, and never changes the run's status or
+.IR finished_at .
+It adds a
+.B report
+phase row and events to that run. Vault is contacted only when the logbook post
+needs the ECL credentials; under
+.B \-\-simulate
+nothing is posted.
+.PP
+.B The report site.
+Each run is rendered into
+.I html/runs/<id>/
+(pages and
+.IR data/ )
+from that run's stored rows alone, with a page only for the phases the run
+contains; the navigation links only those. The directory is emptied first, so
+nothing from another run can survive in it. The top level of
+.I html/
+is the latest view: the newest run's bundle rendered again, with the pages and
+data files of phases the newest run lacks removed, plus
+.I runs.html
+(the run history). Regenerating an older run rewrites its bundle and leaves the
+top level as it is.
+.I report.keep_runs
+bounds the number of bundles kept.
+.SH JSON OUTPUT
+With
+.BR \-\-json ,
+stdout carries exactly one JSON document and nothing else, so
+.B "| jq ."
+works directly; there are no ANSI escapes in it even with
+.BR FORCE_COLOR .
+For
+.B \-\-list\-checks
+and
+.B \-\-list\-nodes
+the document is the listing. Otherwise it is an object:
+.PP
+.RS
+.EX
+{"version":   {package_version, git_describe, ...},
+ "run_id":    N or null,
+ "status":    the run's stored status,
+ "exit_code": the process exit status,
+ "phases":    [one PhaseResult per phase that ran],
+ "report":    {output_dir, run_dir, pages, data, latest,
+               publication, ecl} or null,
+ "error":     present only on an error or interrupt}
+.EE
+.RE
+.PP
+It is written on the error and interrupt paths too, with
+.I error
+set. Phase 4's full run export is not repeated in
+.IR phases ;
+it is in
+.IR runs/<id>/data/run-export.json .
+The four single-phase commands follow the same contract. An argument the parser
+rejects is reported on stderr before any document exists.
 .SH PHASE 0
 A run that will contact the cluster begins by checking
 .I origin
@@ -602,7 +717,10 @@ Local overrides. Not in version control.
 The run store.
 .TP
 .I html/
-The generated report site.
+The report site: the newest run's view at the top level,
+.I runs.html
+and one bundle per run under
+.IR html/runs/<id>/ .
 .TP
 .I logs/power-recovery.log
 Rotating log of every run.
@@ -658,8 +776,17 @@ A phase completed but one or more nodes failed their checks.
 .TP
 .B 2
 The run could not start: configuration, credentials, no reachable gateway, a
-live run the invocation did not authorise, or a phase-2 stage or node
-selection that cannot be honoured.
+live run the invocation did not authorise, a phase-2 stage or node selection
+that cannot be honoured, or a
+.B \-\-run\-id
+that is misplaced or not in the store; or it stopped on an internal error
+(recorded as status
+.BR error ).
+.PP
+Statuses 0 and 1 are decided by the reconciled current state (see
+.BR "REPORT LIFECYCLE" ),
+so a failure that a later phase re-checked and passed does not make the
+run exit 1.
 .TP
 .B 3
 Interrupted by the operator.
@@ -701,11 +828,19 @@ mu2e-power\-on \-\-execute \-\-from dcs
 .EE
 .RE
 .PP
-Regenerate and post the report for an earlier run:
+Regenerate and post the report for an earlier run (no new run is created):
 .PP
 .RS
 .EX
 mu2e-power\-report \-\-run\-id 17 \-\-post\-ecl
+.EE
+.RE
+.PP
+Machine-readable result:
+.PP
+.RS
+.EX
+mu2e-power-recovery \-\-phase all \-\-simulate \-\-json | jq .status
 .EE
 .RE
 .SH SEE ALSO

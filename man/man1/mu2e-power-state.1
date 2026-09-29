@@ -174,7 +174,12 @@ Print every registered check and exit.
 Print the node inventory and exit.
 .TP
 .B \-\-json
-Print the survey as JSON on stdout instead of tables.
+Reserve stdout for exactly one JSON document; every human-readable line
+(banner, mode notice, phase tables, notes, report and self-update messages, and
+a self-update rebuild's output) goes to stderr. See
+.B JSON OUTPUT
+in
+.BR mu2e-power-recovery (1).
 .TP
 .BR \-v ", " \-\-verbose
 Debug logging, including one line per credential attempted against each host.

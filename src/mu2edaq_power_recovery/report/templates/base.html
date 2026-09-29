@@ -28,8 +28,8 @@
       </p>
     </div>
     <nav class="mt-3 flex flex-wrap gap-1 text-sm">
-      {% for pid, (filename, label) in pages.items() %}
-      <a href="{{ prefix }}{{ filename }}"
+      {% for pid, (filename, label) in pages.items() if pid in present %}
+      <a href="{{ root if pid == 'runs' else '' }}{{ filename }}"
          class="rounded px-2.5 py-1 {% if pid == page_id %}bg-slate-900 text-white dark:bg-slate-100 dark:text-slate-900{% else %}text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800{% endif %}">
         {{ label }}
       </a>
@@ -44,9 +44,10 @@
 
 <footer class="mx-auto max-w-7xl px-4 py-8 text-xs text-slate-500 dark:text-slate-400">
   <p>
-    Produced by <code>mu2edaq-power-recovery</code>. Re-running a phase refreshes
-    its page in place; previous runs are kept under
-    <a class="underline" href="{{ prefix }}runs.html">run history</a>.
+    Produced by <code>mu2edaq-power-recovery</code> from the run store. Every
+    run's pages are rendered from that run's data alone and kept under
+    <a class="underline" href="{{ root }}runs.html">run history</a>; the top
+    level shows the newest run.
   </p>
 </footer>
 

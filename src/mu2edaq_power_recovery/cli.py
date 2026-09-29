@@ -13,10 +13,12 @@ point of use.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import logging
 import os
 import signal
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,7 +28,7 @@ from . import __version__, console
 from .checks import DESCRIPTIONS, Status
 from .logsetup import configure as configure_logging
 from .orchestrator import Orchestrator
-from .phases import PHASES, phase1_assess, phase2_poweron, phase3_network, phase4_report
+from .phases import phase1_assess, phase2_poweron, phase3_network, phase4_report
 from .report import Publisher, ReportWriter
 from .selfupdate import SelfUpdater
 from .phases.phase2_poweron import SequenceSelectionError, plan_sequence
@@ -53,8 +55,11 @@ examples
   # resume a power-on that stopped at the dcs stage, after fixing it
   mu2e-power-on --execute --from dcs
 
-  # regenerate and post the report for an earlier run
+  # regenerate and post the report for an earlier run (no new run is made)
   mu2e-power-report --run-id 17 --post-ecl
+
+  # machine-readable: stdout is one JSON object
+  mu2e-power-recovery --phase all --simulate --json | jq .status
 
 live power commands
   A run is a dry run unless this invocation authorises it, in one of two ways:
@@ -77,7 +82,8 @@ exit status
   0  every phase completed and nothing failed
   1  a phase completed but one or more nodes failed their checks
   2  the run could not start (configuration, credentials, no gateway,
-     live-run authorisation, stage or node selection)
+     live-run authorisation, stage or node selection, a --run-id that is
+     not in the store), or it stopped on an internal error
   3  interrupted by the operator
 """
 
@@ -165,8 +171,10 @@ def build_parser(prog: Optional[str] = None, description: Optional[str] = None,
     report.add_argument("--post-ecl", action="store_true",
                         help="post the phase-4 report to the electronic logbook")
     report.add_argument("--run-id", type=int, metavar="N",
-                        help="operate on an existing run (phase 4 / report "
-                             "regeneration)")
+                        help="regenerate the report of stored run N (default: "
+                             "the latest). Only with --phase report; attaches "
+                             "to run N, creates no run, needs no credentials "
+                             "unless posting")
 
     general = parser.add_argument_group("general")
     general.add_argument("--config", metavar="FILE",
@@ -184,7 +192,9 @@ def build_parser(prog: Optional[str] = None, description: Optional[str] = None,
     general.add_argument("--list-nodes", action="store_true",
                          help="print the node inventory and exit")
     general.add_argument("--json", action="store_true",
-                         help="print the result as JSON on stdout instead of tables")
+                         help="stdout carries exactly one JSON document (the "
+                              "run result, or the --list-* listing); every "
+                              "human-readable line goes to stderr")
     general.add_argument("-v", "--verbose", action="store_true", help="debug logging")
     general.add_argument("-q", "--quiet", action="store_true",
                          help="warnings and errors only")
@@ -337,37 +347,40 @@ def authorize_live(settings: Any, args: argparse.Namespace,
 # ---------------------------------------------------------------------------
 
 
-def print_checks(as_json: bool = False) -> int:
+def print_checks(as_json: bool = False, out: Any = None) -> int:
+    out = out or sys.stdout
     if as_json:
-        print(json.dumps(DESCRIPTIONS, indent=2))
+        print(json.dumps(DESCRIPTIONS, indent=2), file=out)
         return 0
-    print(console.heading("Registered checks"))
+    print(console.heading("Registered checks", console.use_color(out)), file=out)
     rows = [[cid, DESCRIPTIONS[cid]] for cid in sorted(DESCRIPTIONS)]
-    print(console.table(rows, ["CHECK ID", "VERIFIES"]))
+    print(console.table(rows, ["CHECK ID", "VERIFIES"]), file=out)
     print(f"\n  {len(rows)} check(s). Profiles that use them are in "
-          f"config/checks.yaml.")
+          f"config/checks.yaml.", file=out)
     return 0
 
 
 def print_nodes(orch: Orchestrator, names: Optional[Sequence[str]] = None,
-                as_json: bool = False) -> int:
+                as_json: bool = False, out: Any = None) -> int:
+    out = out or sys.stdout
     nodes = orch.nodes(names)
     if as_json:
-        print(json.dumps([n.as_dict() for n in nodes], indent=2))
+        print(json.dumps([n.as_dict() for n in nodes], indent=2), file=out)
         return 0
-    print(console.heading("Node inventory"))
+    print(console.heading("Node inventory", console.use_color(out)), file=out)
     rows = [[n.short, n.node_class, n.location,
              ",".join(sorted(n.networks)), n.ipmi_host or "-",
              "protected" if n.protected else ""]
             for n in nodes]
-    print(console.table(rows, ["NODE", "CLASS", "LOCATION", "NETWORKS", "BMC", ""]))
+    print(console.table(rows, ["NODE", "CLASS", "LOCATION", "NETWORKS", "BMC", ""]),
+          file=out)
     print(f"\n  {len(nodes)} node(s) across "
-          f"{', '.join(sorted({n.location for n in nodes}))}")
+          f"{', '.join(sorted({n.location for n in nodes}))}", file=out)
     empty = [loc for loc in orch.locations
              if not orch.topology.nodes(loc)]
     if empty:
         print(f"\n  note: no nodes are configured for {', '.join(empty)} "
-              f"-- see config/topology.yaml")
+              f"-- see config/topology.yaml", file=out)
     return 0
 
 
@@ -376,12 +389,25 @@ def print_nodes(orch: Orchestrator, names: Optional[Sequence[str]] = None,
 # ---------------------------------------------------------------------------
 
 
-def do_self_update(settings: Any) -> None:
-    """Run the update check and, if it changed anything, restart this process."""
-    updater = SelfUpdater(settings)
+def _stderr_target() -> Any:
+    """stderr as something subprocess can write to (a descriptor)."""
+    try:
+        return sys.stderr.fileno()
+    except (AttributeError, OSError, ValueError):
+        return subprocess.DEVNULL
+
+
+def do_self_update(settings: Any, out: Any = None, as_json: bool = False) -> None:
+    """Run the update check and, if it changed anything, restart this process.
+
+    Under --json the messages go to *out* (stderr) and so does the rebuild's
+    own output, so stdout stays a single JSON document.
+    """
+    out = out or sys.stdout
+    updater = SelfUpdater(settings, stdout=_stderr_target() if as_json else None)
     result = updater.run()
     for message in result.messages:
-        print(f"  update: {message}")
+        print(f"  update: {message}", file=out)
     if result.needs_reexec:
         updater.reexec()   # never returns
 
@@ -391,71 +417,93 @@ def do_self_update(settings: Any) -> None:
 # ---------------------------------------------------------------------------
 
 
-def write_report(orch: Orchestrator, results: Sequence[Any],
-                 settings: Any) -> Dict[str, Any]:
-    """Render every page the run touched, plus the static ones.
+def write_report(orch: Orchestrator, run_id: int, settings: Any,
+                 report_result: Optional[Any] = None,
+                 post: bool = False) -> Dict[str, Any]:
+    """Render run *run_id*'s bundle, post it if asked, then publish.
 
-    Only the phases that actually ran are re-rendered; the others keep whatever
-    a previous invocation wrote, which is what makes "re-run phase 1 and refresh
-    its page" work without erasing phase 2's page.
+    Called only once the run is finished (or, for regeneration, on the stored
+    run as it is), so nothing here can record a run as still in progress.
+    The order is the one #18 needs: render the complete bundle, post it with
+    that bundle's pages attached, write the logbook outcome into the bundle's
+    report.json, and only then publish -- once, with the bundle final.
     """
+    if report_result is not None and report_result.data.get("export"):
+        export = report_result.data["export"]
+        narrative = report_result.data["narrative"]
+    else:
+        export = orch.store.export_run(run_id)
+        narrative = phase4_report.build_narrative(export)
+    payload = None
+    if report_result is not None:
+        payload = report_result.as_dict()
+        payload.pop("assessments", None)
+        # The export has its own file, data/run-export.json.
+        payload["data"] = {k: v for k, v in payload["data"].items()
+                           if k != "export"}
+
     writer = ReportWriter(settings, orch.topology)
-    run = orch.store.get_run() or {}
-    version = orch.version.as_dict()
-    written: List[str] = []
+    run = export.get("run") or {}
+    bundle = writer.render_run(
+        export, narrative,
+        version=run.get("version") or orch.version.as_dict(),
+        latest=orch.store.latest_run_id() == run_id,
+        checks=DESCRIPTIONS,
+        runs=orch.store.list_runs(int(settings.get("report.keep_runs", 30))),
+        report=payload)
 
-    for result in results:
-        if result.name in ("assess", "poweron", "network", "report"):
-            written.append(str(writer.write_phase(result, run, version)))
-            payload = result.as_dict()
-            if result.name == "report":
-                # The phase-4 result carries the entire run export, which the
-                # per-phase files already hold check by check.  Split it out so
-                # data/report.json stays the readable narrative and the bulk
-                # evidence has a file of its own.
-                export = payload.get("data", {}).pop("export", None)
-                if export is not None:
-                    writer.write_data("run-export", export)
-            writer.write_data(result.name, payload)
+    ecl: Optional[Dict[str, Any]] = None
+    if report_result is not None:
+        ecl = _post_or_skip(orch, run_id, narrative, bundle.paths, post)
+        writer.record_ecl(bundle, ecl)
+        _note_ecl(report_result, ecl)
 
-    stored_phases = orch.store.get_phases()
-    phase_rows = []
-    for stored in stored_phases:
-        live = next((r for r in results if r.name == stored["name"]), None)
-        phase_rows.append({
-            "name": stored["name"],
-            "number": stored["number"],
-            "title": PHASE_TITLES.get(stored["name"], stored["name"]),
-            "status": (live.status.value if live else stored["status"]),
-            "summary": stored.get("summary") or (live.summary if live else ""),
-            "duration": (live.duration if live else 0.0),
-            "counts": (live.counts if live else {}),
-        })
-
-    written.append(str(writer.write_index(run, phase_rows, version, orch.notes)))
-    written.append(str(writer.write_runs(orch.store.list_runs(
-        settings.get("report.keep_runs", 30)))))
-    written.extend(str(p) for p in writer.write_static_pages(
-        version, DESCRIPTIONS, settings.redacted()))
-    writer.write_data("summary", {"run": run, "phases": phase_rows,
-                                  "version": version, "notes": orch.notes})
-    writer.write_data("inventory", [n.as_dict() for n in orch.nodes()])
-
-    if run.get("id"):
-        writer.archive_run(int(run["id"]))
-
-    publication = Publisher(settings, orch.local,
-                            simulate=orch.simulate).publish()
-    return {"pages": written, "output_dir": str(writer.output_dir),
-            "publication": publication, "page_paths": writer.page_paths()}
+    publication = Publisher(settings, orch.local, simulate=orch.simulate).publish()
+    return {"output_dir": str(writer.output_dir),
+            "run_dir": str(bundle.directory),
+            "pages": bundle.paths, "data": bundle.data,
+            "latest": bundle.latest,
+            "publication": publication, "ecl": ecl}
 
 
-PHASE_TITLES = {
-    "assess": "Initial state",
-    "poweron": "Power on",
-    "network": "Network connectivity",
-    "report": "Recovery report",
-}
+def _post_or_skip(orch: Orchestrator, run_id: int, narrative: Dict[str, Any],
+                  attachments: Sequence[str], post: bool) -> Dict[str, Any]:
+    if not post:
+        return {"posted": False,
+                "reason": "logbook posting not enabled (ecl.enabled: false)"}
+    return phase4_report.post(orch, run_id, narrative, attachments)
+
+
+def _note_ecl(result: Any, ecl: Dict[str, Any]) -> None:
+    result.data["ecl"] = ecl
+    if ecl.get("posted"):
+        result.notes.append(f"posted to the logbook: {ecl.get('url') or 'ok'}")
+    elif ecl.get("error"):
+        result.notes.append(f"logbook posting failed: {ecl['error']} (the local "
+                            f"report is complete)")
+    else:
+        result.notes.append(ecl.get("reason") or "not posted to the logbook")
+
+
+def _render_after_failure(orch: Orchestrator, run_id: Optional[int],
+                          settings: Any, args: argparse.Namespace) -> None:
+    """Best effort: render the (already finished) run after an error.
+
+    The run's terminal status is in the store by now, so the pages say
+    'error' or 'interrupted', not 'in progress'. Never publishes or posts.
+    """
+    if run_id is None or args.no_report:
+        return
+    try:
+        export = orch.store.export_run(run_id)
+        ReportWriter(settings, orch.topology).render_run(
+            export, phase4_report.build_narrative(export),
+            version=(export.get("run") or {}).get("version"),
+            latest=orch.store.latest_run_id() == run_id,
+            checks=DESCRIPTIONS,
+            runs=orch.store.list_runs(int(settings.get("report.keep_runs", 30))))
+    except Exception:  # noqa: BLE001 - the failure being reported matters more
+        log.exception("could not render the report after the failure")
 
 
 # ---------------------------------------------------------------------------
@@ -463,21 +511,81 @@ PHASE_TITLES = {
 # ---------------------------------------------------------------------------
 
 
+def print_phase(result: Any, out: Any, name: Optional[str] = None) -> None:
+    """The console view of one phase result, on *out*."""
+    color = console.use_color(out)
+    name = name or result.name
+    print(console.phase_banner(result, color), file=out)
+    if result.assessments:
+        print(console.counts_line(result.counts, color), file=out)
+        print(file=out)
+        print(console.node_table(result.assessments,
+                                 show_power=(name in ("assess", "poweron")),
+                                 enabled=color), file=out)
+        failures = [a for a in result.assessments if a.status.is_bad]
+        if failures:
+            print(console.rule("-", "failures"), file=out)
+            print(console.failure_detail(failures, enabled=color), file=out)
+    if result.notes:
+        print(console.rule("-", "notes"), file=out)
+        # Capped: the full set is on the phase's report page, and a console
+        # that scrolls a hundred notes past the operator has told them
+        # nothing.
+        for note in result.notes[:20]:
+            print(f"  * {note}", file=out)
+        if len(result.notes) > 20:
+            print(f"  ... and {len(result.notes) - 20} more; see the "
+                  f"report page", file=out)
+
+
+def _persist_result(orch: Orchestrator, result: Any,
+                    phase_id_before: Optional[int]) -> None:
+    """Store what a phase returned beside what it stored itself.
+
+    The verdict, title, notes and duration go into the phase row's data as
+    ``_result``, so every report page can be rebuilt from the store alone.
+    A phase that returned before opening a row (nothing to do) has none,
+    and is absent from the run -- and from its report.
+    """
+    phase_id = getattr(orch.store, "phase_id", None)
+    if phase_id is None or phase_id == phase_id_before:
+        return
+    orch.store.annotate_phase(phase_id, {"_result": {
+        "status": result.status.value, "title": result.title,
+        "notes": list(result.notes), "counts": result.counts,
+        "duration": round(result.duration, 2),
+        "started_at": result.started_at, "finished_at": result.finished_at}})
+
+
+def _record_notes(orch: Orchestrator, seen: set) -> None:
+    """Run-level notes (credentials, gateways) into the run as 'note' events."""
+    for note in orch.notes:
+        if note not in seen:
+            seen.add(note)
+            orch.store.record_event(note, level="note")
+
+
 def run_phases(orch: Orchestrator, args: argparse.Namespace,
                phase_names: Sequence[str],
                nodes: Optional[Sequence[Any]] = None,
-               plan: Optional[Any] = None) -> List[Any]:
-    """Execute the requested phases in order, returning their results.
+               plan: Optional[Any] = None,
+               out: Any = None) -> List[Any]:
+    """Execute phases 1-3 in order, returning their results.
 
-    *nodes* and *plan* are resolved by :func:`main` before credentials are
-    acquired; given neither, they are resolved here (--node for phases 1 and
-    3; phase 2 plans the sequence itself).
+    Phase 4 is not run here: it needs the run finished first, which is
+    :func:`main`'s job once these return. *nodes* and *plan* are resolved by
+    :func:`main` before credentials are acquired; given neither, they are
+    resolved here (--node for phases 1 and 3; phase 2 plans the sequence
+    itself).
     """
+    out = out or sys.stdout
     results: List[Any] = []
     if nodes is None and args.node:
         nodes = orch.nodes(args.node)
+    runnable = [n for n in phase_names if n != "report"]
 
-    for name in phase_names:
+    for name in runnable:
+        before = getattr(orch.store, "phase_id", None)
         if name == "assess":
             result = phase1_assess.run(orch, nodes)
         elif name == "poweron":
@@ -486,15 +594,6 @@ def run_phases(orch: Orchestrator, args: argparse.Namespace,
         elif name == "network":
             result = phase3_network.run(orch, nodes,
                                         include_failed=args.include_failed)
-        elif name == "report":
-            # Phase 4 needs the pages on disk to attach them, so the report is
-            # written for the earlier phases first and the paths handed over.
-            html_paths: List[str] = []
-            if not args.no_report and results:
-                html_paths = write_report(orch, results, orch.settings)["page_paths"]
-            result = phase4_report.run(orch, run_id=args.run_id,
-                                       post=args.post_ecl or None,
-                                       html_paths=html_paths)
         else:  # pragma: no cover - argparse restricts this
             continue
 
@@ -502,27 +601,9 @@ def run_phases(orch: Orchestrator, args: argparse.Namespace,
         # failure) belong in this phase's notes and the run's events, whichever
         # phase it happened in -- phase 3 does not copy orch.notes itself.
         orch.surface_credential_failure(result.notes)
+        _persist_result(orch, result, before)
         results.append(result)
-        print(console.phase_banner(result))
-        if result.assessments:
-            print(console.counts_line(result.counts))
-            print()
-            print(console.node_table(result.assessments,
-                                     show_power=(name in ("assess", "poweron"))))
-            failures = [a for a in result.assessments if a.status.is_bad]
-            if failures:
-                print(console.rule("-", "failures"))
-                print(console.failure_detail(failures))
-        if result.notes:
-            print(console.rule("-", "notes"))
-            # Capped: the full set is on the phase's report page, and a console
-            # that scrolls a hundred notes past the operator has told them
-            # nothing.
-            for note in result.notes[:20]:
-                print(f"  * {note}")
-            if len(result.notes) > 20:
-                print(f"  ... and {len(result.notes) - 20} more; see the "
-                      f"report page")
+        print_phase(result, out, name)
 
         # A phase that cannot proceed makes the following phases meaningless:
         # powering on through a gateway that never answered, or probing a mesh
@@ -532,19 +613,61 @@ def run_phases(orch: Orchestrator, args: argparse.Namespace,
             if name == "assess" and result.data.get("ready_for_phase2", {}).get("ready"):
                 continue   # failures exist, but phase 2 still has what it needs
             print(f"\n  Stopping after phase '{name}': later phases depend on it. "
-                  f"Use --continue-on-error to override.")
+                  f"Use --continue-on-error to override.", file=out)
             break
     return results
+
+
+def _json_phase(result: Any) -> Dict[str, Any]:
+    payload = result.as_dict()
+    if "export" in payload.get("data", {}):
+        # Phase 4 carries the whole run export; it is in data/run-export.json.
+        payload["data"] = {k: v for k, v in payload["data"].items()
+                           if k != "export"}
+    return payload
 
 
 def main(argv: Optional[Sequence[str]] = None,
          fixed_phase: Optional[str] = None,
          prog: Optional[str] = None,
          description: Optional[str] = None) -> int:
+    """The driver.
+
+    With ``--json`` stdout carries exactly one JSON document and nothing
+    else: every human-readable line goes to stderr (and anything else that
+    prints is redirected there), and the document is written last. For
+    --list-checks / --list-nodes it is that listing; otherwise the object
+    ``{version, run_id, status, exit_code, phases, report, [error]}``,
+    written on the error and interrupt paths too.
+    """
     parser = build_parser(prog=prog, description=description, fixed_phase=fixed_phase)
     args = parser.parse_args(argv)
     if fixed_phase:
         args.phase = fixed_phase
+    if not args.json:
+        return _main(args, sys.stdout, sys.stdout, {})
+
+    data_out = sys.stdout
+    doc: Dict[str, Any] = {"version": {"package_version": __version__},
+                           "run_id": None, "status": None, "exit_code": None,
+                           "phases": [], "report": None}
+    with contextlib.redirect_stdout(sys.stderr):
+        code = _main(args, sys.stderr, data_out, doc)
+    if doc.pop("_emit", True):
+        doc["exit_code"] = code
+        print(json.dumps(doc, indent=2, default=str), file=data_out)
+    return code
+
+
+def _main(args: argparse.Namespace, out: Any, data_out: Any,
+          doc: Dict[str, Any]) -> int:
+    phase_names = PHASE_ORDER if args.phase == "all" else [args.phase]
+    report_only = phase_names == ["report"]
+
+    def fail(message: str, code: int = 2) -> int:
+        print(f"error: {message}", file=sys.stderr)
+        doc["error"] = message
+        return code
 
     # --- configuration ----------------------------------------------------
     try:
@@ -554,13 +677,20 @@ def main(argv: Optional[Sequence[str]] = None,
             cli=cli_overrides(args),
         )
     except ConfigError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
+        return fail(str(exc))
 
     configure_logging(settings, verbose=args.verbose, quiet=args.quiet)
 
     if args.list_checks:
-        return print_checks(args.json)
+        doc["_emit"] = False
+        return print_checks(args.json, data_out if args.json else out)
+
+    # --run-id names a stored run to report on; with any other phase it would
+    # mean "report on N but run phases 1-3 as a new run", which is two runs.
+    if args.run_id is not None and not report_only and not args.list_nodes:
+        return fail("--run-id selects an existing run to regenerate the report "
+                    "for; it is only valid with --phase report "
+                    "(mu2e-power-report)")
 
     # --- live-run authorisation -------------------------------------------
     # Before the self-update and before anything is contacted: a run whose
@@ -571,121 +701,207 @@ def main(argv: Optional[Sequence[str]] = None,
         try:
             authorization = authorize_live(settings, args, os.environ)
         except LiveAuthorizationError as exc:
-            print(f"error: {exc}", file=sys.stderr)
-            return 2
+            return fail(str(exc))
 
     # --- phase 0 ----------------------------------------------------------
     if not args.simulate:
-        do_self_update(settings)
+        do_self_update(settings, out, args.json)
 
     # --- banner -----------------------------------------------------------
     try:
         orch = Orchestrator(settings, simulate=args.simulate)
     except TopologyError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
+        return fail(str(exc))
+    doc["version"] = orch.version.as_dict()
 
     if not args.quiet:
-        print(orch.version.banner())
+        print(orch.version.banner(), file=out)
     if args.list_nodes:
+        doc["_emit"] = False
         try:
-            return print_nodes(orch, args.node, args.json)
+            return print_nodes(orch, args.node, args.json,
+                               data_out if args.json else out)
         except TopologyError as exc:
-            print(f"error: {exc}", file=sys.stderr)
-            return 2
+            return fail(str(exc))
         finally:
             orch.close()
 
-    if args.simulate:
+    # --- the run to report on (report-only) -------------------------------
+    # Checked before anything touches credentials: a missing run is a usage
+    # error, and no row is created for it.
+    target_run: Optional[int] = None
+    if report_only:
+        target_run = (args.run_id if args.run_id is not None
+                      else orch.store.latest_run_id())
+        if target_run is None or orch.store.get_run(target_run) is None:
+            orch.close()
+            if args.run_id is not None:
+                return fail(f"run {args.run_id} is not in the run store "
+                            f"({orch.store.url}); see the run history page or "
+                            f"'data/summary.json' for the run ids it holds")
+            return fail(f"the run store ({orch.store.url}) holds no run to "
+                        f"report on; run a phase first")
+
+    if report_only:
+        print(f"  REPORT ONLY -- regenerating the report for run {target_run} "
+              f"from the run store; no host is contacted.\n", file=out)
+    elif args.simulate:
         print("  SIMULATED RUN -- no host will be contacted; command output is "
-              "answered from a built-in script.\n")
+              "answered from a built-in script.\n", file=out)
     elif settings.get("run.dry_run", True):
         print("  DRY RUN -- power states will be read but nothing will be "
               "switched on. Pass --execute to act (see 'live power commands' "
-              "in --help).\n")
+              "in --help).\n", file=out)
     else:
         print(f"  LIVE RUN -- power commands WILL be issued "
-              f"(authorised by {authorization.source if authorization else '?'}).\n")
-
-    phase_names = PHASE_ORDER if args.phase == "all" else [args.phase]
+              f"(authorised by {authorization.source if authorization else '?'}).\n",
+              file=out)
 
     # --- scope ------------------------------------------------------------
     # Resolved before credentials and before the run row exists, so a bad
     # --node, --from/--until or --location costs the operator no password
     # prompt and leaves no half-started run in the store.
-    try:
-        nodes = orch.nodes(args.node) if args.node else None
-        plan = None
-        if "poweron" in phase_names:
-            plan = plan_sequence(orch.sequence_config, orch.topology,
-                                 orch.locations, args.node,
-                                 settings.get("run.from_stage"),
-                                 settings.get("run.until_stage"))
-    except (TopologyError, SequenceSelectionError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        orch.close()
-        return 2
+    nodes = None
+    plan = None
+    if not report_only:
+        try:
+            nodes = orch.nodes(args.node) if args.node else None
+            if "poweron" in phase_names:
+                plan = plan_sequence(orch.sequence_config, orch.topology,
+                                     orch.locations, args.node,
+                                     settings.get("run.from_stage"),
+                                     settings.get("run.until_stage"))
+        except (TopologyError, SequenceSelectionError) as exc:
+            orch.close()
+            return fail(str(exc))
     if plan is not None:
         for notice in plan.notices:
-            print(f"  scope: {notice}")
+            print(f"  scope: {notice}", file=out)
         if plan.notices:
-            print()
+            print(file=out)
 
     # --- run --------------------------------------------------------------
     exit_code = 0
     results: List[Any] = []
+    rid: Optional[int] = None
+    #: Once True the run's terminal status is in the store, and nothing on
+    #: an error path may overwrite it. A regenerated run starts True: its
+    #: status is never changed by regenerating it.
+    finished = report_only
+    post = bool(settings.get("ecl.enabled", False))
     install_sigterm_handler()
     try:
-        orch.prepare_credentials()
-        orch.store.start_run(
-            label=settings.get("run.label") or default_label(),
-            dry_run=bool(settings.get("run.dry_run", True)),
-            version=orch.version.as_dict(),
-            settings=settings.redacted(),
-        )
-        if authorization is not None and authorization.live:
-            orch.store.record_event(
-                f"LIVE run: power commands authorised by {authorization.source}",
-                level="warning")
-        results = run_phases(orch, args, phase_names, nodes=nodes, plan=plan)
+        if report_only:
+            orch.store.attach(target_run)
+            rid = target_run
+        else:
+            orch.prepare_credentials()
+            rid = orch.store.start_run(
+                label=settings.get("run.label") or default_label(),
+                dry_run=bool(settings.get("run.dry_run", True)),
+                version=orch.version.as_dict(),
+                settings=settings.redacted(),
+            )
+            if authorization is not None and authorization.live:
+                orch.store.record_event(
+                    f"LIVE run: power commands authorised by {authorization.source}",
+                    level="warning")
+            seen: set = set()
+            _record_notes(orch, seen)
+            results = run_phases(orch, args, phase_names, nodes=nodes,
+                                 plan=plan, out=out)
+            _record_notes(orch, seen)
 
+            # Finish the run before anything is assembled, rendered or
+            # posted: the report is the record, and it must not say
+            # "in progress" about a run that has ended.
+            verdict = phase4_report.overall_status(orch.store.export_run(rid))
+            orch.store.finish_run("complete" if verdict is not Status.FAIL
+                                  else "complete_with_failures")
+            finished = True
+        doc["run_id"] = rid
+
+        report_result = None
+        if "report" in phase_names:
+            report_result = phase4_report.assemble(orch.store, rid)
+            results.append(report_result)
+            verdict = report_result.status
+        else:
+            verdict = phase4_report.overall_status(orch.store.export_run(rid))
+        exit_code = 1 if verdict.is_bad else 0
+
+        report_info: Optional[Dict[str, Any]] = None
         if not args.no_report:
-            report_info = write_report(orch, results, settings)
-            print(console.rule("-", "report"))
-            print(f"  pages written to {report_info['output_dir']}")
-            publication = report_info["publication"]
+            report_info = write_report(orch, rid, settings, report_result, post)
+        elif report_result is not None:
+            ecl = _post_or_skip(orch, rid, report_result.data["narrative"], [], post)
+            _note_ecl(report_result, ecl)
+            report_info = {"output_dir": None, "pages": [], "data": [],
+                           "publication": None, "ecl": ecl}
+        if report_result is not None:
+            print_phase(report_result, out)
+        if report_info is not None and report_info.get("output_dir"):
+            print(console.rule("-", "report"), file=out)
+            print(f"  run {rid}: pages written to {report_info['run_dir']}"
+                  + ("; the top-level view shows this run"
+                     if report_info.get("latest") else
+                     "; the top-level view still shows the newest run"),
+                  file=out)
+            publication = report_info["publication"] or {}
             if publication.get("published"):
-                print(f"  published to {publication.get('target')}")
+                print(f"  published to {publication.get('target')}", file=out)
             elif publication.get("reason") and \
                     settings.get("report.publish.enabled"):
-                print(f"  publication skipped: {publication['reason']}")
-
-        worst = max((r.status for r in results), key=lambda s: s.rank) \
-            if results else Status.UNKNOWN
-        orch.store.finish_run("complete" if worst is not Status.FAIL
-                              else "complete_with_failures")
-        exit_code = 1 if worst.is_bad else 0
-
-        if args.json:
-            print(json.dumps([r.as_dict() for r in results], indent=2, default=str))
+                print(f"  publication skipped: {publication['reason']}", file=out)
+        doc["report"] = report_info
 
     except KeyboardInterrupt:
         # Ctrl-C, or SIGTERM routed here by install_sigterm_handler().
         print("\n  interrupted; the run store keeps everything done so far, and "
               "the run's private Kerberos caches have been destroyed.",
               file=sys.stderr)
-        orch.store.record_event("run interrupted by the operator", level="error")
-        orch.store.finish_run("interrupted")
+        doc["error"] = "interrupted"
+        if rid is not None:
+            orch.store.record_event("run interrupted by the operator"
+                                    if not finished else
+                                    "report generation interrupted by the operator",
+                                    level="error", run_id=rid)
+            if not finished:
+                orch.store.finish_run("interrupted", run_id=rid)
+                finished = True
+                _render_after_failure(orch, rid, settings, args)
         exit_code = 3
     except SystemExit as exc:
-        return int(exc.code or 2)
+        # prepare_credentials() and the config loaders stop with
+        # SystemExit("error: ..."): a message, not a status.
+        if isinstance(exc.code, int):
+            exit_code = exc.code
+        else:
+            exit_code = 2
+            if exc.code:
+                print(str(exc.code), file=sys.stderr)
+        doc["error"] = str(exc.code) if exc.code else f"exit {exit_code}"
+        if rid is not None and not finished:
+            orch.store.finish_run("error", run_id=rid)
+            finished = True
     except Exception as exc:  # noqa: BLE001 - report, do not traceback at the operator
         log.exception("run failed")
         print(f"\nerror: {exc}", file=sys.stderr)
         print("  see the log file for the full traceback.", file=sys.stderr)
-        orch.store.finish_run("error")
+        doc["error"] = str(exc)
+        if rid is not None and not finished:
+            orch.store.finish_run("error", run_id=rid)
+            finished = True
+            _render_after_failure(orch, rid, settings, args)
         exit_code = 2
     finally:
+        try:
+            doc["run_id"] = rid
+            doc["phases"] = [_json_phase(r) for r in results]
+            stored = orch.store.get_run(rid) if rid is not None else None
+            doc["status"] = stored.get("status") if stored else None
+        except Exception:  # noqa: BLE001 - the JSON document is best effort here
+            log.exception("could not read the run back for --json")
         orch.close()
 
     return exit_code

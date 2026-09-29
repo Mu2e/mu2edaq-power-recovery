@@ -74,9 +74,14 @@ class UpdateResult:
 class SelfUpdater:
     """Runs the phase-0 update against the project's own git checkout."""
 
-    def __init__(self, settings: Any, root: Optional[Path] = None):
+    def __init__(self, settings: Any, root: Optional[Path] = None,
+                 stdout: Any = None):
         self.settings = settings
         self.root = root or PROJECT_ROOT
+        #: Where the rebuild's output goes (a file object or descriptor);
+        #: None inherits stdout. The driver passes stderr under --json, so
+        #: stdout carries nothing but the JSON document.
+        self.stdout = stdout
         self.timeout = int(settings.get("selfupdate.timeout", 60))
         self.remote = settings.get("selfupdate.remote", "origin")
 
@@ -211,7 +216,8 @@ class SelfUpdater:
                if os.name == "nt" else [str(script)])
         log.info("rebuilding: %s", " ".join(cmd))
         try:
-            proc = subprocess.run(cmd, cwd=str(self.root), timeout=900, check=False)
+            proc = subprocess.run(cmd, cwd=str(self.root), timeout=900,
+                                  check=False, stdout=self.stdout)
         except (OSError, subprocess.SubprocessError) as exc:
             log.error("rebuild failed to start: %s", exc)
             return False

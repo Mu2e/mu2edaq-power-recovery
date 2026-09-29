@@ -30,24 +30,31 @@ def phase_result(orch):
         ["mu2egateway01", "mu2e-trk-01", "mu2e-dcs-01"], ["mc2"]))
 
 
-def test_every_page_is_written_and_is_valid_html(orch, phase_result, settings):
+def _render(orch, settings, latest=True):
+    export = orch.store.export_run(orch.store.run_id)
     writer = ReportWriter(settings, orch.topology)
-    run = orch.store.get_run()
-    version = orch.version.as_dict()
-    writer.write_phase(phase_result, run, version)
-    writer.write_index(run, [phase_result.as_dict()], version)
-    writer.write_runs(orch.store.list_runs())
-    writer.write_static_pages(version, {"ping.lab": "reachability"}, settings.redacted())
+    bundle = writer.render_run(export, phase4_report.build_narrative(export),
+                               orch.version.as_dict(), latest=latest,
+                               checks={"ping.lab": "reachability"},
+                               runs=orch.store.list_runs())
+    return writer, bundle
+
+
+def test_every_page_is_written_and_is_valid_html(orch, phase_result, settings):
+    writer, bundle = _render(orch, settings)
 
     import html.parser
 
     for page_id, (filename, _label) in PAGES.items():
         path = writer.output_dir / filename
         if page_id in ("poweron", "network", "report"):
-            continue    # those phases did not run in this test
+            assert not path.exists()     # not in this run: no page, no link
+            continue
         assert path.exists(), f"{filename} was not written"
         parser = html.parser.HTMLParser()
         parser.feed(path.read_text())      # raises on malformed markup
+    for page in bundle.paths:
+        html.parser.HTMLParser().feed(Path(page).read_text())
 
 
 def test_pages_carry_the_node_data(orch, phase_result, settings):
@@ -88,11 +95,11 @@ def test_network_page_separates_untested_from_failed_paths(orch, settings):
 
 
 def test_json_companions_are_written_and_parse(orch, phase_result, settings):
-    writer = ReportWriter(settings, orch.topology)
-    path = writer.write_data("assess", phase_result.as_dict())
-    payload = json.loads(path.read_text())
+    _writer, bundle = _render(orch, settings)
+    payload = json.loads((bundle.directory / "data" / "assess.json").read_text())
     assert payload["name"] == "assess"
     assert payload["counts"]["total"] == 3
+    assert payload["run_id"] == orch.store.run_id
 
 
 def test_rerunning_a_phase_rewrites_its_page_in_place(orch, settings):
@@ -108,13 +115,12 @@ def test_rerunning_a_phase_rewrites_its_page_in_place(orch, settings):
     assert second.read_text() != original or True   # content regenerated
 
 
-def test_archiving_keeps_a_copy_per_run(orch, phase_result, settings):
-    writer = ReportWriter(settings, orch.topology)
-    run = orch.store.get_run()
-    writer.write_phase(phase_result, run, orch.version.as_dict())
-    writer.write_index(run, [], orch.version.as_dict())
-    archived = writer.archive_run(int(run["id"]))
-    assert archived and (archived / "index.html").exists()
+def test_render_run_writes_a_bundle_per_run(orch, phase_result, settings):
+    _writer, bundle = _render(orch, settings)
+    assert bundle.directory.name == str(orch.store.run_id)
+    assert (bundle.directory / "index.html").exists()
+    assert str(bundle.directory / "initial-state.html") in bundle.paths
+    assert all(p.startswith(str(bundle.directory)) for p in bundle.paths + bundle.data)
 
 
 def test_archive_pruning_is_numeric_not_lexical(settings, orch, tmp_path):
@@ -151,8 +157,7 @@ def test_publication_without_a_target_is_reported_not_attempted(settings):
 
 
 def test_local_copy_publication(settings, tmp_path, orch, phase_result):
-    writer = ReportWriter(settings, orch.topology)
-    writer.write_index(orch.store.get_run(), [], orch.version.as_dict())
+    _render(orch, settings)
     destination = tmp_path / "webroot"
     settings.set("report.publish.enabled", True)
     settings.set("report.publish.method", "copy")
@@ -166,8 +171,7 @@ def test_a_simulated_run_publishes_nothing(settings, tmp_path, orch):
     # The 'copy' method writes with shutil.copytree rather than through the
     # transport, so scripting the transport is not enough to keep a rehearsal
     # off the live web area -- it would overwrite it for real.
-    writer = ReportWriter(settings, orch.topology)
-    writer.write_index(orch.store.get_run(), [], orch.version.as_dict())
+    _render(orch, settings)
     destination = tmp_path / "webroot"
     settings.set("report.publish.enabled", True)
     settings.set("report.publish.method", "copy")
@@ -185,7 +189,7 @@ def test_a_simulated_run_publishes_nothing(settings, tmp_path, orch):
 
 
 def test_the_ecl_body_states_the_outcome_and_the_follow_ups(orch, phase_result):
-    narrative = phase4_report.run(orch, post=False).data["narrative"]
+    narrative = phase4_report.run(orch).data["narrative"]
     poster = ECLPoster(orch.settings, vault=None)
     body = poster.body(narrative)
     assert narrative["headline"] in body
@@ -195,14 +199,14 @@ def test_the_ecl_body_states_the_outcome_and_the_follow_ups(orch, phase_result):
 
 
 def test_a_dry_run_is_marked_in_the_subject(orch, phase_result):
-    narrative = phase4_report.run(orch, post=False).data["narrative"]
+    narrative = phase4_report.run(orch).data["narrative"]
     subject = ECLPoster(orch.settings, vault=None).subject(narrative)
     assert subject.startswith("[DRY RUN]")
 
 
 def test_posting_without_credentials_raises_rather_than_silently_skipping(orch,
                                                                           phase_result):
-    narrative = phase4_report.run(orch, post=False).data["narrative"]
+    narrative = phase4_report.run(orch).data["narrative"]
     with pytest.raises(ECLError):
         ECLPoster(orch.settings, vault=None).post(narrative)
 
