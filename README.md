@@ -464,28 +464,27 @@ a scripted `FakeTransport`. Nothing in the test suite touches the DAQ network,
 needs a Kerberos ticket, or reads Vault — which is the point, because the only
 time it matters that the tests pass is *before* an outage.
 
-That claim is *partly enforced*, not merely asserted. An autouse fixture in
-`tests/conftest.py` monkeypatches `LocalTransport.run` and fails any test that
-shells out through it to `ssh`, `scp`, `rsync`, `ping`, `ping6`, `ipmitool`,
-`kinit`, `klist`, `kdestroy`, `vault`, `get-kerberos-ticket` or `vault-client`;
-a test that genuinely needs to opts out with `@pytest.mark.allow_network`.
-`tests/unit/test_network_guard.py` tests the guard itself. It was added after
-the suite was found making real ssh connections to the gateways, and extended
-after a `--simulate` run was found pinging them.
+That claim is *enforced*, not merely asserted. An autouse fixture in
+`tests/conftest.py` guards the three ways production code reaches the outside:
 
-**Know what the guard does not cover.** It hooks one method, so anything that
-does not go through `LocalTransport.run` walks straight past it:
+- `subprocess.Popen` — covering `LocalTransport.run` and the direct
+  `subprocess.run`/`call` in `creds/` — refuses `ssh`, `scp`, `rsync`, `ping`,
+  `ping6`, `ipmitool`, `kinit`, `klist`, `kdestroy`, `kswitch`, `vault`,
+  `get-kerberos-ticket`, `vault-client`, `mu2e-probe`, `curl`, `wget` and `nc`,
+  including inside `sh -c` payloads and after `env VAR=…` prefixes;
+- `socket.connect` to anything but loopback or TEST-NET-1, which stops `hvac`'s
+  HTTPS to Vault and the Python sweep;
+- `sweep.sweep` for real hosts, which covers the C++ backend.
 
-- `creds/ticketsource.py` calls `subprocess.run` directly for `klist`,
-  `klist -l`, `kswitch` and `get-kerberos-ticket`/`vault-client`;
-- `creds/vault.py` calls `subprocess.call(["vault", "login", …])` and issues
-  HTTPS to Vault through `hvac`.
-
-A new test that exercised `KerberosManager`'s service path or
-`VaultCredentials` would therefore contact the real Kerberos collection or
-`ssivault.fnal.gov` without tripping anything. The existing tests stub those
-paths; if you add one that does not, stub it yourself — the guard will not
-catch you.
+A block raises a `BaseException` (`pytest.fail.Exception`), so the
+`except Exception` around the gateway pre-filter and every Vault call cannot
+swallow it, and it is recorded and fails the test at teardown as well. A test
+that genuinely needs the network opts out with `@pytest.mark.allow_network`.
+`tests/unit/test_network_guard.py` has a meta-test for each path. The guard was
+added after the suite was found making real ssh connections to the gateways,
+extended after a `--simulate` run was found pinging them, and extended again
+(issue #22) — when it immediately found a credentials test running the
+developer's real `klist`.
 
 ## Documentation
 

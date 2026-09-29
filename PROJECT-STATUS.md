@@ -509,16 +509,13 @@ by how much an operator would care.
   `-n mu2e-dcs-03` (on the lab network, no `ipmi:` interface) proceeds and builds
   `ipmitool -H None …` on the gateway. The `--diagnose` path handles this
   correctly (`ipmi_tool.py:253-255`). Documented in the man page.
-- **The test suite's network guard covers one method.**
-  `tests/conftest.py:125-142` monkeypatches `LocalTransport.run` only. Two
-  credential paths bypass it entirely: `creds/ticketsource.py` calls
-  `subprocess.run` directly (klist, `klist -l`, kswitch, `get-kerberos-ticket`
-  / `vault-client`), and `creds/vault.py` calls `subprocess.call(["vault",
-  "login", …])` and issues HTTPS through `hvac`. A test exercising
-  `KerberosManager`'s service path or `VaultCredentials` would contact the real
-  Kerberos collection or `ssivault.fnal.gov` without tripping the guard. The
-  existing tests stub those paths, so nothing leaks today; README and CLAUDE.md
-  now state the real scope rather than claiming the whole list is enforced.
+- ~~**The test suite's network guard covers one method.**~~ **Fixed (#22,
+  fix/test-guard).** The guard now patches `subprocess.Popen`, `socket.connect`
+  and `sweep.sweep`, and raises a BaseException so production
+  `except Exception` blocks cannot swallow it. The "nothing leaks today" claim
+  made here was wrong: on first run the extended guard caught
+  `test_no_kerberos_package_means_no_service_identities` running the real
+  `klist` via `operator_credential()` -> `ambient_principal()`.
 - **The displacement guard around a mint is best-effort, not a precondition.**
   `ticketsource.py:256-259` reads `before = self.default_principal()` and, when
   that returns `None`, logs a debug line and mints anyway;

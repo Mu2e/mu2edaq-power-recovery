@@ -22,7 +22,7 @@ mu2e-power-on --execute                      # phase 2, actually switches on
 mu2e-power-netcheck                          # phase 3
 mu2e-power-report --post-ecl                 # phase 4
 
-pytest                                       # 309 tests, no cluster needed
+pytest                                       # no cluster needed
 cmake -S . -B build && cmake --build build   # optional C/C++ library
 ctest --test-dir build --output-on-failure
 ```
@@ -136,23 +136,33 @@ Vault. Every check is a pure function of a transport; faults are injected with
 `FakeTransport.expect_first(pattern, response)`, which puts one rule ahead of
 the healthy baseline.
 
-That is **partly enforced**: the autouse `no_real_network` fixture in
-`tests/conftest.py` monkeypatches `LocalTransport.run` and fails any test whose
-first command word is `ssh`, `scp`, `rsync`, `ping`, `ping6`, `ipmitool`,
-`kinit`, `klist`, `kdestroy`, `vault`, `get-kerberos-ticket` or `vault-client`.
-Opt out with `@pytest.mark.allow_network` (declared in `pyproject.toml`);
-`tests/unit/test_network_guard.py` is the meta-test. Do not weaken it — it was
-added after the suite was caught making real ssh connections, and extended
-after a `--simulate` run was caught pinging the live gateways.
+That is **enforced** by the autouse `no_real_network` fixture in
+`tests/conftest.py`, in three layers:
 
-**The guard hooks one method, so know what it misses.** Anything not routed
-through `LocalTransport.run` is unprotected: `creds/ticketsource.py` calls
-`subprocess.run` directly (`klist`, `klist -l`, `kswitch`,
-`get-kerberos-ticket`/`vault-client`), and `creds/vault.py` calls
-`subprocess.call(["vault", "login", ...])` and talks HTTPS to Vault through
-`hvac`. A new test touching `KerberosManager`'s service path or
-`VaultCredentials` would reach the real Kerberos collection or
-`ssivault.fnal.gov` without tripping anything — stub those yourself.
+- `subprocess.Popen.__init__` — so `LocalTransport.run` *and* the direct
+  `subprocess.run`/`call` in `creds/ticketsource.py` and `creds/vault.py` —
+  refuses `BLOCKED_COMMANDS` (`ssh`, `scp`, `rsync`, `ping`, `ping6`,
+  `ipmitool`, `kinit`, `klist`, `kdestroy`, `kswitch`, `vault`,
+  `get-kerberos-ticket`, `vault-client`, `mu2e-probe`, `curl`, `wget`, `nc`),
+  looking inside `sh -c` payloads, `shell=True` strings and `env VAR=…`
+  prefixes;
+- `socket.connect`/`connect_ex` to anything but loopback, AF_UNIX or TEST-NET-1
+  (192.0.2.0/24) — this is what stops `hvac` and the Python sweep;
+- `sweep.sweep` for any host but loopback, TEST-NET-1 or `*.invalid` — the
+  native backend opens its sockets in C++.
+
+A block raises `pytest.fail.Exception`, a **BaseException**, because the paths
+it guards are wrapped in `except Exception` in production
+(`SSHFactory._select_gateway`, every `VaultCredentials` call): an
+`AssertionError` there was swallowed and the test passed having reached out.
+Each block is also recorded and fails the test at teardown. Meta-tests consume
+an expected block with `no_real_network.expect(fragment)`. Opt out with
+`@pytest.mark.allow_network` (declared in `pyproject.toml`);
+`tests/unit/test_network_guard.py` has a meta-test per path. Do not weaken it —
+it was added after the suite was caught making real ssh connections, extended
+after a `--simulate` run was caught pinging the live gateways, and extended
+again (#22) when it found a credentials test running the developer's real
+`klist`.
 
 `FakeTransport`'s rule scan is under a lock: clones deliberately share the rule
 list and `assess_nodes` runs a node per thread, so an unguarded `once=True` rule
