@@ -24,7 +24,7 @@ from typing import Any, Dict, List, Optional, Sequence
 from ..checks import Status
 from ..orchestrator import NodeAssessment, Orchestrator, group_by_class
 from ..topology import Node
-from .base import PhaseResult, overall_status
+from .base import TIMEOUT_SUMMARY, PhaseResult, overall_status, phase_deadline
 
 log = logging.getLogger(__name__)
 
@@ -50,7 +50,18 @@ def run(orch: Orchestrator, nodes: Optional[Sequence[Node]] = None,
 
     orch.store.start_phase(PHASE_NAME, PHASE_NUMBER)
     orch.store.record_event(f"phase 1 (assess) started over {len(targets)} node(s)")
+    deadline = phase_deadline(orch)
+    with orch.budget(deadline):
+        return _assess(orch, result, targets, deadline, started, progress)
 
+
+def _assess(orch: Orchestrator, result: PhaseResult, targets: List[Node],
+            deadline: Any, started: float, progress: Optional[Any]) -> PhaseResult:
+    """The body of :func:`run`, under the phase's run.phase_timeout budget.
+
+    The orchestrator checks the budget before every node and every check, so
+    nodes and checks it never reached come back UNKNOWN with TIMEOUT_SUMMARY.
+    """
     # --- 1: the gateways, first and alone ---------------------------------
     gateways = [n for n in targets if n.node_class == "gateway"]
     others = [n for n in targets if n.node_class != "gateway"]
@@ -107,6 +118,14 @@ def run(orch: Orchestrator, nodes: Optional[Sequence[Node]] = None,
             result.assessments,
             getattr(orch.ipmi, "credentials_refused", None)),
     }
+    timed_out = [a.node.hostname for a in result.assessments if a.timed_out]
+    result.data["timed_out"] = timed_out
+    if timed_out:
+        result.notes.append(
+            f"run.phase_timeout ({deadline.budget:.0f}s) expired: "
+            f"{len(timed_out)} node(s) were not fully assessed; their "
+            f"remaining checks are UNKNOWN ({TIMEOUT_SUMMARY})")
+        orch.store.record_event(result.notes[-1], level="error")
     result.notes.extend(orch.notes)
     refused = result.data["ready_for_phase2"]["credentials_refused"]
     if refused:

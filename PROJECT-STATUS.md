@@ -170,6 +170,17 @@ JSON files, and is wired into `ctest` as `simulated-run`.
 | No mint runs when the default cache cannot be read first | `test_an_unreadable_default_refuses_before_any_mint` |
 | Concurrent cold chains mint each identity exactly once | `test_concurrent_cold_chains_mint_each_identity_exactly_once` |
 | A show-only diagnostic acquires and mints nothing | `test_show_only_mints_nothing_and_says_so` |
+| Config `run.dry_run: false` alone does not arm a run (YAML, `.env`, env) | `test_config_live_alone_is_refused` |
+| The ARM token arms only with a matching configured label | `test_an_arm_token_that_does_not_hold_is_refused` |
+| The ARM token is refused in `config/.env` | `test_arm_in_dotenv_is_a_config_error` |
+| `--simulate` beats `--execute` and the ARM token | `test_simulate_always_wins` |
+| A `--node` live run powers only the named node, never a predecessor | `test_a_scoped_live_run_powers_only_the_named_node` |
+| An off predecessor stops the run before the target stage | `test_an_off_predecessor_stops_before_the_target` |
+| `_power_stage` refuses a host outside the plan | `test_power_stage_refuses_a_host_outside_the_plan` |
+| Each BMC is driven through its own location's gateway | `test_each_bmc_is_driven_through_its_own_locations_gateway` |
+| A bad stage/node selection exits 2 before credentials, no run row | `test_bad_phase2_selection_exits_2_before_credentials` |
+| 28 dead nodes cost one `boot_timeout`, not 28 | `test_28_dead_nodes_cost_one_boot_timeout_not_28` |
+| Stages past `run.phase_timeout` are UNKNOWN, not FAIL | `test_phase_timeout_marks_the_stages_it_never_reached` |
 
 ---
 
@@ -460,17 +471,21 @@ The nine items immediately below were found in a documentation audit on
 what the code does; the code behaviour is left for the author. They are ordered
 by how much an operator would care.
 
-- **`--execute` is not a second gate, although four documents said it was.**
-  `cli.py:184-185` does `if args.execute: overrides["run.dry_run"] = False`, and
-  `orchestrator.py:308` passes `run.dry_run` straight to `IPMIClient`. Nothing
-  re-checks the flag, so `run: {dry_run: false}` in the config file, `.env` or
-  `MU2E_POWER_RECOVERY_RUN_DRY_RUN=false` arms live power commands with no flag
-  on the command line — verified by resolving the shipped parser against such a
-  config. Only `--simulate` is genuinely independent. The docs now say so. If
-  the two-gate behaviour was the intent, it is a two-line change in
-  `run_phases`/`_make_ipmi_client` (require `args.execute` *and* `not
-  run.dry_run`), but it would break any operator who arms a run from the config
-  file today, so it is the author's call. **Highest-value item in this group.**
+- ~~**`--execute` is not a second gate, although four documents said it
+  was.**~~ **Fixed (#11, fix/poweron-safety).** `--execute` no longer writes
+  `run.dry_run`; `cli.authorize_live()` decides per invocation, before phase 0
+  and credentials: `--simulate` is never live; `--execute` alone arms;
+  `run.dry_run: false` from YAML, `.env` or the environment *alone* exits 2
+  with both ways to authorise; with it, `MU2E_POWER_RECOVERY_ARM` equal to a
+  non-empty configured `run.label` arms an unattended run. A token with a null
+  or mismatched label, or with `dry_run: true`, exits 2. The token is read
+  from the process environment only — `settings._apply_env` skips it and its
+  presence in `config/.env` is a `ConfigError`. The decision is written back
+  as `run.dry_run` (source recorded), so the IPMI clients are unchanged
+  downstream; a live run logs a WARNING and records a store event naming what
+  armed it. Assumed interpretation, flagged for confirmation: `--execute` alone
+  still arms (the shipped config is `dry_run: true` and every documented
+  example uses the bare flag).
 - ~~**Nothing installs a SIGTERM handler, so `stop-…-recovery.sh` is not a clean
   stop.**~~ **Fixed (fix/credentials).** `cli.install_sigterm_handler()` raises
   KeyboardInterrupt, and `assess_nodes` / `MeshProbe.run` replace their `with
@@ -498,12 +513,32 @@ by how much an operator would care.
   — a service identity holding the default cache (every login will be refused)
   versus the benign case where the ambient principal merely differs from
   `kerberos.principal`. Separating them, then exiting on the first, is the fix.
-- **An unmatched `--from`/`--until` stage name is silently ignored.**
-  `phase2_poweron.py:289-295`: `start = names.index(from_stage) if from_stage in
-  names else 0`. So `mu2e-power-on --execute --from manger` runs the *whole*
-  sequence, readout included, with no error and no note. For a flag whose
-  purpose is to bound what gets powered on, this should arguably be an error.
-  Documented as a caveat in `man 1 mu2e-power-on` and the runbook for now.
+- ~~**An unmatched `--from`/`--until` stage name is silently ignored.**~~
+  **Fixed (#2, fix/poweron-safety).** `_slice_bounds()` raises
+  `SequenceSelectionError` (a `ValueError`) for an unknown name, a reversed
+  range, a stage with no name or duplicate stage names, listing the valid
+  names; the same applies to `run.from_stage`/`run.until_stage`. The CLI plans
+  the sequence before `prepare_credentials()` and `start_run()`, so a typo exits
+  2 with no password prompt and no run row.
+- ~~**Phase 2 ignored `--node` and `--location`.**~~ **Fixed (#1,
+  fix/poweron-safety).** `plan_sequence()` builds a `SequencePlan` before
+  credentials: stages outside `--location` are dropped with a notice (none left
+  is an error); with `--node`, target stages are cut to the named nodes,
+  predecessor stages (from the range start to the last target) are
+  **verify-only** — power status, ssh wait, checks, never `chassis power on` —
+  and a predecessor stage that is not up stops the run before the target, even
+  with `--continue-on-error`, naming the stage to run explicitly; later stages
+  are SKIP "outside requested scope". A named node in no usable stage is an
+  error naming its stage(s). `_power_stage` refuses any host outside
+  `plan.allowed_power` (action `out_of_scope`). Every stage's node names are
+  validated at plan time, so a bad name cannot fail mid-sequence. `--node`
+  resolution moved ahead of credentials too, and `--list-nodes` handles
+  `TopologyError` (exit 2, no traceback). IPMI is now one client per location
+  (`Orchestrator.ipmi_for`), each on a gateway of its own location, all sharing
+  the run's `CredentialBreaker`. Deviation from the literal plan text: a
+  predecessor blocks by its stage's `require:` rule with off/silent nodes
+  counted as bad, so one dark gateway of two (`require: any`) does not stop a
+  run that the full sequence would also have continued.
 - ~~**`mu2e-ipmi-tool` reaches the gateway with the ambient ticket only.**~~
   **Fixed (#14, fix/credentials).** Both diagnostics and
   `Orchestrator.prepare_credentials` now open credentials through
@@ -676,16 +711,18 @@ by how much an operator would care.
   (and tolerates one that was never created). Not covered: a ticket an
   interrupted mint put into the macOS API: collection has no name we know, so
   only the pre-recorded FILE: path is destroyed.
-- **Phase 2 waits for nodes one at a time.** `_wait_for_nodes` walks the stage's
-  nodes in sequence, so a node that never comes back costs the whole
-  `boot_timeout` (600 s by default) before the next one is even tried. The
-  `readout` stage has 28 nodes: three dead ones are half an hour of an outage
-  spent waiting in series, during which nothing else happens. Parallelising it
-  is straightforward — the probes are read-only `ssh true`, and `assess_nodes`
-  immediately afterwards already runs the same nodes concurrently — but it
-  changes the connection profile against machines that have just booted, in the
-  most safety-critical phase, so it wants the author's eye rather than a
-  drive-by fix.
+- ~~**Phase 2 waits for nodes one at a time.**~~ ~~**`run.phase_timeout` is
+  never enforced.**~~ **Fixed (#13, fix/poweron-safety).** `_wait_for_nodes`
+  waits for every node of a stage at once under one stage deadline, `now +
+  min(boot_timeout, phase time left)`, with ssh attempts bounded by a semaphore
+  of `ssh.max_sessions` and starts staggered 0.5 s; 28 never-answering nodes
+  finish within about one `boot_timeout` (fake-clock test). `run.phase_timeout`
+  is a `Deadline` (phases/base.py) on the orchestrator's injectable clock,
+  installed by `Orchestrator.budget()` for phases 1–3: checked before each
+  stage, node, check and power command; every factory-built `SSHTransport` caps
+  each call at `min(configured, remaining)`; the mesh probe skips sources once
+  it has expired. Unreached work is UNKNOWN `not run: phase_timeout expired`.
+  Overrun bound: the one call in flight at expiry. Power commands stay serial.
 - **The single-phase drivers cross-reference rather than list their flags.**
   `man 1 mu2e-power-recovery` is complete; the four single-phase pages point at
   it instead of repeating the options they accept. `build_parser()` exposes 31

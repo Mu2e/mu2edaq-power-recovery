@@ -737,7 +737,8 @@ def test_the_precheck_setting_reaches_the_run_client(settings):
     try:
         orch.prepare_credentials()
         client = orch._make_ipmi_client(IPMICredentials(username="u",
-                                                        password="p"))
+                                                        password="p"),
+                                        "mu2egateway01.fnal.gov")
         assert client.reachability_precheck is False
     finally:
         orch.close()

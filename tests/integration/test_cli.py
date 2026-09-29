@@ -72,9 +72,18 @@ def test_dry_run_is_the_default_and_is_announced(tmp_path, capsys, monkeypatch):
     assert "run.dry_run" not in overrides      # config default (True) stands
 
 
-def test_execute_flips_dry_run_off():
+def test_execute_is_not_a_configuration_override():
+    # --execute is this invocation's authorisation, decided by
+    # authorize_live(); it no longer writes run.dry_run as a config layer.
     args = cli.build_parser().parse_args(["--execute"])
-    assert cli.cli_overrides(args)["run.dry_run"] is False
+    assert "run.dry_run" not in cli.cli_overrides(args)
+
+
+def test_execute_arms_the_run_through_authorize_live(settings):
+    args = cli.build_parser().parse_args(["--execute"])
+    decision = cli.authorize_live(settings, args, {})
+    assert decision.live and decision.source == "--execute"
+    assert settings.get("run.dry_run") is False
 
 
 def test_simulate_forces_dry_run_even_with_execute():
@@ -127,3 +136,101 @@ def test_json_output_is_machine_readable(tmp_path, capsys):
     payload = json.loads(out[out.index("["):])
     assert payload[0]["name"] == "assess"
     assert payload[0]["counts"]["total"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Selection errors stop the run before credentials and before the run row
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def no_credentials(monkeypatch):
+    """Fail the test if the driver gets as far as acquiring credentials."""
+    from mu2edaq_power_recovery.orchestrator import Orchestrator
+
+    def refuse(self):
+        raise AssertionError("prepare_credentials() reached")
+
+    monkeypatch.setattr(Orchestrator, "prepare_credentials", refuse)
+
+
+def _run_rows(tmp_path):
+    import sqlite3
+    db = tmp_path / "cli.db"
+    if not db.exists():
+        return 0
+    with sqlite3.connect(str(db)) as conn:
+        try:
+            return conn.execute("select count(*) from runs").fetchone()[0]
+        except sqlite3.OperationalError:
+            return 0
+
+
+@pytest.mark.parametrize("args, needle", [
+    (["--from", "manger"], "valid stages, in order: gateways, manager"),
+    (["--until", "readuot"], "--until 'readuot' is not a stage"),
+    (["--from", "cfo", "--until", "manager"], "comes after --until"),
+    (["--node", "mu2e-trk-15"], "not in any stage of the power sequence"),
+    (["--node", "mu2e-trk-01", "--until", "cfo"], "stage 'readout', outside"),
+    (["--node", "bad;name"], "bad;name"),
+])
+def test_bad_phase2_selection_exits_2_before_credentials(tmp_path, capsys,
+                                                         no_credentials,
+                                                         args, needle):
+    code = run_cli(tmp_path, "--phase", "poweron", *args)
+    captured = capsys.readouterr()
+    assert code == 2
+    assert needle in captured.err
+    assert "Traceback" not in captured.err + captured.out
+    assert _run_rows(tmp_path) == 0
+
+
+def test_a_bad_node_exits_2_before_credentials_in_every_phase(tmp_path, capsys,
+                                                              no_credentials):
+    # --node resolution is up front for phases 1 and 3 as well.
+    code = run_cli(tmp_path, "--phase", "assess", "--node=-oProxyCommand=x")
+    captured = capsys.readouterr()
+    assert code == 2
+    assert "Traceback" not in captured.err + captured.out
+    assert _run_rows(tmp_path) == 0
+
+
+def test_config_from_stage_typo_exits_2(tmp_path, capsys, no_credentials,
+                                        monkeypatch):
+    monkeypatch.setenv("MU2E_POWER_RECOVERY_RUN_FROM_STAGE", "dataloger")
+    assert run_cli(tmp_path, "--phase", "poweron") == 2
+    assert "'dataloger' is not a stage" in capsys.readouterr().err
+
+
+def test_list_nodes_rejects_a_bad_name_cleanly(capsys):
+    code = cli.main(["--list-nodes", "--node", "bad name", "--no-self-update",
+                     "-q"])
+    captured = capsys.readouterr()
+    assert code == 2
+    assert "error:" in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_config_live_without_authorisation_exits_2(tmp_path, capsys,
+                                                   no_credentials, monkeypatch):
+    monkeypatch.setenv("MU2E_POWER_RECOVERY_RUN_DRY_RUN", "false")
+    monkeypatch.delenv("MU2E_POWER_RECOVERY_ARM", raising=False)
+    code = cli.main(["--no-self-update", "-q", "--phase", "assess",
+                     "--database-url", f"sqlite:///{tmp_path / 'cli.db'}"])
+    err = capsys.readouterr().err
+    assert code == 2
+    assert "--execute" in err and "MU2E_POWER_RECOVERY_ARM" in err
+    assert _run_rows(tmp_path) == 0
+
+
+def test_scoped_poweron_rehearsal_powers_only_the_named_node(tmp_path, capsys):
+    import json as _json
+    assert run_cli(tmp_path, "--phase", "poweron", "--node", "mu2e-trk-01") == 0
+    out = capsys.readouterr().out
+    assert "VERIFY-ONLY" in out
+    data = _json.loads((tmp_path / "html" / "data" / "poweron.json").read_text())
+    stages = {s["name"]: s for s in data["data"]["stages"]}
+    assert stages["readout"]["nodes"] == ["mu2e-trk-01.fnal.gov"]
+    assert stages["manager"]["role"] == "predecessor"
+    assert data["data"]["scope"]["allowed_power"] == ["mu2e-trk-01.fnal.gov"]
+    assert data["counts"]["total"] == 9

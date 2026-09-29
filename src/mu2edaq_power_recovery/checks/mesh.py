@@ -89,6 +89,11 @@ class MeshEdge:
                 "status": self.status.value, "detail": self.detail}
 
 
+#: Detail on an edge never probed because run.phase_timeout ran out. Matches
+#: orchestrator.TIMEOUT_SUMMARY; not imported, to keep checks/ below it.
+TIMEOUT_DETAIL = "not run: phase_timeout expired"
+
+
 def _untested(source: str, target: str, network: str, detail: str) -> MeshEdge:
     return MeshEdge(source=source, target=target, network=network, ok=False,
                     tested=False, detail=detail)
@@ -420,12 +425,17 @@ class MeshProbe:
 
     def run(self, nodes: Sequence[Any], network: str,
             full_mesh: bool = True, mtu_probe: bool = False,
-            origin: str = "nodes", targets: Optional[str] = None) -> MeshResult:
+            origin: str = "nodes", targets: Optional[str] = None,
+            deadline: Any = None) -> MeshResult:
         """Probe *network* across *nodes*.
 
         *targets* is ``all`` or ``anchors``; when omitted it follows
         *full_mesh* (``all`` for a full mesh, ``anchors`` otherwise), which is
         the behaviour before the key existed.
+
+        *deadline* is the phase's run.phase_timeout Deadline: a source whose
+        probe has not started when it expires is not probed, and its edges
+        are UNKNOWN (untested) with :data:`TIMEOUT_DETAIL`.
         """
         target_mode = targets or ("all" if full_mesh else "anchors")
         if origin not in self.ORIGINS:
@@ -475,6 +485,9 @@ class MeshProbe:
 
         def job(plan: _Plan) -> List[MeshEdge]:
             name, make_transport, target_names = plan
+            if deadline is not None and deadline.expired():
+                return [_untested(name, t, network, TIMEOUT_DETAIL)
+                        for t in target_names]
             return self._probe_source(name, make_transport(), target_names,
                                       network, mtu_probe)
 
@@ -531,7 +544,7 @@ class MeshProbe:
                     f"{len(uncovered)} of its {len(mine)} target(s) were tested "
                     f"by no other gateway -- those are UNKNOWN")
 
-    def run_all(self, nodes: Sequence[Any]) -> List[MeshResult]:
+    def run_all(self, nodes: Sequence[Any], deadline: Any = None) -> List[MeshResult]:
         """Probe every network listed in checks.yaml's mesh section."""
         results: List[MeshResult] = []
         for entry in self.config.get("networks", []) or []:
@@ -542,6 +555,7 @@ class MeshProbe:
                 mtu_probe=bool(entry.get("mtu_probe", False)),
                 origin=str(entry.get("origin", "nodes")),
                 targets=entry.get("targets"),
+                deadline=deadline,
             ))
         return results
 

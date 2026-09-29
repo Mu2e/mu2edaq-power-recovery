@@ -105,9 +105,14 @@ No corrective action is taken. Produces the "initial state" pages.
 .TP
 .B Phase 2 \(em power on
 The dependency-ordered power-on sequence, verifying each stage before starting
-the next. Dry run unless
-.B \-\-execute
-is given. Produces the "power on" pages.
+the next. Dry run unless this invocation authorises it
+.RB ( \-\-execute ,
+or the
+.B MU2E_POWER_RECOVERY_ARM
+token); with
+.BR \-\-node ,
+only the named nodes are powered and the stages before them are verified.
+Produces the "power on" pages.
 .TP
 .B Phase 3 \(em network
 Node-to-node connectivity across the segments, with a jumbo-frame probe on the
@@ -137,9 +142,19 @@ Not applicable to this host \(em a node with no BMC, a host with no PCIe card.
 A node whose every applicable check passed is OK, not n/a.
 .SH SAFETY MODEL
 .IP \(bu 2
-Power actions are a dry run unless
-.B \-\-execute
-is given; a simulated run cannot be armed at all.
+Power actions are a dry run unless the invocation authorises them
+.RB ( \-\-execute ,
+or
+.B MU2E_POWER_RECOVERY_ARM
+equal to the configured
+.IR run.label );
+.I run.dry_run: false
+in configuration alone is refused. A simulated run cannot be armed at all.
+.IP \(bu 2
+Phase 2 powers only what
+.BR \-\-node / \-\-location / \-\-from / \-\-until
+select; a selection that cannot be honoured exactly is an error before any
+credential is acquired.
 .IP \(bu 2
 .BR "chassis power off" ", " cycle " and " reset
 are refused for the gateways,

@@ -1,11 +1,90 @@
 """Common shape for a phase's outcome."""
 from __future__ import annotations
 
+import math
+import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from ..checks import Status
-from ..orchestrator import NodeAssessment, tally
+from ..orchestrator import TIMEOUT_SUMMARY, NodeAssessment, tally
+
+
+__all__ = ["Deadline", "PhaseResult", "TIMEOUT_SUMMARY", "overall_status",
+           "phase_deadline"]
+
+
+class Deadline:
+    """A monotonic wall-clock budget.
+
+    ``budget`` of None or <= 0 means unbounded: :meth:`remaining` is infinite,
+    :meth:`expired` is always False and :meth:`cap` passes timeouts through.
+
+    The clock is injectable (the orchestrator's, normally ``time.monotonic``)
+    so a test can run a whole phase against a fake clock without sleeping.
+    Other modules use a Deadline by duck type -- ``remaining()``,
+    ``expired()``, ``cap()``, ``expires_at`` -- because transport/ and the
+    orchestrator sit below phases/ in the import graph.
+    """
+
+    def __init__(self, budget: Optional[float],
+                 clock: Callable[[], float] = time.monotonic):
+        self.clock = clock
+        self.started = clock()
+        self.budget: Optional[float] = (float(budget) if budget is not None
+                                        and float(budget) > 0 else None)
+
+    @property
+    def expires_at(self) -> float:
+        """The clock value at which the budget runs out (inf when unbounded)."""
+        if self.budget is None:
+            return math.inf
+        return self.started + self.budget
+
+    def remaining(self) -> float:
+        """Seconds left, never negative; inf when unbounded."""
+        if self.budget is None:
+            return math.inf
+        return max(0.0, self.expires_at - self.clock())
+
+    def expired(self) -> bool:
+        return self.budget is not None and self.clock() >= self.expires_at
+
+    def cap(self, timeout: Optional[float]) -> Optional[float]:
+        """``min(timeout, remaining)``; *timeout* unchanged when unbounded."""
+        if self.budget is None:
+            return timeout
+        if timeout is None:
+            return self.remaining()
+        return min(float(timeout), self.remaining())
+
+    def child(self, budget: Optional[float]) -> "Deadline":
+        """A deadline of ``min(budget, remaining)``, on the same clock.
+
+        A stage deadline: it can never outlive the phase that holds it.
+        """
+        limit = self.remaining()
+        if budget is not None and float(budget) > 0:
+            limit = min(limit, float(budget))
+        out = Deadline(None, self.clock)
+        if limit != math.inf:
+            out.budget = limit
+            out.started = self.clock()
+            if limit <= 0:
+                # Already exhausted: expired() must be True, which a budget of
+                # 0 would not give (0 reads as "unbounded").
+                out.budget = 0.0
+        return out
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return (f"Deadline(budget={self.budget}, "
+                f"remaining={self.remaining():.1f})")
+
+
+def phase_deadline(orch: Any) -> Deadline:
+    """The ``run.phase_timeout`` deadline for a phase, on the orchestrator's clock."""
+    return Deadline(orch.settings.get("run.phase_timeout"),
+                    getattr(orch, "clock", time.monotonic))
 
 
 @dataclass
