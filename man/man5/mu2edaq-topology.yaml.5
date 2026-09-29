@@ -83,7 +83,13 @@ and
 are the same location.
 .TP
 .I gateways
-Jump hosts used to reach this location, in preference order.
+Jump hosts used to reach this location, in preference order. They are also the
+probe sources for any phase-3 mesh network with
+.B "origin: gateways"
+in
+.BR mu2edaq-checks.yaml (5)
+\(em the IPMI network in the shipped configuration \(em and every gateway
+listed is used there, not only the first that answers.
 .TP
 .I subnets
 Network name to CIDR. These are what
@@ -147,6 +153,25 @@ is kept out of a list.
 .I fmt
 printf-style format for the number. Default
 .BR %02d .
+.SS Hostname validation
+Every expanded name \(em each network entry after NodeRange expansion, each
+.IR gateways " and " protected
+entry \(em must be a DNS hostname (labels of letters, digits and
+.BR \- ,
+neither starting nor ending with
+.BR \- ,
+separated by dots; a trailing dot is allowed) or an IPv4 or IPv6 literal
+(without a zone id). Anything else \(em whitespace, quotes, shell
+metacharacters, a leading
+.B \-
+\(em makes the file fail to load, naming the location and network the entry
+came from. The same rule, the one function
+.IR topology.valid_hostname ,
+is applied to each
+.B \-\-node
+name. These names become ssh destinations and are placed in the phase-3 probe
+scripts, so the check is the boundary between configuration text and shell
+source.
 .SH THE CURRENT INVENTORY
 65 hosts across three locations, as shipped.
 .BR "mu2e-node-inventory \-\-json"

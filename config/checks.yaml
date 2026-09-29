@@ -130,15 +130,35 @@ profiles:
 # Phase 3: inter-node connectivity mesh.
 # ---------------------------------------------------------------------------
 mesh:
-  # Networks to test.  For each, every source node pings every target node on
-  # that network.  full_mesh: false samples a representative set instead --
-  # each node to the stage leaders -- which is O(N) rather than O(N^2) and is
-  # the default for the large lab network.
+  # Networks to test.  Per entry:
+  #   origin:   nodes     every node on the network is a probe source (default)
+  #             gateways  each location's gateways (topology.yaml) are the
+  #                       sources, contacted directly -- for a network the host
+  #                       OSes have no route to
+  #   targets:  all       every node on the network
+  #             anchors   the anchor hosts below -- O(N) rather than O(N^2)
+  #             Default: all when full_mesh is true, anchors when it is false.
+  #   full_mesh: kept for compatibility; only sets the default for targets.
+  #   mtu_probe: also send one 9000-byte do-not-fragment packet per pair.
+  #
+  # ipmi is origin: gateways.  A node's ipmi entry names its BMC, which sits
+  # on a private subnet only the gateways can route to -- the same reason
+  # ipmitool runs on a gateway -- so pinging a BMC from a node's OS would
+  # fail on a healthy network.  From the gateways, every BMC in the location
+  # is probed: the check proves each BMC answers ICMP from the host that
+  # drives it.
   networks:
     - {name: data, full_mesh: true,  mtu_probe: true}
     - {name: lab,  full_mesh: false, mtu_probe: false}
-    - {name: ipmi, full_mesh: false, mtu_probe: false}
-  # Representative targets used when full_mesh is false.
+    - {name: ipmi, origin: gateways, targets: all, full_mesh: false, mtu_probe: false}
+  # Representative targets used when targets is anchors.  Either a flat list
+  # (the same anchors for every location, as here) or keyed by location, e.g.
+  #   anchors:
+  #     mc2:       [mu2e-mgr-01.fnal.gov, mu2e-dl-01.fnal.gov]
+  #     teststand: [mu2edaq07.fnal.gov]
+  # Keyed anchors also keep each node's probes within its own location.  A
+  # location none of whose anchors is in the run falls back to its first three
+  # nodes on the network.
   anchors:
     - mu2e-mgr-01.fnal.gov
     - mu2e-dl-01.fnal.gov

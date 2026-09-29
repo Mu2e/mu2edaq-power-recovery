@@ -1,6 +1,7 @@
 """Reachability and login checks -- the ones whose failure explains the rest."""
 from __future__ import annotations
 
+import shlex
 import time
 from typing import Any, Optional
 
@@ -35,7 +36,13 @@ def _ping_command(target: str, count: int, timeout: int,
     The payload/DF options are iputils-only.  Only the phase-3 MTU probe asks
     for them and that always runs on a gateway, so the other dialects are
     never asked to express them.
+
+    *target* is shell-quoted: the command is a string run through a shell,
+    locally or on a remote host.  A name that passed
+    :func:`~mu2edaq_power_recovery.topology.valid_hostname` comes out
+    unchanged; anything else is at worst a literal argument, never code.
     """
+    target = shlex.quote(target)
     if dialect == "windows":
         # -w is milliseconds here too, and there is no quiet mode.
         return f"ping -n {count} -w {timeout * 1000} {target}"

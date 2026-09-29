@@ -55,26 +55,29 @@ def run(orch: Orchestrator, nodes: Optional[Sequence[Node]] = None,
     orch.store.record_event(f"phase 3 (network) started over {len(targets)} node(s)")
 
     probe = MeshProbe(orch.ssh_factory, orch.checks_config,
-                      max_workers=int(orch.settings.get("ssh.max_sessions", 16)))
+                      max_workers=int(orch.settings.get("ssh.max_sessions", 16)),
+                      topology=orch.topology)
     mesh_results: List[MeshResult] = probe.run_all(targets)
 
     statuses = [m.status for m in mesh_results]
     result.status = max(statuses, key=lambda s: s.rank) if statuses else Status.UNKNOWN
-    result.summary = "; ".join(
-        f"{m.network}: {len(m.edges) - len(m.failures)}/{len(m.edges)} paths ok"
-        + (f", {len(m.mtu_failures)} jumbo-frame failure(s)" if m.mtu_failures else "")
-        for m in mesh_results) or "no networks probed"
+    result.summary = "; ".join(_summary(m) for m in mesh_results) or "no networks probed"
     result.data = {
         "networks": [m.as_dict() for m in mesh_results],
         "isolated_nodes": sorted({n for m in mesh_results for n in m.isolated_nodes()}),
         "unreachable_targets": sorted({t for m in mesh_results
                                        for t in m.unreachable_targets()}),
+        "unreachable_sources": sorted({s for m in mesh_results
+                                       for s in m.unreachable_sources()}),
     }
 
     # An interpretation, not just a matrix: a node that reaches nothing and a
     # target nobody reaches have different causes, and saying which is which
     # here saves the operator reading a 900-cell table to work it out.
     for m in mesh_results:
+        # The probe's own notes first: gateway coverage and locations with no
+        # gateway, which the counts below cannot express.
+        result.notes.extend(m.notes)
         # Aggregated, not one note per host: a fabric-wide failure would
         # otherwise produce fifty identical lines and bury the one diagnosis
         # that differs.  Counts plus a sample is what an operator can act on.
@@ -88,6 +91,22 @@ def run(orch: Orchestrator, nodes: Optional[Sequence[Node]] = None,
                 if len(isolated) > 2 else
                 f"{m.network}: {_sample(isolated)} reached nothing -- look at "
                 f"that node's interface and its switch port, not at the fabric")
+        dark = m.unreachable_sources()
+        if dark:
+            # UNKNOWN, not FAIL: nothing was learned about the paths from
+            # these sources, so they are kept out of the isolation analysis.
+            result.notes.append(
+                f"{m.network}: {len(dark)} probe source(s) could not be used "
+                f"({_sample(dark)}) -- their {sum(1 for e in m.untested if e.source in dark)} "
+                f"path(s) are UNKNOWN, not failed. Fix the login or the host "
+                f"first, then rerun phase 3.")
+        partial = sorted({e.source for e in m.untested} - set(dark)
+                         - set(m.pseudo_sources))
+        if partial:
+            result.notes.append(
+                f"{m.network}: {len(partial)} source(s) returned no result for "
+                f"some targets ({_sample(partial)}) -- those paths are UNKNOWN; "
+                f"the probe was probably cut off by its timeout")
         one_way = [h for h in m.unreachable_targets() if h not in isolated]
         if one_way:
             result.notes.append(
@@ -108,6 +127,21 @@ def run(orch: Orchestrator, nodes: Optional[Sequence[Node]] = None,
     result.duration = time.monotonic() - started
     result.finished_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     return result
+
+
+def _summary(m: MeshResult) -> str:
+    """'data: 3/4 tested paths ok, 2 untested (1 source unreachable)'."""
+    c = m.counts()
+    text = f"{m.network}: {c['ok']}/{c['tested']} tested paths ok"
+    if c["unknown"]:
+        text += f", {c['unknown']} untested"
+        if c["unreachable_sources"]:
+            text += f" ({c['unreachable_sources']} source(s) unreachable)"
+    if m.mtu_failures:
+        text += f", {len(m.mtu_failures)} jumbo-frame failure(s)"
+    if m.origin == "gateways":
+        text += " [from gateways]"
+    return text
 
 
 def _sample(hosts: Sequence[str], limit: int = 5) -> str:

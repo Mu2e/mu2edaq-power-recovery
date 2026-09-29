@@ -287,13 +287,48 @@ def test_a_healthy_fabric_passes(orch):
     assert data["failures"] == []
 
 
+def _no_replies(command):
+    """A completed probe in which every ping got nothing back."""
+    import re
+    parts = []
+    for target in re.findall(r"===BEGIN (\S+)===", command):
+        parts += [f"===BEGIN {target}===",
+                  "3 packets transmitted, 0 received, 100% packet loss, time 2040ms",
+                  f"===END {target}==="]
+    return ScriptedResponse(stdout="\n".join(parts))
+
+
 def test_an_isolated_node_is_identified(orch):
-    orch.ssh_factory.base.expect_first(r"===BEGIN ", ScriptedResponse(stdout=""))
+    # Marker-wrapped "0 received": the probe ran and the pings got no reply.
+    # Empty output would be an untested path (UNKNOWN), not an isolated node.
+    orch.ssh_factory.base.expect_first(r"===BEGIN ", _no_replies)
     result = phase3_network.run(orch, _nodes(orch, "mu2e-dl-01", "mu2e-dl-02"))
     assert result.status is Status.FAIL
     assert result.data["isolated_nodes"]
     # Notes are aggregated, not one per host.
     assert len(result.notes) < 10
+
+
+def test_a_probe_that_returns_nothing_is_unknown_not_failed(orch):
+    orch.ssh_factory.base.expect_first(r"===BEGIN ", ScriptedResponse(stdout=""))
+    result = phase3_network.run(orch, _nodes(orch, "mu2e-dl-01", "mu2e-dl-02"))
+    assert result.status is Status.UNKNOWN
+    assert result.data["isolated_nodes"] == []
+    for net in result.data["networks"]:
+        assert net["failures"] == []
+        assert net["counts"]["tested"] == 0
+        assert net["counts"]["unknown"] == net["edge_count"] > 0
+
+
+def test_ipmi_is_probed_from_the_gateways(orch):
+    result = phase3_network.run(orch, _nodes(orch, "mu2e-dl-01", "mu2e-dl-02"))
+    ipmi = next(n for n in result.data["networks"] if n["network"] == "ipmi")
+    assert ipmi["origin"] == "gateways"
+    assert {e["source"] for e in ipmi["edges"]} == set(
+        orch.topology.gateways("mc2"))
+    assert {e["target"] for e in ipmi["edges"]} == {
+        "mu2e-dl-01-ipmi.fnal.gov", "mu2e-dl-02-ipmi.fnal.gov"}
+    assert "[from gateways]" in result.summary
 
 
 def test_mesh_edges_come_back_in_a_stable_order(orch):

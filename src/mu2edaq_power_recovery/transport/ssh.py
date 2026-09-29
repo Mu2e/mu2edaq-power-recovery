@@ -212,6 +212,10 @@ class SSHTransport(Transport):
         login = user
         if login is None and credential is not None:
             login = getattr(credential, "login", None)
+        # "--" ends ssh's option parsing, so a destination can never be read
+        # as an option (a host beginning with '-', e.g. "-oProxyCommand=...").
+        # Every option -- config options, ConnectTimeout, -J -- precedes it.
+        argv.append("--")
         argv.append(self._target(login))
         # The remote side runs this through its login shell, so it must be a
         # single string; as_string() quotes a sequence safely.

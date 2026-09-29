@@ -94,7 +94,7 @@ Every requirement from `Project-Description.md`, and where it is met.
 | Output parsers | ✅ Complete | 20 | Real command output as fixtures; iputils/BSD/Windows |
 | Phase 1 assess | ✅ Complete | 7 | Read-only asserted by test; simulation hermeticity |
 | Phase 2 power on | ✅ Complete | 8 | Stage order, requirements, dry run |
-| Phase 3 network | ✅ Complete | 4 | Full mesh + MTU probe |
+| Phase 3 network | ✅ Complete | 7 + 24 mesh tests | Full mesh + MTU probe; IPMI from gateways; UNKNOWN vs FAIL per path |
 | Phase 4 report | ✅ Complete | 4 | Narrative derived from the store |
 | Run store | ✅ Complete | 8 | SQLite; Postgres by URL |
 | Report site | ✅ Complete | 20 | 9 pages + JSON companions |
@@ -552,6 +552,45 @@ by how much an operator would care.
   made here was wrong: on first run the extended guard caught
   `test_no_kerberos_package_means_no_service_identities` running the real
   `klist` via `operator_credential()` -> `ambient_principal()`.
+- ~~**Hostnames were interpolated unquoted into shell scripts.**~~ **Fixed (#9,
+  fix/network-checks).** `_ping_command()` and the phase-3 mesh script built
+  shell source from host names, and `Topology.resolve()` turned any `--node`
+  text into a Node, so `--node 'host; cmd'` reached a shell. Now
+  `topology.valid_hostname()` (DNS labels or an IPv4/IPv6 literal; no leading
+  `-`, whitespace, quotes or metacharacters) is enforced on every expanded name
+  at load and on every `resolve()` name (`TopologyError`); every target and
+  marker string is `shlex.quote`d as well; and the ssh argv puts `--` before the
+  destination. A valid name is unchanged by quoting, so the `===BEGIN <name>===`
+  markers still parse. On the phase path a bad `--node` exits 2 through
+  `main()`'s generic handler, after credentials are prepared and a run row is
+  opened; under `--list-nodes` it is an uncaught traceback (exit 1). Moving
+  `--node` resolution ahead of credentials is B5's (`cli.py`).
+- ~~**Phase 3 pinged BMCs from node operating systems.**~~ **Fixed (#19,
+  fix/network-checks).** Sources for the `ipmi` network were every node with
+  an `ipmi:` entry, but that entry names the BMC, on a subnet only the gateways
+  route to; a healthy IPMI network would have been reported broadly failed.
+  Mesh entries now take `origin: nodes|gateways` and `targets: all|anchors`
+  (defaults preserve the other networks); `ipmi` is `origin: gateways,
+  targets: all`, probed from each of `topology.gateways(location)` over a
+  direct session, with the gateway named as the edge source. `anchors:` may be
+  keyed by location. Tests use a fake that models routing (node OS -> BMC is
+  "Network is unreachable").
+- ~~**An unreachable mesh source was reported as failed paths.**~~ **Fixed (#20,
+  fix/network-checks).** `MeshEdge` had no unknown state, so an ssh failure on
+  one source made every edge from it FAIL and fed the isolation diagnosis.
+  Edges now carry `tested`; a source transport error, a raised probe, or
+  output without the target's BEGIN/END markers is UNKNOWN. A network is FAIL
+  only on a tested failure, else UNKNOWN if anything is untested -- except
+  that for `origin: gateways` coverage is per target: a BMC tested by either
+  gateway of its location is tested, so one dark gateway whose partner covered
+  every BMC gives the partner's verdict (OK/FAIL) with the dark one in
+  `unreachable_sources` and a note, and a location with BMC targets but no
+  gateway yields untested edges from `(no gateway: <loc>)` and a note, never a
+  silent OK (`uncovered_targets` in `counts`); isolated
+  nodes and unreachable targets use tested edges only; results carry
+  `counts` (tested/ok/failed/unknown/unreachable_sources) and
+  `unreachable_sources`, which the phase summary, notes and `network.html`
+  show.
 - **The displacement guard around a mint is best-effort, not a precondition.**
   `ticketsource.py:256-259` reads `before = self.default_principal()` and, when
   that returns `None`, logs a debug line and mints anyway;
@@ -612,7 +651,7 @@ by how much an operator would care.
 - Phase 3's full mesh on the data network is O(N²) SSH-bundled probes; at the
   present 49 data-network nodes that is 2352 ordered pairs, bundled into one
   session per source (49 sessions) — measured, not estimated: a simulated run
-  prints `data: 2352/2352 paths ok`. If the cluster grows substantially,
+  prints `data: 2352/2352 tested paths ok`. If the cluster grows substantially,
   consider anchoring it too.
 - `pytest` takes ~30 s, dominated by deliberate sweep timeouts. It was ~70 s
   until the simulated run stopped issuing real pings (§6.4).
@@ -663,7 +702,7 @@ Recorded here in brief; the reasoning is in [docs/DESIGN.md](docs/DESIGN.md).
 | 0 — self-update | ✅ | ✅ 13 | ✅ | ✅ fetch/up-to-date verified against origin |
 | 1 — assess | ✅ | ✅ 7 + 39 check tests | ✅ | ◐ SSH, Kerberos and BMC reads verified; no full phase run |
 | 2 — power on | ✅ | ✅ 8 + 43 IPMI tests | ✅ | ⬜ nothing has been switched on |
-| 3 — network | ✅ | ✅ 4 | ✅ | ⬜ |
+| 3 — network | ✅ | ✅ 7 + 24 mesh tests | ✅ | ⬜ |
 | 4 — report | ✅ | ✅ 4 + 20 report tests | ✅ | ⬜ |
 | Report site | ✅ | ✅ 20 | ✅ | ⬜ |
 | Diagnostics | ✅ | manual | ✅ | ✅ all four run against the live cluster |
