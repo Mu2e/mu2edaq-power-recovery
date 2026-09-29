@@ -48,7 +48,7 @@ cd mu2edaq-power-recovery
 ./bootstrap.sh
 . venv/bin/activate
 
-mu2e-power-recovery --version        # mu2edaq-power-recovery 0.1.0
+mu2e-power-recovery --version        # mu2edaq-power-recovery 0.2.0
 mu2e-power-recovery --list-checks    # the 25 registered checks
 mu2e-power-recovery --list-nodes     # what the tools think exists
 
@@ -83,7 +83,7 @@ commands each *are* their phase. Every driver takes `--version` and `--help`.
 
 | Phase | Command | What happens |
 |---|---|---|
-| 0 | *(automatic)* | Check GitHub for a newer revision, fast-forward, rebuild if needed, restart, print the version and config digest. |
+| 0 | *(automatic)* | Check GitHub for a newer revision, fast-forward, rebuild if needed, restart, print the version and config digest. A required rebuild that fails rolls the checkout back and the run continues on the old code. |
 | 1 | `mu2e-power-state` | **Read-only** survey of every node: reachability, logins, disks, mounts, interfaces, link speeds, services, PCIe, and chassis power from the BMC. Nothing is changed. |
 | 2 | `mu2e-power-on` | Power the cluster on in dependency order, verifying each stage before starting the next. Dry run unless this invocation authorises it (`--execute`). `--node` powers only the named nodes. |
 | 3 | `mu2e-power-netcheck` | Node-to-node connectivity across the lab, data and IPMI segments, with a jumbo-frame probe on the data network. |
@@ -439,7 +439,27 @@ no data network, but **its node list is empty** — MC-1 is not carried in
 `mu2edaq-operations/scripts/nodes_config.yaml`, which is the authoritative
 upstream inventory, so nothing could be imported. Add the hostnames and every
 phase picks MC-1 up with no code change. Until then the tools report it as
-having no nodes configured rather than as healthy.
+having no nodes configured rather than as healthy, and a phase run with
+`--location mc1` says so in its notes. `config/topology.yaml` carries commented
+templates and `inventory_source` / `owner` / `status: pending` metadata, and
+`config/power-sequence.yaml` a commented `location: mc1` stage. After filling it
+in, check it:
+
+```sh
+mu2e-node-inventory --validate          # exit 1 on errors, 0 with warnings; --json
+```
+
+On the shipped file that reports four warnings — mc1 empty, the IPMI subnet
+mc1 shares with mc2, the data subnet the teststand shares with mc2, and twelve
+MC-2 nodes (trk-15..18 among them) that no power-sequence stage covers.
+
+### One run at a time
+
+Every run that can act on hardware (phases 1–3 without `--simulate`) holds an
+exclusive OS lock on `logs/power-recovery.lock` (`run.lock_file`); a second one
+exits 2 naming the first. `python -m mu2edaq_power_recovery.runlock status`
+shows the holder. `stop-mu2edaq-power-recovery.sh` signals only the pid the
+held lock names, after checking its command line.
 
 ## Installation
 
@@ -483,7 +503,7 @@ between two runs has an explanation. See `man 3 libmu2eprobe`.
 ## Testing
 
 ```sh
-pytest                                              # 309 tests, no cluster needed
+pytest                                              # the full suite; no cluster needed
 mu2e-power-recovery --phase all --simulate          # end-to-end rehearsal
 ctest --test-dir build --output-on-failure          # all four ctest entries
 ```

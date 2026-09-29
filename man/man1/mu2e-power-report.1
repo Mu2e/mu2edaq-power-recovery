@@ -1,4 +1,4 @@
-.TH MU2E-POWER-REPORT 1 "2026-09-18" "mu2edaq-power-recovery 0.1.0" "Mu2e DAQ Operations"
+.TH MU2E-POWER-REPORT 1 "2026-09-29" "mu2edaq-power-recovery 0.2.0" "Mu2e DAQ Operations"
 .SH NAME
 mu2e-power-report \- phase 4: the consolidated recovery report
 .SH SYNOPSIS
@@ -171,7 +171,7 @@ Print the option summary and exit.
 .TP
 .B \-\-version
 Print
-.I mu2edaq-power-recovery 0.1.0
+.I mu2edaq-power-recovery 0.2.0
 and exit.
 .TP
 .BI \-\-config " FILE"
@@ -221,6 +221,22 @@ failures or unreachable nodes (or no node was assessed at all).
 No run could be found to report on: the store is empty, or
 .B \-\-run\-id
 names a run it does not hold.
+.I run.dry_run: false
+set only in configuration (YAML,
+.I config/.env
+or
+.BR MU2E_POWER_RECOVERY_RUN_DRY_RUN )
+without
+.B \-\-execute
+or the
+.B MU2E_POWER_RECOVERY_ARM
+token also exits 2 here, although this command issues no power command: the
+authorisation check is the same for every entry point
+(see
+.BR mu2e-power-recovery (1),
+.BR "LIVE RUNS" ).
+A report-only run does not take the run lock, so it can be run while a
+recovery is in progress.
 .SH EXAMPLES
 .RS
 .EX

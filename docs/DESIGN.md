@@ -409,6 +409,39 @@ Three deliberate conservatisms:
 - **It re-executes rather than pretending.** Python has already imported the
   modules that changed on disk, so continuing in-process would run the old code
   while claiming the new version.
+- **A failed required rebuild undoes the update (#21).** If the pull touched a
+  build input and `bootstrap.sh` fails, is missing or cannot start, re-executing
+  would run the new code against the old venv or native extension — turning a
+  working installation into a startup failure just before a recovery. The
+  checkout is reset to the full pre-update SHA (`--hard`, or `--keep` under
+  `allow_dirty`, which keeps local edits), nothing is re-executed, and the run
+  continues on the code it started with; a partly run bootstrap may still have
+  changed the venv, and the message says so. If the reset fails, the tree no
+  longer matches the process — which imports modules lazily from it — so the
+  run stops (exit 2). The `UpdateResult` goes into the run's provenance
+  (`version.selfupdate`).
+
+### The run lock
+
+A second concurrent run would drive the same BMCs from two directions. The
+start script's PID file could not prevent that safely: `exec` discards the
+shell's EXIT trap, so every normal run left the file behind, and a bare integer
+survives its process — after pid reuse `stop` would have signalled whatever now
+had that number (#12). The driver now holds an OS lock itself (`runlock.py`:
+`flock(LOCK_EX|LOCK_NB)` on POSIX, `msvcrt.locking` on Windows) from before
+phase 0 to the end of the run. Acquisition is atomic, so two simultaneous
+starts cannot both win, and the kernel drops the lock however the process ends,
+so nothing stale needs cleaning. The JSON record written into the file
+(`pid`, `started_at`, `cmdline`, `host`) is information, not authority:
+`runlock pid` prints it only while the lock is held, and the stop scripts
+re-check the process's command line before each signal. The file is never
+deleted — unlinking a lock file lets a second process lock the old inode while
+a third creates a new one. Only invocations that can reach hardware take it
+(phases 1–3, not `--simulate`); rehearsals, listings and report regeneration
+must stay usable during a real run. The lock is dropped immediately before the
+phase-0 `execve` and re-taken by the new process, which keeps the pid; the
+instant between is accepted rather than relying on descriptor inheritance
+across `exec`, which `msvcrt` cannot provide.
 
 ### Phase 1 — assess
 
@@ -729,6 +762,8 @@ needs an answer that does not involve reading four files.
 | Startup *warning* on the default credential cache (it does not stop the run) | A whole run attempted as `mu2eraw`, with nothing to say why |
 | A credential rejection stops IPMI for the run | Locking out 45 BMC accounts with one wrong password |
 | `Publisher` refuses to publish under `--simulate` | A rehearsal overwriting the live report |
+| Run lock held by the driver; stop scripts signal only a held lock's pid after checking its command line | Two runs interleaving power commands; a stale pid file killing an unrelated process |
+| A failed required rebuild rolls the checkout back and does not re-exec | New code started against an old environment just before a recovery |
 
 The protected-host refusal is not overridable by any flag. That is the one
 place where the tool declines to do what it is told, and it is deliberate:

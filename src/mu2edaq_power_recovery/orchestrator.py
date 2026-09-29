@@ -23,7 +23,7 @@ from .checks import (CheckContext, CheckResult, NEEDS_ROOT, Status,
 from .creds import KerberosError, KerberosManager, VaultCredentials, VaultError
 from .creds.bootstrap import credential_session
 from .state import RunStore
-from .topology import Node, Topology
+from .topology import Node, Topology, TopologyError
 from .transport import (CredentialBreaker, FakeTransport, IPMIClient,
                         LocalTransport, PowerState, SSHFactory,
                         healthy_node_rules)
@@ -216,6 +216,29 @@ class Orchestrator:
     @property
     def locations(self) -> List[str]:
         return list(self.settings.get("topology.locations", ["mc2"]))
+
+    def empty_location_notes(self) -> List[str]:
+        """One note per requested location that has no nodes configured.
+
+        Phases 1-3 carry these so a run over, say, ``--location mc1`` says
+        in its own report that it covered nothing there, instead of an
+        empty table that reads as "nothing wrong" (#25).
+        """
+        notes: List[str] = []
+        for location in self.locations:
+            try:
+                if self.topology.nodes(location):
+                    continue
+                info = self.topology.location_info(location)
+            except TopologyError:
+                continue
+            status = info.get("status")
+            notes.append(
+                f"no nodes configured for {location}"
+                + (f" (inventory status: {status})" if status else "")
+                + " -- nothing there was checked; see config/topology.yaml "
+                  "and mu2e-node-inventory --validate")
+        return notes
 
     def nodes(self, names: Optional[Sequence[str]] = None) -> List[Node]:
         """The nodes this run operates on."""

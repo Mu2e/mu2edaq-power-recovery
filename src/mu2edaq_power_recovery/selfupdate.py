@@ -16,6 +16,10 @@ Three constraints shape the implementation:
   imported the modules that just changed on disk, so the driver re-executes
   itself once (with a guard variable to make that exactly once) instead of
   pretending the update took effect.
+* An update whose required rebuild fails is not an update.  The checkout is
+  reset to the revision it started at and the process carries on without
+  re-executing (#21); if even the reset fails, the driver stops with exit 2
+  rather than run old code against a new tree.
 """
 from __future__ import annotations
 
@@ -52,23 +56,49 @@ class UpdateResult:
     changed_files: List[str] = field(default_factory=list)
     messages: List[str] = field(default_factory=list)
     needs_reexec: bool = False
+    #: The pull touched a build input (selfupdate.rebuild_globs).
+    rebuild_required: bool = False
+    #: A required rebuild failed, so the update was abandoned (#21).
+    update_failed: bool = False
+    #: ... and the checkout was reset to :attr:`before`.
+    rolled_back: bool = False
+    #: ... but the reset itself failed: the checkout is at :attr:`attempted`
+    #: while this process runs :attr:`before`'s code. The driver exits 2.
+    reset_failed: bool = False
+    #: The revision the abandoned update fast-forwarded to.
+    attempted: Optional[str] = None
 
     def as_dict(self) -> Dict[str, Any]:
         return {"checked": self.checked, "updated": self.updated,
                 "rebuilt": self.rebuilt, "before": self.before, "after": self.after,
                 "behind": self.behind, "ahead": self.ahead, "dirty": self.dirty,
+                "rebuild_required": self.rebuild_required,
+                "update_failed": self.update_failed,
+                "rolled_back": self.rolled_back,
+                "reset_failed": self.reset_failed,
+                "attempted": self.attempted,
+                "needs_reexec": self.needs_reexec,
                 "changed_files": self.changed_files[:50],
                 "messages": self.messages}
 
     def summary(self) -> str:
         if not self.checked:
             return "update check skipped"
+        if self.update_failed:
+            return (f"update to {_short(self.attempted)} abandoned (rebuild "
+                    f"failed); "
+                    + (f"rolled back to {_short(self.before)}"
+                       if self.rolled_back else "ROLLBACK FAILED"))
         if self.updated:
-            return (f"updated {self.before} -> {self.after}"
+            return (f"updated {_short(self.before)} -> {_short(self.after)}"
                     + (" and rebuilt" if self.rebuilt else ""))
         if self.behind:
             return f"{self.behind} commit(s) behind but not updated"
         return "already up to date"
+
+
+def _short(sha: Optional[str]) -> str:
+    return (sha or "?")[:12]
 
 
 class SelfUpdater:
@@ -116,7 +146,9 @@ class SelfUpdater:
             return out
 
         out.checked = True
-        out.before = self._out("rev-parse", "--short", "HEAD") or None
+        # The full SHA: it is what a rollback resets to, and what the run's
+        # provenance records (a short one can become ambiguous).
+        out.before = self._out("rev-parse", "HEAD") or None
         branch = (self.settings.get("selfupdate.branch")
                   or self._out("rev-parse", "--abbrev-ref", "HEAD"))
         if not branch or branch == "HEAD":
@@ -177,15 +209,70 @@ class SelfUpdater:
             return out
 
         out.updated = True
-        out.after = self._out("rev-parse", "--short", "HEAD") or None
-        out.messages.append(f"fast-forwarded {out.before} -> {out.after} "
-                            f"({out.behind} commit(s))")
+        out.after = self._out("rev-parse", "HEAD") or None
+        out.messages.append(f"fast-forwarded {_short(out.before)} -> "
+                            f"{_short(out.after)} ({out.behind} commit(s))")
         log.info(out.messages[-1])
 
         if self.needs_rebuild(out.changed_files):
+            out.rebuild_required = True
             out.rebuilt = self.rebuild()
+            if not out.rebuilt:
+                # The new code's declared build inputs were not applied, so
+                # re-executing into it would run it against the old venv or
+                # native extension -- a working installation turned into a
+                # startup failure just before a recovery (#21).
+                self._roll_back(out)
+                return out
         out.needs_reexec = True
         return out
+
+    def _roll_back(self, out: UpdateResult) -> None:
+        """Abandon the update: put the checkout back at ``out.before``.
+
+        ``--hard`` on a clean tree; ``--keep`` when the tree was dirty under
+        ``allow_dirty``, which keeps the operator's local edits (and refuses
+        rather than overwrite one). Either way this process carries on with
+        the code it started with. If the reset fails the checkout no longer
+        matches the running code -- which still imports modules lazily from
+        disk -- so ``reset_failed`` is set and the driver stops.
+        """
+        out.update_failed = True
+        out.attempted = out.after
+        out.needs_reexec = False
+        mode = "--keep" if out.dirty else "--hard"
+        detail = ""
+        try:
+            proc = self._git("reset", "--quiet", mode, str(out.before))
+            ok = proc.returncode == 0 and bool(out.before)
+            if not ok:
+                lines = proc.stderr.decode("utf-8", "replace").strip().splitlines()
+                detail = lines[-1] if lines else f"git exited {proc.returncode}"
+        except (OSError, subprocess.SubprocessError) as exc:
+            ok = False
+            detail = str(exc)
+        if ok:
+            out.rolled_back = True
+            out.after = out.before
+            out.messages.append(
+                f"the rebuild this update requires failed, so the update to "
+                f"{_short(out.attempted)} was abandoned: the checkout was reset "
+                f"({mode}) to {_short(out.before)} and this run continues on the "
+                f"code it started with, not re-executed. Run ./bootstrap.sh by "
+                f"hand and read its output before the next run; a partly run "
+                f"bootstrap may already have changed the virtual environment "
+                f"(venv/) this run uses.")
+            log.error(out.messages[-1])
+            return
+        out.reset_failed = True
+        out.messages.append(
+            f"the rebuild this update requires failed, and rolling the checkout "
+            f"back to {_short(out.before)} failed too ({detail}). The checkout "
+            f"is at {_short(out.attempted)} while this process runs "
+            f"{_short(out.before)}'s code, which still imports modules from "
+            f"disk; refusing to continue. Restore it by hand (git reset "
+            f"{mode} {out.before}) or run ./bootstrap.sh, then start again.")
+        log.error(out.messages[-1])
 
     # -- rebuild -----------------------------------------------------------
 
@@ -210,7 +297,7 @@ class SelfUpdater:
         """
         script = self.root / ("bootstrap.ps1" if os.name == "nt" else "bootstrap.sh")
         if not script.exists():
-            log.warning("no bootstrap script at %s; skipping rebuild", script)
+            log.warning("no bootstrap script at %s; the required rebuild cannot run", script)
             return False
         cmd = (["powershell", "-ExecutionPolicy", "Bypass", "-File", str(script)]
                if os.name == "nt" else [str(script)])
@@ -222,7 +309,7 @@ class SelfUpdater:
             log.error("rebuild failed to start: %s", exc)
             return False
         if proc.returncode != 0:
-            log.error("rebuild exited %s -- continuing with the existing build",
+            log.error("rebuild exited %s; the update will be rolled back",
                       proc.returncode)
             return False
         return True

@@ -65,6 +65,8 @@ DEFAULTS: Dict[str, Any] = {
         "phase_timeout": 7200,
         "from_stage": None,
         "until_stage": None,
+        # The single-run lock (runlock.py), relative to the project root.
+        "lock_file": "logs/power-recovery.lock",
     },
     "topology": {
         "file": "topology.yaml",

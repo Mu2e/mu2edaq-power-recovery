@@ -16,6 +16,6 @@ Each phase writes its own page into the static report site; re-running a
 phase refreshes that page in place.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 __author__ = "A. Norman"
 __all__ = ["__version__"]

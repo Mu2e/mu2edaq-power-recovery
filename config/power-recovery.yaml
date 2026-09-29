@@ -36,6 +36,13 @@ run:
   # A name that is not a stage (or a reversed range) is an error, exit 2.
   from_stage: null
   until_stage: null
+  # The single-run lock. Every run that can act on hardware (phases 1-3, not
+  # --simulate) takes an exclusive OS lock on this file before phase 0; a
+  # second such run exits 2 naming the holder. The JSON record inside
+  # ({pid, started_at, cmdline, host}) is only believed while the lock is
+  # held, and the file is left in place afterwards. Relative to the project
+  # root. Inspect with:  python -m mu2edaq_power_recovery.runlock status
+  lock_file: logs/power-recovery.lock
 
 topology:
   file: topology.yaml

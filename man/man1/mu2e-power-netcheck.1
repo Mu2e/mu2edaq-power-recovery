@@ -1,4 +1,4 @@
-.TH MU2E-POWER-NETCHECK 1 "2026-09-18" "mu2edaq-power-recovery 0.1.0" "Mu2e DAQ Operations"
+.TH MU2E-POWER-NETCHECK 1 "2026-09-29" "mu2edaq-power-recovery 0.2.0" "Mu2e DAQ Operations"
 .SH NAME
 mu2e-power-netcheck \- phase 3: inter-node connectivity across the DAQ networks
 .SH SYNOPSIS
@@ -176,7 +176,7 @@ Print the option summary and exit.
 .TP
 .B \-\-version
 Print
-.I mu2edaq-power-recovery 0.1.0
+.I mu2edaq-power-recovery 0.2.0
 and exit.
 .TP
 .BI \-\-config " FILE"
@@ -233,6 +233,23 @@ At least one path failed (FAIL), or at least one path could not be tested
 The probe could not start, or a
 .B \-\-node
 name is not a valid hostname.
+.I run.dry_run: false
+set only in configuration (YAML,
+.I config/.env
+or
+.BR MU2E_POWER_RECOVERY_RUN_DRY_RUN )
+without
+.B \-\-execute
+or the
+.B MU2E_POWER_RECOVERY_ARM
+token also exits 2 here, although this command issues no power command: the
+authorisation check is the same for every entry point
+(see
+.BR mu2e-power-recovery (1),
+.BR "LIVE RUNS" ).
+Another run holds the run lock
+.RI ( run.lock_file )
+also exits 2, naming the holder.
 .SH EXAMPLES
 .RS
 .EX

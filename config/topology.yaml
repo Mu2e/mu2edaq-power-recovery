@@ -145,10 +145,26 @@ locations:
   # upstream inventory, so nothing could be imported.  Add the hostnames
   # below and every phase will pick MC-1 up with no code change; until then
   # the tools report MC-1 as "no nodes configured" rather than as healthy.
+  #
+  # Filling it in (#25): record where the list came from and who owns it, add
+  # the hosts, then run  mu2e-node-inventory --validate  (it flags BMCs with no
+  # lab host, subnets shared with another location, gateways or protected
+  # hosts that are not in the inventory, and nodes no power-sequence stage
+  # covers) and a read-only  mu2e-power-state --location mc1  before adding
+  # mc1 to power-recovery.yaml topology.locations. Until then mc1 is only
+  # reached with an explicit --location mc1.
+  #
+  # The ipmi subnet below is the same as MC-2's (192.168.157.0/24) and the
+  # validator reports it as shared; confirm or correct it with the network
+  # owner when the inventory arrives.
   # ==========================================================================
   mc1:
     label: MC-1
     description: MC-1 building computing centre (inventory pending)
+    # Provenance metadata. Not used by any phase; reported by --validate.
+    inventory_source: none identified -- not in mu2edaq-operations/scripts/nodes_config.yaml
+    owner: TBD (Mu2e DAQ operations)
+    status: pending
     gateways:
       # Reached through the MC-2 gateways until MC-1 gets its own.
       - mu2egateway01.fnal.gov
@@ -159,6 +175,19 @@ locations:
     networks:
       lab: []
       ipmi: []
+      # Template -- uncomment and replace with the real MC-1 hosts. Same
+      # syntax as mc2 above; the BMC list must name only hosts that are also
+      # on lab, or --validate reports "BMC with no lab host".
+      #
+      # lab:
+      #   - mu2e-mc1-gw-01.fnal.gov                 # hypothetical names
+      #   - {category: mc1node, start: 1, end: 8}
+      # ipmi:
+      #   - {category: mc1node, start: 1, end: 8, suffix: -ipmi}
+      #
+      # A new host class needs a roles: entry above, and a check profile in
+      # checks.yaml if the existing ones do not fit. New protected hosts go in
+      # protected: at the top of this file.
 
   # ==========================================================================
   # Teststand -- Helen Edwards Engineering Center (HEERC).

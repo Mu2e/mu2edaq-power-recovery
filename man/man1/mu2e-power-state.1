@@ -1,4 +1,4 @@
-.TH MU2E-POWER-STATE 1 "2026-09-18" "mu2edaq-power-recovery 0.1.0" "Mu2e DAQ Operations"
+.TH MU2E-POWER-STATE 1 "2026-09-29" "mu2edaq-power-recovery 0.2.0" "Mu2e DAQ Operations"
 .SH NAME
 mu2e-power-state \- phase 1: read-only survey of the Mu2e DAQ clusters
 .SH SYNOPSIS
@@ -150,7 +150,7 @@ Print the option summary and exit.
 .TP
 .B \-\-version
 Print
-.I mu2edaq-power-recovery 0.1.0
+.I mu2edaq-power-recovery 0.2.0
 and exit.
 .TP
 .BI \-\-config " FILE"
@@ -196,6 +196,23 @@ At least one node failed a check or could not be reached.
 .TP
 .B 2
 The survey could not start, or no gateway could be logged in to.
+.I run.dry_run: false
+set only in configuration (YAML,
+.I config/.env
+or
+.BR MU2E_POWER_RECOVERY_RUN_DRY_RUN )
+without
+.B \-\-execute
+or the
+.B MU2E_POWER_RECOVERY_ARM
+token also exits 2 here, although this command issues no power command: the
+authorisation check is the same for every entry point
+(see
+.BR mu2e-power-recovery (1),
+.BR "LIVE RUNS" ).
+Another run holds the run lock
+.RI ( run.lock_file )
+also exits 2, naming the holder.
 .SH EXAMPLES
 .RS
 .EX

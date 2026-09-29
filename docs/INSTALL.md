@@ -133,7 +133,11 @@ The start and stop scripts have PowerShell equivalents.
 `start-mu2edaq-power-recovery.ps1` passes every argument straight through to
 `mu2e-power-recovery` and runs the read-only survey with none.
 `stop-mu2edaq-power-recovery.ps1` takes `-Status` (report, change nothing),
-`-Force` (kill at once rather than waiting) and `-Grace <seconds>` (default 30).
+`-Force` (kill at once rather than waiting), `-Grace <seconds>` (default 30)
+and `-LockFile <path>`. Neither script keeps a PID file: the driver holds a
+lock on `logs\power-recovery.lock`, and the stop script takes the driver's pid
+from `python -m mu2edaq_power_recovery.runlock pid` and checks its command line
+with `Get-CimInstance Win32_Process` before stopping it.
 
 ## Full CMake build
 
@@ -195,7 +199,7 @@ Run these in order. None of them changes anything.
 
 ```sh
 # 1. the package is installed and the entry points resolve
-mu2e-power-recovery --version           # mu2edaq-power-recovery 0.1.0
+mu2e-power-recovery --version           # mu2edaq-power-recovery 0.2.0
 
 # 2. the tools start, and the inventory parses
 mu2e-node-inventory -l mc2
@@ -209,7 +213,7 @@ mu2e-power-recovery --phase all --simulate
 # 5. the report renders
 open html/index.html            # or xdg-open, or start
 
-# 6. the test suite  (309 tests, ~30 s)
+# 6. the test suite  (650+ tests, about a minute; no cluster needed)
 pytest
 
 # 7. Vault holds what the tools expect (needs a Vault token)

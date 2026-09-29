@@ -61,7 +61,7 @@ int mu2e_probe_many(const char* const* hosts, size_t count,
 /* Human-readable name for an outcome code. */
 const char* mu2e_probe_outcome_name(int outcome);
 
-/* Library version string, e.g. "0.1.0". */
+/* Library version string, e.g. "0.2.0". */
 const char* mu2e_probe_version(void);
 
 /* Non-zero when compiled with OpenMP. */

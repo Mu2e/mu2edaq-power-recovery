@@ -30,7 +30,8 @@ from .logsetup import configure as configure_logging
 from .orchestrator import Orchestrator
 from .phases import phase1_assess, phase2_poweron, phase3_network, phase4_report
 from .report import Publisher, ReportWriter
-from .selfupdate import SelfUpdater
+from .runlock import DEFAULT_LOCK_FILE, LockError, RunLock
+from .selfupdate import SelfUpdater, UpdateResult
 from .phases.phase2_poweron import SequenceSelectionError, plan_sequence
 from .settings import ARM_ENV, ConfigError, load as load_settings
 from .topology import TopologyError
@@ -83,8 +84,15 @@ exit status
   1  a phase completed but one or more nodes failed their checks
   2  the run could not start (configuration, credentials, no gateway,
      live-run authorisation, stage or node selection, a --run-id that is
-     not in the store), or it stopped on an internal error
+     not in the store, another run holding the run lock, a failed update
+     that could not be rolled back), or it stopped on an internal error
   3  interrupted by the operator
+
+run lock
+  Phases 1-3 run for real (not --simulate) take an exclusive lock on
+  run.lock_file (logs/power-recovery.lock) before phase 0; a second such run
+  exits 2 naming the holder. --simulate, --list-* and report-only runs do not.
+  python -m mu2edaq_power_recovery.runlock status   shows the holder.
 """
 
 
@@ -397,11 +405,18 @@ def _stderr_target() -> Any:
         return subprocess.DEVNULL
 
 
-def do_self_update(settings: Any, out: Any = None, as_json: bool = False) -> None:
+def do_self_update(settings: Any, out: Any = None, as_json: bool = False,
+                   lock: Optional[RunLock] = None) -> UpdateResult:
     """Run the update check and, if it changed anything, restart this process.
 
     Under --json the messages go to *out* (stderr) and so does the rebuild's
     own output, so stdout stays a single JSON document.
+
+    The run lock is released immediately before the re-exec; the new process
+    takes it again through the normal path (pid identity is preserved by
+    exec, and the record is rewritten). Returns the result, which the run
+    records in its provenance; a result with ``reset_failed`` set means the
+    caller must stop (exit 2).
     """
     out = out or sys.stdout
     updater = SelfUpdater(settings, stdout=_stderr_target() if as_json else None)
@@ -409,7 +424,10 @@ def do_self_update(settings: Any, out: Any = None, as_json: bool = False) -> Non
     for message in result.messages:
         print(f"  update: {message}", file=out)
     if result.needs_reexec:
+        if lock is not None:
+            lock.release()
         updater.reexec()   # never returns
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -703,9 +721,46 @@ def _main(args: argparse.Namespace, out: Any, data_out: Any,
         except LiveAuthorizationError as exc:
             return fail(str(exc))
 
+    # --- the run lock -----------------------------------------------------
+    # Only an invocation that can act on hardware takes it: phases 1-3 for
+    # real. A rehearsal, a listing or a report regeneration contacts nothing
+    # that another run could be driving, and must stay usable while a real
+    # run is in progress. Taken before phase 0, so two starts cannot both
+    # update the checkout either.
+    lock: Optional[RunLock] = None
+    if needs_run_lock(args, phase_names):
+        lock = RunLock(settings.resolve_path(
+            settings.get("run.lock_file") or DEFAULT_LOCK_FILE))
+        try:
+            lock.acquire()
+        except LockError as exc:
+            return fail(str(exc))
+    try:
+        return _run(args, settings, authorization, lock, phase_names,
+                    report_only, out, data_out, doc, fail)
+    finally:
+        if lock is not None:
+            lock.release()
+
+
+def needs_run_lock(args: argparse.Namespace, phase_names: Sequence[str]) -> bool:
+    """True for the invocations that can act on hardware (#12)."""
+    if args.simulate or args.list_nodes or args.list_checks:
+        return False
+    return any(name in ("assess", "poweron", "network") for name in phase_names)
+
+
+def _run(args: argparse.Namespace, settings: Any,
+         authorization: Optional[Authorization], lock: Optional[RunLock],
+         phase_names: Sequence[str], report_only: bool, out: Any,
+         data_out: Any, doc: Dict[str, Any], fail: Any) -> int:
+    """Everything after the lock: phase 0, then the run itself."""
     # --- phase 0 ----------------------------------------------------------
+    update: Optional[UpdateResult] = None
     if not args.simulate:
-        do_self_update(settings, out, args.json)
+        update = do_self_update(settings, out, args.json, lock=lock)
+        if update.reset_failed:
+            return fail(update.messages[-1])
 
     # --- banner -----------------------------------------------------------
     try:
@@ -799,7 +854,8 @@ def _main(args: argparse.Namespace, out: Any, data_out: Any,
             rid = orch.store.start_run(
                 label=settings.get("run.label") or default_label(),
                 dry_run=bool(settings.get("run.dry_run", True)),
-                version=orch.version.as_dict(),
+                version=dict(orch.version.as_dict(),
+                             selfupdate=update.as_dict() if update else None),
                 settings=settings.redacted(),
             )
             if authorization is not None and authorization.live:

@@ -10,7 +10,7 @@ write the tools, at an hour when they would rather not be.
 ```sh
 cd mu2edaq-power-recovery
 git pull && ./bootstrap.sh
-pytest                                          # 309 tests, should be all green
+pytest                                          # the full suite, should be all green
 mu2e-power-recovery --phase all --simulate      # full rehearsal, contacts nothing
 open html/index.html                            # check the report looks right
 ```
@@ -509,6 +509,25 @@ mu2e-power-state --node mu2e-trk-03 -v
 
 On Windows the equivalents are `stop-mu2edaq-power-recovery.ps1 -Status`,
 `-Force` and `-Grace <seconds>` (default 30).
+
+**One hardware-facing run at a time.** Phases 1–3 run for real (not
+`--simulate`) take an exclusive lock on `logs/power-recovery.lock`
+(`run.lock_file`) before phase 0. A second such run exits 2 with
+`another recovery run holds the run lock ...: pid N on host H, started T,
+command: ...`. A rehearsal, `--list-*` and `mu2e-power-report` never take it,
+so they work while a recovery is in progress. There is no PID file to clean
+up: the kernel releases the lock however the run ends, and the file with its
+last record is left in place on purpose.
+
+```sh
+python -m mu2edaq_power_recovery.runlock status   # holder, or "not running (stale record: ...)"
+```
+
+The stop scripts signal only the pid that command reports *while the lock is
+held*, and only if that process's command line is still the driver's. A stale
+record naming a live process (a reused pid) is reported as "no recovery run is
+active" and nothing is signalled; a holder whose command line is not the
+driver's is refused with exit 1.
 
 **SIGTERM is a clean stop; SIGKILL is not.** The driver's SIGTERM handler
 raises the same KeyboardInterrupt as Ctrl-C. Mid-phase, the worker pool is shut

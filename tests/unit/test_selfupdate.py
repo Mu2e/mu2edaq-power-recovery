@@ -6,6 +6,7 @@ branch, and never let a network problem stop the run.
 """
 from __future__ import annotations
 
+import json
 import subprocess
 
 import pytest
@@ -136,3 +137,175 @@ def test_the_reexec_guard_prevents_a_second_check(settings, repo, monkeypatch):
 ])
 def test_rebuild_is_triggered_only_by_build_inputs(settings, repo, changed, expected):
     assert SelfUpdater(settings, root=repo).needs_rebuild(changed) is expected
+
+
+# ---------------------------------------------------------------------------
+# #21: a required rebuild that fails abandons the update
+# ---------------------------------------------------------------------------
+
+
+def _git(repo, *args):
+    return subprocess.run(["git", "-C", str(repo), *args], check=True,
+                          stdout=subprocess.PIPE).stdout.decode().strip()
+
+
+def advance_origin_with(repo, files, message="update"):
+    """Commit *files* ({path: text or (text, mode)}) to origin."""
+    clone = repo.parent / f"other-{abs(hash(message)) % 10000}"
+    subprocess.run(["git", "clone", "-q", "-b", "main", str(repo.parent / "origin"),
+                    str(clone)], check=True)
+    for key, value in (("user.email", "t@example.invalid"), ("user.name", "Test")):
+        subprocess.run(["git", "-C", str(clone), "config", key, value], check=True)
+    for name, content in files.items():
+        text, mode = content if isinstance(content, tuple) else (content, 0o644)
+        target = clone / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text)
+        target.chmod(mode)
+    subprocess.run(["git", "-C", str(clone), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(clone), "commit", "-qm", message], check=True)
+    subprocess.run(["git", "-C", str(clone), "push", "-q", "origin", "HEAD:main"],
+                   check=True)
+    return _git(clone, "rev-parse", "HEAD")
+
+
+def _assert_rolled_back(result, repo, before, attempted):
+    assert _git(repo, "rev-parse", "HEAD") == before
+    assert result.update_failed and result.rolled_back
+    assert not result.reset_failed
+    assert not result.needs_reexec
+    assert result.before == before and result.after == before
+    assert result.attempted == attempted
+    assert "./bootstrap.sh" in result.messages[-1]
+    assert "partly run bootstrap" in result.messages[-1]
+    data = result.as_dict()
+    for key in ("update_failed", "rolled_back", "attempted", "reset_failed",
+                "rebuild_required"):
+        assert key in data
+
+
+def test_the_pre_update_sha_is_recorded_in_full(settings, repo):
+    advance_origin(repo)
+    before = _git(repo, "rev-parse", "HEAD")
+    result = SelfUpdater(settings, root=repo).run()
+    assert result.before == before and len(before) == 40
+    assert result.after == _git(repo, "rev-parse", "HEAD")
+
+
+@pytest.mark.parametrize("changed", ["pyproject.toml", "requirements.txt",
+                                     "src/cpp/x.cpp"])
+def test_a_failed_rebuild_rolls_the_checkout_back(settings, repo, monkeypatch,
+                                                  changed):
+    before = _git(repo, "rev-parse", "HEAD")
+    attempted = advance_origin_with(repo, {changed: "new\n"}, message=changed)
+    monkeypatch.setattr(SelfUpdater, "rebuild", lambda self: False)
+    result = SelfUpdater(settings, root=repo).run()
+    assert result.rebuild_required
+    _assert_rolled_back(result, repo, before, attempted)
+    assert not (repo / changed).exists()
+
+
+def test_a_bootstrap_that_exits_1_rolls_back(settings, repo):
+    before = _git(repo, "rev-parse", "HEAD")
+    attempted = advance_origin_with(repo, {
+        "bootstrap.sh": ("#!/bin/sh\nexit 1\n", 0o755),
+        "requirements.txt": "newdep\n"}, message="bootstrap-fails")
+    result = SelfUpdater(settings, root=repo, stdout=subprocess.DEVNULL).run()
+    _assert_rolled_back(result, repo, before, attempted)
+
+
+def test_a_missing_bootstrap_rolls_back(settings, repo):
+    before = _git(repo, "rev-parse", "HEAD")
+    attempted = advance_origin_with(repo, {"requirements.txt": "newdep\n"},
+                                    message="no-bootstrap")
+    assert not (repo / "bootstrap.sh").exists()
+    result = SelfUpdater(settings, root=repo).run()
+    _assert_rolled_back(result, repo, before, attempted)
+
+
+def test_a_dirty_tree_under_allow_dirty_rolls_back_with_keep(settings, repo,
+                                                             monkeypatch):
+    settings.set("selfupdate.allow_dirty", True)
+    (repo / "README.md").write_text("operator's local edit\n")
+    before = _git(repo, "rev-parse", "HEAD")
+    attempted = advance_origin_with(repo, {"pyproject.toml": "x\n"}, message="dirty")
+    monkeypatch.setattr(SelfUpdater, "rebuild", lambda self: False)
+    calls = []
+    real = SelfUpdater._git
+
+    def spy(self, *args, **kwargs):
+        calls.append(args)
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(SelfUpdater, "_git", spy)
+    result = SelfUpdater(settings, root=repo).run()
+    _assert_rolled_back(result, repo, before, attempted)
+    assert any(a[:1] == ("reset",) and "--keep" in a for a in calls)
+    assert (repo / "README.md").read_text() == "operator's local edit\n"
+
+
+def test_a_failed_reset_is_reported_for_exit_2(settings, repo, monkeypatch):
+    advance_origin_with(repo, {"pyproject.toml": "x\n"}, message="reset-fails")
+    monkeypatch.setattr(SelfUpdater, "rebuild", lambda self: False)
+    real = SelfUpdater._git
+
+    def failing_reset(self, *args, **kwargs):
+        if args[:1] == ("reset",):
+            return subprocess.CompletedProcess(args, 128, b"", b"fatal: nope\n")
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(SelfUpdater, "_git", failing_reset)
+    result = SelfUpdater(settings, root=repo).run()
+    assert result.reset_failed and result.update_failed
+    assert not result.rolled_back and not result.needs_reexec
+    assert "refusing to continue" in result.messages[-1]
+
+
+def test_a_successful_rebuild_still_reexecs(settings, repo, monkeypatch):
+    advance_origin_with(repo, {"pyproject.toml": "x\n"}, message="ok")
+    monkeypatch.setattr(SelfUpdater, "rebuild", lambda self: True)
+    result = SelfUpdater(settings, root=repo).run()
+    assert result.rebuilt and result.needs_reexec and not result.update_failed
+
+
+def test_the_driver_exits_2_when_the_rollback_failed(monkeypatch, capsys, tmp_path):
+    from mu2edaq_power_recovery import cli
+    from mu2edaq_power_recovery.selfupdate import UpdateResult
+    failed = UpdateResult(checked=True, update_failed=True, reset_failed=True,
+                          messages=["rolling back failed; refusing to continue"])
+    monkeypatch.setattr(SelfUpdater, "run", lambda self: failed)
+    code = cli.main(["--phase", "assess", "-q",
+                     "--database-url", f"sqlite:///{tmp_path / 'x.db'}"])
+    assert code == 2
+    assert "refusing to continue" in capsys.readouterr().err
+    assert not (tmp_path / "x.db").exists()
+
+
+def test_the_update_result_is_recorded_in_run_provenance(monkeypatch, tmp_path):
+    """The run row's version carries what phase 0 did (#21)."""
+    import sqlite3
+    from mu2edaq_power_recovery import cli
+    from mu2edaq_power_recovery.orchestrator import Orchestrator
+    from mu2edaq_power_recovery.selfupdate import UpdateResult
+    rolled = UpdateResult(checked=True, update_failed=True, rolled_back=True,
+                          before="a" * 40, after="a" * 40, attempted="b" * 40,
+                          messages=["rolled back"])
+    monkeypatch.setattr(SelfUpdater, "run", lambda self: rolled)
+    # A real (non-simulated) run is needed for phase 0 to happen; answer it
+    # from the simulator underneath so nothing is contacted.
+    real_init = Orchestrator.__init__
+
+    def simulated(self, settings, simulate=False, **kw):
+        real_init(self, settings, simulate=True, **kw)
+
+    monkeypatch.setattr(Orchestrator, "__init__", simulated)
+    db = tmp_path / "prov.db"
+    cli.main(["--phase", "assess", "-q", "--node", "mu2e-trk-01",
+              "--database-url", f"sqlite:///{db}",
+              "--output-dir", str(tmp_path / "html"), "--no-report"])
+    row = sqlite3.connect(str(db)).execute(
+        "select version from runs order by id desc limit 1").fetchone()
+    version = json.loads(row[0])
+    assert version["selfupdate"]["rolled_back"] is True
+    assert version["selfupdate"]["attempted"] == "b" * 40
+    assert version["selfupdate"]["after"] == "a" * 40

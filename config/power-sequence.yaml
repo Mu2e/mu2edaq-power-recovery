@@ -98,3 +98,17 @@ stages:
       - {category: calo, start: 1, end: 11}
       - mu2e-stm-01.fnal.gov
       - mu2e-stm-02.fnal.gov
+
+  # --- MC-1 (template; the inventory is pending, #25) ------------------------
+  # Uncomment once config/topology.yaml lists the MC-1 hosts. Stages run in
+  # file order, so an MC-1 stage placed here follows the MC-2 readout; with
+  # --location mc2 it is dropped, with --location mc1 the MC-2 stages are.
+  # mu2e-node-inventory --validate reports inventory nodes no stage covers.
+  #
+  # - name: mc1-nodes
+  #   title: MC-1 nodes
+  #   location: mc1
+  #   checks: other
+  #   require: majority
+  #   nodes:
+  #     - {category: mc1node, start: 1, end: 8}   # hypothetical names

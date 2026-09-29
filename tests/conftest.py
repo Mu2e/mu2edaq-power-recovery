@@ -288,3 +288,18 @@ def no_real_network(monkeypatch, request):
         guard.violations.clear()
         pytest.fail("network guard blocked, and the code under test swallowed "
                     "it:\n" + "\n".join(leftover), pytrace=False)
+
+
+@pytest.fixture(autouse=True)
+def private_run_lock(monkeypatch, tmp_path):
+    """Point run.lock_file into tmp_path for every test (#12).
+
+    cli.main takes the run lock for every non-simulated phase 1-3 invocation,
+    and the default is logs/ under the project root: without this a test run
+    would create the checkout's lock file, and two concurrent test runs (or a
+    test run beside a real recovery) would contend for it. The environment is
+    the layer cli.main reads; tests that build Settings with ``environ={}``
+    never take the lock.
+    """
+    monkeypatch.setenv("MU2E_POWER_RECOVERY_RUN_LOCK_FILE",
+                       str(tmp_path / "run.lock"))

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mu2edaq-power-recovery"
-version = "0.1.0"
+version = "0.2.0"
 description = "Assess, power on, verify and report on the Mu2e DAQ clusters after a planned or unplanned power outage."
 readme = "README.md"
 requires-python = ">=3.9"

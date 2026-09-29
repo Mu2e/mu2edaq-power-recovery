@@ -24,6 +24,8 @@ mu2e-power-netcheck                          # phase 3
 mu2e-power-report --post-ecl                 # phase 4
 
 pytest                                       # no cluster needed
+mu2e-node-inventory --validate               # inventory gaps (exit 1 on errors)
+python -m mu2edaq_power_recovery.runlock status   # who holds the run lock
 cmake -S . -B build && cmake --build build   # optional C/C++ library
 ctest --test-dir build --output-on-failure
 ```
@@ -35,7 +37,19 @@ built by CMake to `build/mu2e-probe`, not a console script).
 Live power commands need this invocation's authorisation: `--execute`, or
 `MU2E_POWER_RECOVERY_ARM=<run.label>` in the process environment with
 `run.dry_run: false` and that `run.label` configured. `run.dry_run: false`
-alone exits 2 (`cli.authorize_live`).
+alone exits 2 (`cli.authorize_live`), for every entry point.
+
+**Run lock.** Phases 1-3 without `--simulate` take an exclusive OS lock on
+`run.lock_file` (`logs/power-recovery.lock`, `runlock.py`) in `cli._main`
+after authorisation and before phase 0; busy exits 2 naming the holder.
+`--simulate`, `--list-*` and report-only never lock (`cli.needs_run_lock`).
+The JSON record in the file is believed only while the lock is held; the file
+is never deleted. The lock is released just before the phase-0 re-exec and
+re-taken by the child. The start scripts keep no PID file; the stop scripts
+signal only `runlock pid` (held lock) after re-checking the command line.
+Tests get a private lock via the autouse `private_run_lock` fixture
+(`MU2E_POWER_RECOVERY_RUN_LOCK_FILE` into `tmp_path`) — keep it, or the suite
+creates `logs/power-recovery.lock` in the checkout.
 
 `--phase` belongs to `mu2e-power-recovery` alone; the four single-phase drivers
 reject it. All five drivers take `--version` and `--help`; the four Python
@@ -47,9 +61,12 @@ helpers take `--config`, `--env-file`, `--json`, `-v`/`--verbose` and
 ```
 src/mu2edaq_power_recovery/
   settings.py      layered config (defaults < yaml < .env < env < CLI)
-  topology.py      node inventory; NodeRange expansion, classes, protection
+  topology.py      node inventory; NodeRange expansion, classes, protection,
+                   validate() findings (--validate only)
   version.py       provenance banner (version, revision, config digest)
-  selfupdate.py    phase 0: fast-forward, rebuild, re-exec
+  selfupdate.py    phase 0: fast-forward, rebuild, re-exec; rollback on a
+                   failed rebuild
+  runlock.py       the single-run OS lock; `python -m ... status|pid`
   sweep.py         reachability sweep; native extension or Python fallback
   orchestrator.py  shared run state, concurrency, check execution
   state.py         SQLAlchemy run store (SQLite; Postgres by URL)
@@ -103,7 +120,7 @@ Four YAML files in `config/`, each with a man page in section 5:
 # power-recovery.yaml -- everything except the inventory. 78 keys; man 5
 # mu2edaq-power-recovery.yaml documents each one.
 run:      {label, dry_run: true, stop_on_stage_failure, phase_timeout,
-           from_stage, until_stage}
+           from_stage, until_stage, lock_file}
 topology: {file, sequence_file, checks_file, locations: [mc2, teststand]}
 selfupdate: {enabled, remote, branch, rebuild_globs, allow_dirty, timeout}
 ssh:      {user, root_user, proxy: auto, connect_timeout, command_timeout,
@@ -333,10 +350,16 @@ could fire for two nodes or for neither.
 
 ## 7. Known gaps
 
-- **MC-1 has no node list.** `config/topology.yaml` defines the location and
-  its lab subnet but the inventory is empty — MC-1 is not in the upstream
-  `mu2edaq-operations/scripts/nodes_config.yaml`. Fill it in and every phase
-  picks it up.
+- **MC-1 has no node list (#25, data still required).** `config/topology.yaml`
+  defines the location, its subnets, `status: pending` metadata and commented
+  templates, but the inventory is empty — MC-1 is not in the upstream
+  `mu2edaq-operations/scripts/nodes_config.yaml`. Fill it in, run
+  `mu2e-node-inventory --validate` (`Topology.validate()`; never called at
+  load) and every phase picks it up; phases 1-3 note "no nodes configured for
+  <loc>" meanwhile. mc1 is not in the default `topology.locations`.
+- **Shared subnets.** mc1 ipmi == mc2 ipmi (192.168.157.0/24) and teststand
+  data == mc2 data (10.226.9.0/24); `--validate` warns. Unconfirmed with the
+  network owner.
 - **The Vault secret is maintained outside this repository.** It is at
   `td/scd/experiments/mu2e/ipmi/config` (note: `ipmi` is a KV folder, not the
   secret) with fields `username`/`password`, both confirmed against the live
@@ -378,9 +401,15 @@ could fire for two nodes or for neither.
   `runs/<id>/` is rendered from that run's data only — no `archive_run` copy
   of the shared directory (#6); ECL attachments are the run's rendered bundle
   and Vault is created only to post (#18); `--json` stdout is exactly one
-  JSON document (#24). Remaining: an interactive `vault login` child inherits
-  fd 1, so a first-time Vault login under `--json --post-ecl` can print to
-  stdout.
+  JSON document (#24). The `vault login` child's stdout is our stderr
+  (fix/ops), so a first-time Vault login no longer corrupts `--json`.
+- **Resolved in fix/ops** (kept so nobody re-adds them): no PID file — the
+  driver's run lock replaces it and the stop scripts check identity before
+  signalling (#12); a required rebuild that fails rolls the checkout back
+  (`git reset --hard`/`--keep` to the full pre-update SHA), never re-execs, and
+  exits 2 if the reset fails; the result is `version.selfupdate` in the run
+  store (#21). A re-executed child records its own phase-0 result, not the
+  parent's.
 - **Nothing has been run against the live cluster end to end.** See
   [PROJECT-STATUS.md](PROJECT-STATUS.md) §6.3 for what is and is not verified.
 

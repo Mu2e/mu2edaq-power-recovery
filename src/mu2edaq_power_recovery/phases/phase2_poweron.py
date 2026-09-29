@@ -713,6 +713,7 @@ def run(orch: Orchestrator, progress: Optional[Any] = None,
     result = PhaseResult(name=PHASE_NAME, number=PHASE_NUMBER, title=PHASE_TITLE,
                          started_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
     config = orch.sequence_config or {}
+    result.notes.extend(orch.empty_location_notes())
     if not (config.get("stages") or []):
         result.status = Status.UNKNOWN
         result.summary = "no stages defined in the power sequence"

@@ -1,4 +1,4 @@
-.TH MU2EDAQ-POWER-RECOVERY.YAML 5 "2026-09-18" "mu2edaq-power-recovery 0.1.0" "File Formats"
+.TH MU2EDAQ-POWER-RECOVERY.YAML 5 "2026-09-29" "mu2edaq-power-recovery 0.2.0" "File Formats"
 .SH NAME
 power-recovery.yaml \- main configuration for the Mu2e DAQ power-recovery tools
 .SH SYNOPSIS
@@ -168,6 +168,35 @@ Default stage range for phase 2; normally set with
 .BR \-\-from / \-\-until .
 A name that is not a stage of the sequence, or a reversed range, exits 2 before
 any credential is acquired, listing the valid names.
+.TP
+.I lock_file
+The single-run lock. Default
+.IR logs/power-recovery.lock ,
+relative to the project root. Every invocation that can act on hardware
+(phases 1, 2 or 3 without
+.BR \-\-simulate )
+takes an exclusive, non-blocking operating-system lock on this file before the
+phase-0 update:
+.BR flock (2)
+on Linux and macOS,
+.B msvcrt.locking
+on Windows. A second such run exits 2 naming the holder's pid, start time,
+host and command line.
+.BR \-\-simulate ,
+.BR \-\-list\-checks ,
+.B \-\-list\-nodes
+and report-only runs do not take it. After locking, the holder writes the JSON
+record
+.RI { pid ", " started_at ", " cmdline ", " host }
+into the file. The record is only believed while the lock is held: the kernel
+releases the lock when the process ends, however it ends, so a free lock means
+the recorded pid is stale and it is never signalled. The file itself is left in
+place. The lock is released immediately before the phase-0 re-exec and taken
+again by the re-executed process. Inspect it with
+.BR "python \-m mu2edaq_power_recovery.runlock status" ;
+.B pid
+prints the holder's pid only while the lock is held (exit 1 otherwise), which
+is what the stop scripts use.
 .SS topology
 .TP
 .IR file ", " sequence_file ", " checks_file

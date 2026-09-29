@@ -1,9 +1,10 @@
 # Project status — mu2edaq-power-recovery
 
-**Version** 0.1.0 (tagged) · **Status** feature-complete; credentials, Vault
-and BMC access verified live, no power-on yet (§6.3) · **Repository**
+**Version** 0.2.0 (untagged until the fix branches are merged; 0.1.0 is the
+last tag) · **Status** feature-complete; credentials, Vault and BMC access
+verified live, no power-on yet (§6.3) · **Repository**
 <https://github.com/Mu2e/mu2edaq-power-recovery> (public, per the Mu2e-org
-convention) · **Last updated** 2026-09-18
+convention) · **Last updated** 2026-09-29
 
 ---
 
@@ -14,8 +15,8 @@ with the phase-0 self-update, the static report site, the logbook integration,
 the diagnostics utilities, the optional C/C++ probe library and its Python
 bindings, and the documentation set.
 
-309 automated tests pass, plus 7 C++ test groups and an end-to-end simulated
-four-phase run. The suite's "contacts nothing" claim is now *enforced* by a
+651 automated tests pass (Linux x86_64, Python 3.9.25), plus 7 C++ test groups
+and an end-to-end simulated four-phase run. The suite's "contacts nothing" claim is now *enforced* by a
 test-collection guard rather than merely asserted (§6.4).
 
 **The four phases have not yet been run end to end against the real cluster**,
@@ -24,7 +25,8 @@ the logic rather than the environment. Individual pieces *have* now been
 exercised live, and that is where most of §6.4 came from: Vault reads, the IPMI
 credentials and cipher suite, SSH through a real gateway, and the Kerberos
 credential chain on macOS. Two items remain open (§6): the MC-1 node list, and
-an actual power-on.
+an actual power-on. v0.2.0 is the issue-review release: §6.6 lists what changed
+and the operator questions it leaves open.
 
 ---
 
@@ -39,13 +41,13 @@ Every requirement from `Project-Description.md`, and where it is met.
 | 3 | Uses a Vault token for secrets | ✅ | `creds/vault.py` |
 | 4 | Report hosting local or remote upload | ✅ | `report/publish.py` (rsync / scp / copy) |
 | 5 | Secrets from `td/scd/experiments/mu2e/`, IPMI at `.../ipmi/config` | ✅ | `config/power-recovery.yaml` `vault:`; path and fields confirmed |
-| 6 | Three computing centres: MC-1, MC-2, Teststand | ⚠️ | `config/topology.yaml`; **MC-1 node list empty** (§6.1) |
+| 6 | Three computing centres: MC-1, MC-2, Teststand | ⚠️ | `config/topology.yaml`; **MC-1 node list empty** (§6.1); scaffolding and `mu2e-node-inventory --validate` in place |
 | 7 | Node names from `mu2edaq-operations` `node_list.py` | ✅ | `topology.py` uses the identical entry syntax |
 | 8 | Per-site network segments and CIDRs | ✅ | `topology.yaml` `subnets:` |
 | 9 | Current-state tool, on-screen report | ✅ | `console.py`, `mu2e-power-state` |
 | 10 | Webpage with tables by area and by class | ✅ | `report/templates/assess.html` |
 | 11 | Re-running updates the webpage | ✅ | `ReportWriter.render_run`: each run's bundle under `runs/<id>/`, the top level shows the newest run |
-| 12 | Check for GitHub updates and rebuild first | ✅ | `selfupdate.py` |
+| 12 | Check for GitHub updates and rebuild first | ✅ | `selfupdate.py`; a failed required rebuild rolls the update back (#21) |
 | 13 | Print version information | ✅ | `version.py` banner |
 | 14 | Phase 1 takes no corrective action | ✅ | Read-only checks; asserted by test |
 | 15 | Gateways responding | ✅ | `ping.lab` |
@@ -83,13 +85,13 @@ Every requirement from `Project-Description.md`, and where it is met.
 
 | Component | Status | Tests | Notes |
 |---|---|---|---|
-| Configuration layering | ✅ Complete | 23 | 5 layers, provenance retained, redaction |
-| Topology / inventory | ✅ Complete | 14 | Upstream-compatible entry syntax |
+| Configuration layering | ✅ Complete | 25 | 5 layers, provenance retained, redaction |
+| Topology / inventory | ✅ Complete | 74 + 12 | Upstream-compatible entry syntax; hostname validation at load; `validate()` findings (#25) |
 | SSH transport | ✅ Complete | via checks | ProxyJump, GSSAPI, no ControlMaster; gateway resolution serialised |
 | IPMI client | ✅ Complete | 43 | Runs on the gateway; secrets on stdin; upstream-matching invocation |
 | Kerberos | ✅ Complete | 68 | Credential chains; Heimdal collection caches; displacement guard |
 | Service identities | ✅ Complete | 68 | Via `mu2edaq-kerberos`; no keytab handled here |
-| Vault | ✅ Complete | 11 | Path and fields confirmed against the live Vault |
+| Vault | ✅ Complete | 12 | Path and fields confirmed against the live Vault |
 | Check framework | ✅ Complete | 39 | 25 checks; registry; failure containment; ping dialects |
 | Output parsers | ✅ Complete | 20 | Real command output as fixtures; iputils/BSD/Windows |
 | Phase 1 assess | ✅ Complete | 7 | Read-only asserted by test; simulation hermeticity |
@@ -100,43 +102,51 @@ Every requirement from `Project-Description.md`, and where it is met.
 | Report site | ✅ Complete | 20 | 9 pages + JSON companions |
 | Publication | ✅ Complete | in report suite | rsync / scp / copy; refuses to publish under `--simulate` |
 | ECL posting | ⚠️ Untested | in report suite | Body and subject tested; posting needs the package (§6.5) |
-| Self-update | ✅ Complete | 13 | Against real throwaway git repos |
+| Self-update | ✅ Complete | 24 | Against real throwaway git repos; rollback on a failed rebuild, provenance |
+| Run lock | ✅ Complete | 21 | `runlock.py`; stop script tested against stale and reused pids |
 | `libmu2eprobe` (C++) | ✅ Complete | 7 groups | C++ / C / Python surfaces |
 | ssh credential chain | ✅ Complete | 68 | Per-host memo, promotion, auth-vs-unreachable-vs-hostkey |
 | Host-key handling | ✅ Complete | in credentials suite | Own classification; stops the chain; verified against a live reimaged node |
 | Python sweep fallback | ✅ Complete | 8 | Semantics identical to the native path |
-| CLI | ✅ Complete | 14 | Driver + 4 single-phase entry points |
-| Test network guard | ✅ Complete | 2 | Autouse fixture + its meta-test |
+| CLI | ✅ Complete | 26 + 21 | Driver + 4 single-phase entry points; live-run authorisation |
+| Test network guard | ✅ Complete | 18 | Autouse fixture + its meta-tests |
 | Diagnostics (4 tools) | ✅ Complete | — | Exercised live; `mu2e-ssh-probe` now builds the real credential chain |
-| Man pages | ✅ Complete | — | 18 pages, all render warning-free; the single-phase drivers cross-reference the driver page rather than listing flags (§6.5) |
+| Man pages | ✅ Complete | — | 19 pages, all render warning-free; the single-phase drivers cross-reference the driver page rather than listing flags (§6.5) |
 | Documentation | ✅ Complete | — | README, CLAUDE, INSTALL, DESIGN, OPERATIONS, this file |
 
 ---
 
 ## 4. Test matrix
 
-`pytest` — **309 passed** in ~29 s, no cluster, no credentials, no network.
+`pytest` — **651 passed** in ~50 s on Linux x86_64, Python 3.9.25 (v0.2.0
+stack), no cluster, no credentials, no network.
 
 | Suite | Tests | Covers |
 |---|---|---|
-| `unit/test_topology.py` | 14 | NodeRange expansion, aliases, classes, protection, MC-1 emptiness |
-| `unit/test_settings.py` | 23 | All five precedence layers, coercion, redaction, malformed YAML |
+| `unit/test_topology.py` | 74 | NodeRange expansion, aliases, classes, protection, MC-1 emptiness, hostname validation at load and in `resolve()` |
+| `unit/test_topology_validate.py` | 12 | `Topology.validate()` findings on the shipped config (exactly 4 warnings + 1 info), synthetic orphan BMC / overlap / stage cases, `mu2e-node-inventory --validate` exit status and JSON, a populated synthetic MC-1 through `--list-nodes` and a simulated assess, the per-location "no nodes configured" note |
+| `unit/test_settings.py` | 25 | All five precedence layers, coercion, redaction, malformed YAML |
 | `unit/test_parsers.py` | 35 | `df`, `ip`, `ping` (iputils + BSD + Windows), `mdstat`, SMART, kernel errors, `sel list` and the SEL diff |
 | `unit/test_checks.py` | 50 | Every check's pass and fail path; framework containment; ping dialects; SEL empty/short/rotated/cleared/identical/unread; refused credential is UNKNOWN |
+| `unit/test_mesh.py` | 24 | Phase-3 mesh: quoting, origin/targets, gateway-sourced IPMI, UNKNOWN for untested paths |
 | `unit/test_ipmi.py` | 54 | **Safety gates**, credentials, invocation shape, failure diagnosis, credential stop, breaker under barrier-forced concurrency |
 | `unit/test_ipmi_tool.py` | 8 | `mu2e-ipmi-tool` target selection: no un-filtering, skipped-node reasons, exit 2 before Vault, confirmation lists hostnames |
 | `unit/test_state.py` | 10 | Round-trip, refusal auditing, append-not-overwrite, `attach` without a new row, writes that name their run |
-| `unit/test_vault.py` | 11 | KV path resolution, folder-vs-secret, synonyms, file fallback |
+| `unit/test_vault.py` | 12 | KV path resolution, folder-vs-secret, synonyms, file fallback, `vault login` stdout sent to stderr |
 | `unit/test_credentials.py` | 86 | Primary-first chains, root fallback, ssh-failure classification, KRB5CCNAME, collection caches, host keys, cleanup, password prompting; typed default-cache guard errors, the guard's precondition, barrier-forced concurrent mints |
 | `unit/test_credential_bootstrap.py` | 16 | The shared credential bootstrap: login/ticket pairs attempted by `mu2e-ssh-probe` and `mu2e-ipmi-tool`, show-only mints nothing, cleanup on success/exception/interrupt, the disabled-fallbacks note and event |
-| `unit/test_network_guard.py` | 2 | The suite's "contacts nothing" claim is enforced, not just asserted |
-| `unit/test_docs.py` | 3 | `tools/generate-docs.py --check`: the man pages still match the code, and `--check` writes nothing |
+| `unit/test_authorize_live.py` | 21 | `--execute`, the ARM token, config-only `run.dry_run: false` refused, `--simulate` always wins |
+| `unit/test_sequence_plan.py` | 38 | Phase-2 planning: `--location`/`--node` scope, verify-only predecessors, unknown/reversed stage names |
+| `unit/test_network_guard.py` | 18 | The suite's "contacts nothing" claim is enforced (subprocess, sockets, sweep), not just asserted |
+| `unit/test_docs.py` | 4 | `tools/generate-docs.py --check`: the man pages still match the code, `--check` writes nothing, SIGTERM reaches the clean path |
 | `unit/test_sweep.py` | 8 | Both backends, identical semantics |
-| `unit/test_selfupdate.py` | 13 | Dirty tree, divergence, fast-forward, re-exec guard |
-| `integration/test_phases.py` | 26 | All four phases end to end; simulation hermeticity |
+| `unit/test_selfupdate.py` | 24 | Dirty tree, divergence, fast-forward, re-exec guard; full pre-update SHA; a failed rebuild after pyproject/requirements/C++ changes, a bootstrap exiting 1 and a missing bootstrap all roll back with no re-exec; `--keep` preserves a dirty edit; a failed reset exits 2; the result is in the run's provenance |
+| `unit/test_runlock.py` | 21 | Busy lock names the holder (child-process holder); stale record naming a live unrelated pid is "not running" and `pid` exits 1; release/reacquire; only phases 1-3 non-simulated lock; busy -> exit 2; released before re-exec; stop script never signals a stale record, refuses a holder that is not the driver, and TERMs the real holder |
+| `integration/test_phases.py` | 28 | All four phases end to end; simulation hermeticity |
+| `integration/test_poweron_scope.py` | 15 | Scoped live power-on in simulation: only the named nodes are powered |
 | `integration/test_report.py` | 21 | Page rendering, per-run bundles, publication, ECL body |
 | `integration/test_report_lifecycle.py` | 21 | `--run-id` regeneration on the selected run with no credentials; missing run exits 2; final status in every artefact, also after error/interrupt; reconciliation (resolved, unrechecked, subset re-check); two runs in one output dir; ECL attachments = the run's bundle; `--json` parses as a whole, no ANSI |
-| `integration/test_cli.py` | 14 | Driver, flags, exit codes, JSON output |
+| `integration/test_cli.py` | 26 | Driver, flags, exit codes, JSON output |
 
 **C++** — `ctest`, 7 test groups: version/OpenMP agreement, unresolvable names,
 loopback, timeout bounding, input-order preservation, the reachable filter, and
@@ -174,6 +184,10 @@ JSON files, and is wired into `ctest` as `simulated-run`.
 | Config `run.dry_run: false` alone does not arm a run (YAML, `.env`, env) | `test_config_live_alone_is_refused` |
 | The ARM token arms only with a matching configured label | `test_an_arm_token_that_does_not_hold_is_refused` |
 | The ARM token is refused in `config/.env` | `test_arm_in_dotenv_is_a_config_error` |
+| A second hardware-facing run cannot start while one holds the lock | `test_a_second_acquire_is_busy_and_names_the_holder`, `test_a_busy_lock_stops_the_driver_with_exit_2` |
+| A stale record's pid (alive, reused) is never signalled | `test_stop_never_signals_a_stale_record`, `test_a_stale_record_naming_a_live_unrelated_pid_is_not_reported` |
+| A lock holder that is not the driver is not signalled | `test_stop_refuses_a_holder_that_is_not_the_driver` |
+| A failed required rebuild never re-execs the updated code | `test_a_failed_rebuild_rolls_the_checkout_back` |
 | `--simulate` beats `--execute` and the ARM token | `test_simulate_always_wins` |
 | A `--node` live run powers only the named node, never a predecessor | `test_a_scoped_live_run_powers_only_the_named_node` |
 | An off predecessor stops the run before the target stage | `test_an_off_predecessor_stops_before_the_target` |
@@ -192,7 +206,8 @@ JSON files, and is wired into `ctest` as `simulated-run`.
 | Alma/Rocky/RHEL 9 | 3.9 (system) | ✅ | ✅ GCC + OpenMP | Target deployment |
 | Alma/Rocky/RHEL 8 | 3.9 | ✅ | ✅ | Expected to work; untested |
 | Ubuntu 22.04 / 24.04 | 3.10–3.12 | ✅ | ✅ | Expected to work; untested |
-| macOS 14+ (arm64) | 3.12 | ✅ Verified | ✅ Built and tested, no OpenMP by default | **Development platform** |
+| Linux x86_64 (Amazon Linux 2023, kernel 6.18) | 3.9.25 | ✅ Verified at v0.2.0 | ✅ Built and tested with ctest | Verification host for the v0.2.0 stack |
+| macOS 14+ (arm64) | 3.12 | ✅ Verified at v0.1.0 | ✅ Built and tested, no OpenMP by default | **Development platform** |
 | Windows 11 | 3.9+ | ✅ `bootstrap.ps1` | ⚠️ MSYS2/MinGW only | Needs OpenSSH + MIT Kerberos |
 
 | Dependency | Version | Required? | Without it |
@@ -210,9 +225,15 @@ JSON files, and is wired into `ctest` as `simulated-run`.
 | psycopg2 | — | No | SQLite |
 | `ipmitool` | on the gateway | Yes for phase 2 | No power control |
 
-**Verified on this machine:** macOS 14 (arm64), Python 3.12.1 — 309 pytest
-tests, 7 C++ test groups, the simulated four-phase run, all 18 man pages, and
-`bootstrap.sh` from scratch.
+**Verified for v0.2.0:** Linux x86_64, Python 3.9.25 — 651 pytest tests, the
+C++ build and ctest, the simulated four-phase run, `tools/generate-docs.py
+--check` over all 19 man pages.
+
+**Previously verified at v0.1.0:** macOS 14 (arm64), Python 3.12.1 — the then
+309 pytest tests, 7 C++ test groups, the simulated four-phase run, all 18 man
+pages, and `bootstrap.sh` from scratch. The v0.2.0 stack has not been re-run on
+macOS; the Heimdal-specific paths below are the reason to do so before relying
+on it there.
 
 macOS deserves its own line rather than a tick. It is the development platform
 *and* a realistic platform to drive a recovery from, and it is the one that
@@ -233,6 +254,16 @@ carried in `mu2edaq-operations/scripts/nodes_config.yaml`, the authoritative
 upstream inventory, so nothing could be imported. Adding the hostnames is a
 config edit; no code change is needed. Until then the tools report MC-1 as
 "no nodes configured" rather than as healthy.
+
+v0.2.0 adds the scaffolding (#25, still open for the data): `mc1` carries
+`inventory_source` / `owner` / `status: pending` metadata and commented network
+templates, `config/power-sequence.yaml` a commented `location: mc1` stage,
+phases 1–3 note "no nodes configured for mc1 (inventory status: pending)" when
+it is requested, and `mu2e-node-inventory --validate` checks a filled-in
+inventory. mc1 stays out of the default `topology.locations` until a read-only
+`mu2e-power-state --location mc1` has been run against it. Still needed from
+operations: the host list and its source of truth, owner, gateways, BMC
+mapping, protected hosts, and where MC-1 goes in the power order.
 
 ### 6.2 Vault IPMI secret — ✅ **resolved 2026-09-17**
 Both parts confirmed against the live Vault:
@@ -822,9 +853,97 @@ path and are fixed together, as one restructuring of `cli.main`, `run_phases`,
   (with `error` on the failure paths), or the listing for `--list-checks` /
   `--list-nodes`. Human output goes to stderr, `sys.stdout` is redirected to
   stderr while the run executes, and the self-update rebuild's output is sent
-  to stderr. One gap remains: an interactive `vault login` child spawned by
-  `creds/vault.py` inherits file descriptor 1, so a first-time Vault login
-  under `--json --post-ecl` can still write its prompt to stdout.
+  to stderr. The one remaining gap, an interactive `vault login` child
+  inheriting file descriptor 1, was closed in fix/ops: `_interactive_login`
+  now gives the child our stderr as its stdout (stdin and stderr stay
+  inherited so it can prompt), with a test on the stubbed subprocess.
+
+The three items below were fixed in fix/ops, the last branch of the v0.2.0
+stack.
+
+- ~~**The start script's PID file outlived every run, and stop trusted it.**~~
+  **Fixed (#12, fix/ops).** `exec` discarded the shell trap meant to remove
+  `logs/power-recovery.pid`, and start/stop then trusted the integer, which
+  after pid reuse could name an unrelated process for `stop` to TERM and KILL;
+  the PowerShell wrapper recorded its own `$PID`, so `Stop-Process` orphaned the
+  Python driver. The driver now owns an OS lock (`runlock.py`): `os.open`
+  O_CREAT|O_RDWR plus `fcntl.flock(LOCK_EX|LOCK_NB)` on POSIX,
+  `msvcrt.locking(LK_NBLCK)` (at a far offset, so the record stays readable) on
+  Windows, then a `{pid, started_at, cmdline, host}` record written with
+  truncate+write+fsync. `run.lock_file` (default `logs/power-recovery.lock`,
+  resolved like `logging.file`). Taken in `cli._main` after authorisation and
+  before phase 0, only by phases 1–3 without `--simulate` (a rehearsal,
+  `--list-*` and report-only never lock); busy is exit 2 naming the holder;
+  released immediately before the phase-0 re-exec and re-taken by the child;
+  released in `finally`; the file stays. `python -m
+  mu2edaq_power_recovery.runlock status|pid` reports; `pid` prints only while
+  the lock is held. The start scripts just exec; the stop scripts take the pid
+  from the helper and re-check `ps -o args=` (`Get-CimInstance Win32_Process`
+  on Windows) for `mu2edaq_power_recovery`/`mu2e-power` before every signal.
+  Tests use a child-process holder, a live `sleep` as the reused pid, and run
+  the real stop script against a stub venv. Accepted window: the helper's
+  probe holds a free lock for an instant, so a start in that instant sees
+  "busy".
+- ~~**A failed required rebuild still re-executed the updated code.**~~
+  **Fixed (#21, fix/ops).** `SelfUpdater.run()` set `needs_reexec` whatever
+  `rebuild()` returned. Now the full pre-update SHA is recorded; when a pull
+  touched a rebuild glob and the rebuild returns False (bootstrap failed,
+  missing or failed to start), the checkout is reset (`--hard`, or `--keep`
+  when a dirty tree was allowed) to that SHA, `update_failed`/`rolled_back`/
+  `attempted` are set, `after` is the SHA actually running, there is no
+  re-exec, and the message says to run `./bootstrap.sh` and that a partly run
+  bootstrap may have changed the venv. A failed reset sets `reset_failed` and
+  the driver exits 2, because the old process still imports modules lazily
+  from a tree that has moved. `do_self_update` returns the result and
+  `start_run` records it as `version.selfupdate`. Not done: a re-executed
+  child records its own phase-0 result ("already updated"), not the parent's;
+  its `version` still names the revision that ran.
+- **MC-1 inventory scaffolding (#25, fix/ops; the inventory data is still
+  required).** `Topology.validate()` returns `Finding(level, message)`s and is
+  called only by `mu2e-node-inventory --validate` (exit 1 on errors, 0 with
+  warnings, `--json`), never at load. It reuses `valid_hostname`. On the
+  shipped config it reports four warnings — mc1 empty (with its metadata),
+  mc1 ipmi == mc2 ipmi 192.168.157.0/24, teststand data == mc2 data
+  10.226.9.0/24, twelve mc2 nodes in no stage — and one info (the teststand has
+  no stage). See §6.1 for the rest.
+
+### 6.6 v0.2.0 changes and open operator questions
+
+The 2026-09 issue review (#1–#25) was fixed on seven stacked branches, merged
+in this order:
+
+| Branch | Issues | In short |
+|---|---|---|
+| fix/test-guard | #22 | Network guard covers subprocess, sockets and the sweep; raises a BaseException |
+| fix/ipmi | #8 #10 #16 | Thread-safe credential breaker; SEL diffed by record id; `mu2e-ipmi-tool` no longer un-filters |
+| fix/network-checks | #9 #19 #20 | Hostnames validated and quoted; IPMI probed from gateways; untested mesh paths UNKNOWN |
+| fix/credentials | #7 #14 #15 #17 #23 | Serialised, typed credential guard; one credential bootstrap for driver and diagnostics |
+| fix/poweron-safety | #1 #2 #11 #13 | Scoped phase 2 with verify-only predecessors; stage-name errors; per-invocation live authorisation; `phase_timeout` enforced |
+| fix/report-lifecycle | #3 #4 #5 #6 #18 #24 | Run finished before reporting; per-run bundles from the store; reconciled current state; pure `--json` |
+| fix/ops | #12 #21 (#25 partly) | Run lock and identity-checked stop scripts; rollback on a failed rebuild; MC-1 scaffolding and `--validate`; `vault login` stdout to stderr; version 0.2.0 |
+
+Open questions for operations (none blocks the merge):
+
+1. **mu2e-trk-15..18 are in the MC-2 inventory but in no power-sequence
+   stage** (the `readout` stage lists trk-01..14, as the specification does),
+   and so are calo-12..14, dcs-03, extmon-01 and worker-01..03. Phase 2 never
+   powers them. Deliberate, or should `readout` (or a new stage) include them?
+   `--validate` reports them as a warning; the sequence is unchanged.
+2. **Duplicate subnets.** mc1's IPMI subnet is the same as mc2's
+   (192.168.157.0/24), and the teststand's data subnet is the same as mc2's
+   (10.226.9.0/24). If they really are shared, `net.interfaces` cannot tell the
+   sites apart by address; if not, the topology is wrong. Confirm with the
+   network owner.
+3. **The SEL parser's sample output** (`checks/parsers.py`, `ipmitool sel
+   list`) should be replaced by a capture from a live BMC, per the project's
+   parsers-against-real-output rule.
+4. **Assumed decisions to confirm** (taken as the recommended options while
+   the author was away): #1 predecessor stages are verify-only and stop the run
+   if not up; #7 service keytabs are warmed before workers start only when
+   `use_service_keytabs` is on, never in `--simulate` or show-only
+   diagnostics; #11 `--execute` alone arms, and config `run.dry_run: false`
+   alone exits 2 (it only enables the ARM-token path).
+5. **MC-1**: the inventory itself (§6.1).
 
 ---
 
@@ -858,6 +977,9 @@ Recorded here in brief; the reasoning is in [docs/DESIGN.md](docs/DESIGN.md).
 | Current state = newest result per node and check | Every historical failure is outstanding | A failure a later phase re-checked and passed is resolved, not a to-do (#5) |
 | C++ only for the reachability sweep | C++ throughout, or none | It is the one place where process/GIL overhead dominates; everything else is I/O-bound |
 | Protected-host refusal is not overridable | A `--force` flag | Powering down a gateway from a remote recovery session is never the intent |
+| The driver owns an OS lock; the record is believed only while it is held | A PID file written by the start script | A trap does not survive `exec`, and a bare integer can be reused; the kernel releases a lock however the process ends (#12) |
+| A failed required rebuild rolls the checkout back and does not re-exec | Re-exec anyway, or leave the tree updated | New code against the old venv/extension can fail at startup just before a recovery (#21) |
+| `validate()` only on request | Validate at load | An incomplete inventory (MC-1) is normal and must not stop a run; the load-time hostname rule already refuses what cannot run (#25) |
 | No automatic remediation | Restart services, remount | An outage is not the moment to discover what an automatic fix does when its assumptions fail |
 
 ---
@@ -866,7 +988,7 @@ Recorded here in brief; the reasoning is in [docs/DESIGN.md](docs/DESIGN.md).
 
 | Phase | Implementation | Tests | Docs | Live |
 |---|---|---|---|---|
-| 0 — self-update | ✅ | ✅ 13 | ✅ | ✅ fetch/up-to-date verified against origin |
+| 0 — self-update | ✅ | ✅ 24 | ✅ | ✅ fetch/up-to-date verified against origin |
 | 1 — assess | ✅ | ✅ 7 + 39 check tests | ✅ | ◐ SSH, Kerberos and BMC reads verified; no full phase run |
 | 2 — power on | ✅ | ✅ 8 + 43 IPMI tests | ✅ | ⬜ nothing has been switched on |
 | 3 — network | ✅ | ✅ 7 + 24 mesh tests | ✅ | ⬜ |
@@ -874,6 +996,7 @@ Recorded here in brief; the reasoning is in [docs/DESIGN.md](docs/DESIGN.md).
 | Report site | ✅ | ✅ 20 | ✅ | ⬜ |
 | Diagnostics | ✅ | manual | ✅ | ✅ all four run against the live cluster |
 | C/C++ library | ✅ | ✅ 7 groups | ✅ | n/a |
-| Credentials (Kerberos, Vault) | ✅ | ✅ 68 + 11 | ✅ | ✅ chain, collection caches and Vault reads verified |
+| Run lock / start-stop | ✅ | ✅ 21 | ✅ | ⬜ |
+| Credentials (Kerberos, Vault) | ✅ | ✅ 86 + 16 + 12 | ✅ | ✅ chain, collection caches and Vault reads verified |
 
 ✅ done · ◐ partly · ⬜ pending live-cluster verification (§6.3)

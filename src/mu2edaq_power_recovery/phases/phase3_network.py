@@ -38,6 +38,8 @@ def run(orch: Orchestrator, nodes: Optional[Sequence[Node]] = None,
                          started_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
 
     targets = list(nodes if nodes is not None else orch.nodes())
+    if nodes is None:
+        result.notes.extend(orch.empty_location_notes())
     if not include_failed:
         targets, excluded = _reachable_only(orch, targets)
         if excluded:
