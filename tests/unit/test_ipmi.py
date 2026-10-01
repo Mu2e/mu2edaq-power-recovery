@@ -742,3 +742,30 @@ def test_the_precheck_setting_reaches_the_run_client(settings):
         assert client.reachability_precheck is False
     finally:
         orch.close()
+
+
+#: ipmitool on mu2egateway01 for a topology BMC name with no DNS entry,
+#: captured live 2026-10-01.
+UNRESOLVED_STDERR = ("Address lookup for mu2edaq10-ipmi.fnal.gov failed\n"
+                     "Could not open socket!\n"
+                     "Error: Unable to establish IPMI v2 / RMCP+ session\n")
+
+
+def test_an_unresolvable_bmc_name_is_diagnosed_as_such_and_not_retried(gateway):
+    gateway.expect_first(r"chassis power status",
+                         ScriptedResponse(stderr=UNRESOLVED_STDERR, rc=1))
+    client = IPMIClient(gateway=gateway, username="MU2E", password="x", retries=2)
+    assert client.power_status("mu2edaq10-ipmi.fnal.gov") is PowerState.UNREACHABLE
+    attempts = [c for c in gateway.calls if "chassis power status" in c["command"]]
+    assert len(attempts) == 1
+    assert client.credentials_refused is None
+
+
+def test_an_unresolvable_name_never_counts_toward_the_credential_stop(gateway):
+    gateway.expect_first(r"chassis power status",
+                         ScriptedResponse(stderr=UNRESOLVED_STDERR, rc=1))
+    client = IPMIClient(gateway=gateway, username="MU2E", password="x", retries=0)
+    result = client._run("mu2edaq10-ipmi.fnal.gov", ["chassis", "power", "status"])
+    assert "does not resolve" in result.meta["diagnosis"]
+    assert "credential" not in result.meta["diagnosis"].split(".")[0]
+    assert not result.meta.get("credentials_refused")

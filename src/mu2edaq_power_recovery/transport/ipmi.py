@@ -137,6 +137,8 @@ AUTH_PROBE_CONCURRENCY = 1
 ESTABLISH_FAILURE_LIMIT = 2
 
 #: The ipmitool text that means the RMCP+ session never opened.
+#: ipmitool's message when the BMC name does not resolve on the gateway.
+UNRESOLVED = "address lookup for"
 UNESTABLISHED = "unable to establish"
 
 #: Rows ``sel()`` asks for. The baseline comparison in power.sel needs to know
@@ -454,6 +456,9 @@ class IPMIClient:
                     self.breaker.prove()
                 return result
             last = result
+            if UNRESOLVED in (result.stderr + result.stdout).lower():
+                # A name that does not resolve will not resolve on retry.
+                break
             if self._rejected_credentials(result):
                 # Retrying a wrong username is wrong the second and third time
                 # too. All it adds is two more failed authentications against
@@ -479,7 +484,8 @@ class IPMIClient:
                     f"the combination that works.".strip())
                 log.error("%s", message)
         elif guarded and answered_ping and not self.breaker.proven.is_set() \
-                and UNESTABLISHED in (last.stderr + last.stdout).lower():
+                and UNESTABLISHED in (last.stderr + last.stdout).lower() \
+                and UNRESOLVED not in (last.stderr + last.stdout).lower():
             last.meta["answered_ping"] = True
             count = self.breaker.record_unestablished(bmc_host)
             if count >= ESTABLISH_FAILURE_LIMIT:
@@ -505,6 +511,12 @@ class IPMIClient:
     #: Substrings of ipmitool failures that mean the session never opened, and
     #: what an operator should actually check for each.
     _DIAGNOSES = (
+        # Before "unable to establish": ipmitool prints that too after a failed
+        # lookup, which read as a refused credential on the live teststand.
+        ("address lookup for",
+         "the BMC name does not resolve on the gateway: fix the topology "
+         "(an entry for a host that no longer exists) or DNS. No session was "
+         "attempted, so this says nothing about the credentials."),
         ("unable to establish",
          "the BMC refused the session. In order of likelihood: the username is "
          "wrong (upstream mu2e_ipmi.sh hard-codes 'MU2E' -- compare it against "

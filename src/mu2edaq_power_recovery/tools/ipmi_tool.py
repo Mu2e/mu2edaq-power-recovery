@@ -33,6 +33,10 @@ from ..transport.base import TransportError
 from ..transport.ipmi import DESTRUCTIVE_VERBS, STATE_CHANGING_VERBS
 from ._common import add_common_arguments, add_credential_arguments, bootstrap
 
+#: Output cap for this tool's own invocations, raised from the run's
+#: logging.max_capture_bytes so a full SEL listing arrives whole.
+TOOL_MAX_CAPTURE = 8 * 1024 * 1024
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -165,10 +169,19 @@ def run(argv: Optional[Sequence[str]], credentials: ExitStack) -> int:
     # printing an invocation is no reason to prompt for a password. warm is
     # off because this is one session, not a worker pool -- a lazy mint under
     # the manager's lock is the same transaction.
+    # A full 'sel list' is the read this tool exists for (power.sel tells the
+    # operator to run it), and a BMC's log runs to hundreds of KiB: under the
+    # run's 64 KiB capture cap the middle was silently cut, splitting a row.
+    cap = max(int(settings.get("logging.max_capture_bytes", 65536)),
+              TOOL_MAX_CAPTURE)
+    settings.set("logging.max_capture_bytes", cap)
+    # Also the shared local transport, built before this: an ambient-ticket
+    # ssh runs through it, not through a runner sized by the setting.
+    local.max_capture = cap
     session = credentials.enter_context(credential_session(
         settings, topology, local, prepare=not args.show_command, warm=False))
     if session.warning and not args.quiet:
-        print(f"  note: {session.warning}\n")
+        print(f"  note: {session.warning}\n", file=sys.stderr)
     factory = session.factory
     gateway_host = args.gateway or factory.gateway_for(location, role="ipmi")
     if not gateway_host:
@@ -180,8 +193,9 @@ def run(argv: Optional[Sequence[str]], credentials: ExitStack) -> int:
         # The username is not a secret and is the first thing to check when a
         # BMC refuses the session, so say it rather than making the operator
         # go and look it up.
+        # stderr, so --json stdout is one parseable document.
         print(f"  running ipmitool on {gateway_host} as BMC user "
-              f"'{username}' (credentials from {creds.source})\n")
+              f"'{username}' (credentials from {creds.source})\n", file=sys.stderr)
 
     client = IPMIClient(
         gateway=factory.for_host(gateway_host, direct=True),
@@ -241,10 +255,15 @@ def run(argv: Optional[Sequence[str]], credentials: ExitStack) -> int:
                      first_line[:100]])
         results.append({"node": node.hostname, "bmc": node.ipmi_host,
                         "rc": result.rc, "output": result.output.strip(),
+                        "truncated": result.truncated,
                         "refused": result.meta.get("refused", False),
                         "dry_run": result.meta.get("dry_run", False),
                         "diagnosis": result.meta.get("diagnosis"),
                         "invocation": result.meta.get("invocation")})
+        if result.truncated:
+            print(f"  warning: output from {node.short} exceeded "
+                  f"{settings.get('logging.max_capture_bytes')} bytes and was cut "
+                  f"in the middle", file=sys.stderr)
         if not result.ok:
             failures += 1
 
