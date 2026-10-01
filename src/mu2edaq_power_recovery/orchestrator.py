@@ -99,9 +99,20 @@ class NodeAssessment:
             return f"all {applicable} checks passed{suffix}"
         bad = self.failures
         if bad:
-            return f"{len(bad)} of {applicable} checks failed: " + \
-                   ", ".join(r.check_id for r in bad[:4]) + \
-                   (" ..." if len(bad) > 4 else "")
+            # is_bad covers FAIL and UNKNOWN; say which. Live: mu2edaq13 read
+            # "3 of 17 checks failed" for three checks that could not look.
+            failed = [r for r in bad if r.status is Status.FAIL]
+            unknown = [r for r in bad if r.status is not Status.FAIL]
+            parts = []
+            if failed:
+                parts.append(f"{len(failed)} of {applicable} checks failed: "
+                             + ", ".join(r.check_id for r in failed[:4])
+                             + (" ..." if len(failed) > 4 else ""))
+            if unknown:
+                parts.append(f"{len(unknown)} could not be checked: "
+                             + ", ".join(r.check_id for r in unknown[:4])
+                             + (" ..." if len(unknown) > 4 else ""))
+            return "; ".join(parts)
         return (f"{len(self.warnings)} warning(s) of {applicable} checks"
                 + suffix)
 

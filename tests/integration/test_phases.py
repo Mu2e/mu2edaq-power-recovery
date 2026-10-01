@@ -453,3 +453,17 @@ def test_an_interrupt_from_a_worker_is_not_swallowed_or_waited_out(orch,
     # The one worker may already have taken the next node off the queue
     # before the main thread saw the interrupt; nothing after that runs.
     assert len(started) <= 2
+
+
+def test_a_node_summary_keeps_failed_and_unchecked_apart(topology):
+    """Live: mu2edaq13 read '3 of 17 checks failed' for three UNKNOWNs."""
+    from mu2edaq_power_recovery.checks.base import CheckResult
+    node = topology.resolve(["mu2edaq13"], ["teststand"])[0]
+    a = NodeAssessment(node=node)
+    a.results = [CheckResult(node.hostname, "power.status", Status.UNKNOWN),
+                 CheckResult(node.hostname, "power.sel", Status.UNKNOWN),
+                 CheckResult(node.hostname, "disk.local", Status.FAIL),
+                 CheckResult(node.hostname, "ssh.login", Status.OK)]
+    text = a.summary()
+    assert "1 of 4 checks failed: disk.local" in text
+    assert "2 could not be checked: power.status, power.sel" in text
