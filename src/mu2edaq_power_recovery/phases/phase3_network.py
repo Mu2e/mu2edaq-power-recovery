@@ -122,9 +122,21 @@ def run(orch: Orchestrator, nodes: Optional[Sequence[Node]] = None,
                 f"the probe was probably cut off by its timeout")
         # A target whose own host could not be logged into has not been shown
         # to "probe out"; it belongs to the dark-source note above.
+        unresolved = m.unresolved_targets()
+        if unresolved:
+            result.notes.append(
+                f"{m.network}: {len(unresolved)} name(s) do not resolve "
+                f"({_sample(unresolved)}) -- fix the inventory or DNS; this is "
+                f"not a network fault")
         one_way = [h for h in m.unreachable_targets() if h not in isolated
+                   and h not in unresolved
                    and m.target_hosts.get(h, h) not in dark]
-        if one_way:
+        if one_way and m.origin == "gateways":
+            result.notes.append(
+                f"{m.network}: {len(one_way)} target(s) answered no gateway "
+                f"({_sample(one_way)}) -- the BMC is unpowered, hung or "
+                f"misaddressed, or its switch port is down")
+        elif one_way:
             result.notes.append(
                 f"{m.network}: {len(one_way)} host(s) could not be reached by "
                 f"anyone although they probe out themselves ({_sample(one_way)}) "

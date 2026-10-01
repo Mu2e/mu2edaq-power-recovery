@@ -543,3 +543,22 @@ def test_ipmi_gateways_default_to_the_location_gateways(topology):
             assert topology.ipmi_gateways(loc) == topology.gateways(loc)
     assert topology.ipmi_gateways("mc2") == topology.gateways("mc2")
     assert topology.ipmi_gateways("teststand") == topology.gateways("mc2")
+
+
+def test_an_unresolvable_target_is_named_as_such():
+    """Live: mu2edaq10/11/14/22-ipmi are in the topology but not in DNS."""
+    nx = MeshEdge("gw", "mu2edaq10-ipmi.fnal.gov", "ipmi", ok=False, tested=True,
+                  detail="ping: mu2edaq10-ipmi.fnal.gov: Name or service not known")
+    dark = MeshEdge("gw", "mu2edaq07-ipmi.fnal.gov", "ipmi", ok=False, tested=True,
+                    detail="3 packets transmitted, 0 received, +3 errors, 100% packet loss")
+    res = MeshResult(network="ipmi", full_mesh=True, edges=[nx, dark], origin="gateways")
+    assert res.unresolved_targets() == ["mu2edaq10-ipmi.fnal.gov"]
+    assert res.unreachable_targets() == sorted([nx.target, dark.target])
+
+
+def test_a_shared_ipmi_gateway_is_one_source(topology, checks_config, monkeypatch):
+    monkeypatch.setitem(topology.location_info("teststand"), "ipmi_gateways",
+                        topology.gateways("mc2"))
+    nodes = _nodes(topology, "mu2e-dl-01") + topology.resolve(["mu2edaq07"], ["teststand"])
+    (res,) = _probe(RoutingFactory(topology), checks_config, [IPMI]).run_all(nodes)
+    assert sorted(res.sources) == sorted(topology.gateways("mc2"))

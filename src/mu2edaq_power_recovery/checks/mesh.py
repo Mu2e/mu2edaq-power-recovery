@@ -50,6 +50,11 @@ from .reachability import _ping_command
 log = logging.getLogger(__name__)
 
 
+#: ping's messages for a name that does not resolve (iputils, older iputils,
+#: BSD/macOS).
+_NXDOMAIN = ("Name or service not known", "unknown host", "cannot resolve")
+
+
 @dataclass
 class MeshEdge:
     """One source -> target probe on one network.
@@ -187,6 +192,15 @@ class MeshResult:
             by_source.setdefault(edge.source, []).append(edge)
         return sorted(src for src, edges in by_source.items()
                       if edges and not any(e.ok for e in edges))
+
+    def unresolved_targets(self) -> List[str]:
+        """Tested targets whose name did not resolve on the source.
+
+        An inventory or DNS problem, not a network one: on the live cluster
+        four teststand BMC names in the topology have no DNS entry at all.
+        """
+        return sorted({e.target for e in self.failures
+                       if any(m in (e.detail or "") for m in _NXDOMAIN)})
 
     def unreachable_targets(self) -> List[str]:
         """Targets that no source reached, among the sources that were tested."""
@@ -428,7 +442,10 @@ class MeshProbe:
                 orphaned[loc] = names
                 continue
             for gw in gws:
-                gateways.append(gw)
+                if gw not in gateways:
+                    # The teststand's ipmi_gateways are MC-2's: one host,
+                    # two plans, but one source.
+                    gateways.append(gw)
                 plans.append((gw, lambda g=gw: self.ssh_factory.for_host(g, direct=True),
                               names))
         return plans, gateways, orphaned
