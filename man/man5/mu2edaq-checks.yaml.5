@@ -175,6 +175,18 @@ when it is false, which is how entries written before the key existed behave.
 Sets the default for
 .I targets
 and the "full mesh" label in the report; nothing else.
+.TP
+.I cross_location
+With
+.BR "targets: all" ,
+whether a source also probes targets at other locations. Default
+.BR false :
+each location is meshed on its own, because the private networks are
+separate segments per site \(em MC-2 and the teststand both use
+10.226.9.0/24 for data, and a cross-site pair fails with ARP "host
+unreachable" although neither end is broken. Set it to
+.B true
+only for a network that is one segment across sites.
 .RE
 .IP
 The data network is a full mesh with an MTU probe; the lab network is sampled

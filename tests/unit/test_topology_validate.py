@@ -27,7 +27,10 @@ def test_the_shipped_configuration_findings(topology, sequence):
     found = [(f.level, f.message) for f in topology.validate(sequence)]
     assert not [m for level, m in found if level == "error"]
     warnings = [m for level, m in found if level == "warning"]
-    assert len(warnings) == 4, warnings
+    assert len(warnings) == 6, warnings
+    # The teststand BMCs genuinely share MC-2's IPMI segment (and so mc1's
+    # placeholder): reported, because a dead /25 is still ambiguous.
+    assert sum("overlaps teststand.ipmi 192.168.157.128/25" in m for m in warnings) == 2
     assert any(m.startswith("location mc1 has no nodes configured")
                and "status: pending" in m for m in warnings)
     assert any("mc2.ipmi 192.168.157.0/24 is the same subnet as mc1.ipmi "
@@ -120,10 +123,10 @@ def test_stage_problems(tmp_path):
 
 def test_node_inventory_validate_exit_status_and_json(capsys, tmp_path):
     assert node_inventory.main(["--validate", "-q"]) == 0      # warnings only
-    assert "4 warning(s)" in capsys.readouterr().out
+    assert "6 warning(s)" in capsys.readouterr().out
     assert node_inventory.main(["--validate", "--json", "-q"]) == 0
     payload = json.loads(capsys.readouterr().out)
-    assert payload["ok"] is True and payload["counts"]["warning"] == 4
+    assert payload["ok"] is True and payload["counts"]["warning"] == 6
 
     bad = tmp_path / "bad.yaml"
     bad.write_text(yaml.safe_dump({"locations": {"a": {

@@ -170,7 +170,7 @@ def run(argv: Optional[Sequence[str]], credentials: ExitStack) -> int:
     if session.warning and not args.quiet:
         print(f"  note: {session.warning}\n")
     factory = session.factory
-    gateway_host = args.gateway or factory.gateway_for(location)
+    gateway_host = args.gateway or factory.gateway_for(location, role="ipmi")
     if not gateway_host:
         print(f"error: no gateway for {location} answered ssh; ipmitool cannot "
               f"be run", file=sys.stderr)

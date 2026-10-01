@@ -135,8 +135,9 @@ class SimulatedSSHFactory:
         for pattern, response in (rules if rules is not None else healthy_node_rules()):
             self.base.expect(pattern, response)
 
-    def gateway_for(self, location: str) -> Optional[str]:
-        gateways = self.topology.gateways(location)
+    def gateway_for(self, location: str, role: str = "ssh") -> Optional[str]:
+        gateways = self.topology.ipmi_gateways(location) if role == "ipmi" \
+            else self.topology.gateways(location)
         return gateways[0] if gateways else None
 
     def for_host(self, host: str, jump: Optional[str] = None,
@@ -311,7 +312,7 @@ class Orchestrator:
             # pretend it switched anything.
             # One per location, like a real run, all on the shared breaker.
             for location in self.locations:
-                gateway = self.ssh_factory.gateway_for(location)
+                gateway = self.ssh_factory.gateway_for(location, role="ipmi")
                 if not gateway:
                     continue
                 self.ipmi_clients[location] = IPMIClient(
@@ -380,7 +381,10 @@ class Orchestrator:
         return info
 
     def _make_ipmi_clients(self, creds: Any) -> Dict[str, IPMIClient]:
-        """One IPMI client per location, each on a gateway of that location.
+        """One IPMI client per location, each on an IPMI gateway of that location.
+
+        The IPMI gateway is ``ipmi_gateways:`` when the location names one
+        (the teststand's BMCs are on the MC-2 segment), else ``gateways:``.
 
         The IPMI subnets are per site and not routable between them, so a BMC
         must be driven from its own location's gateway; one client for the
@@ -391,7 +395,7 @@ class Orchestrator:
         """
         clients: Dict[str, IPMIClient] = {}
         for location in self.locations:
-            gateway_host = self.ssh_factory.gateway_for(location)
+            gateway_host = self.ssh_factory.gateway_for(location, role="ipmi")
             if not gateway_host:
                 log.error("no gateway is reachable for %s; its BMCs cannot be "
                           "driven", location)

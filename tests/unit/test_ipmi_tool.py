@@ -40,7 +40,7 @@ def contacted(monkeypatch):
         def __init__(self, *args, **kwargs):
             seen["factory"] += 1
 
-        def gateway_for(self, location):
+        def gateway_for(self, location, role="ssh"):
             return "mu2egateway01.fnal.gov"
 
         def for_host(self, host, **kwargs):

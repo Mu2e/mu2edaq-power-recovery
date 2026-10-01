@@ -271,8 +271,9 @@ class Topology:
         for host in self._protected:
             require_hostname(host, "protected:")
         for loc, info in self._locations.items():
-            for gw in (info or {}).get("gateways", []) or []:
-                require_hostname(gw, f"locations.{loc}.gateways")
+            for key in ("gateways", "ipmi_gateways"):
+                for gw in (info or {}).get(key, []) or []:
+                    require_hostname(gw, f"locations.{loc}.{key}")
             for network, entries in ((info or {}).get("networks", {}) or {}).items():
                 for host in expand_entries(entries, self.domain, self.default_prefix):
                     require_hostname(host, f"locations.{loc}.networks.{network}")
@@ -323,6 +324,17 @@ class Topology:
 
     def gateways(self, location: str) -> List[str]:
         return list(self.location_info(location).get("gateways", []) or [])
+
+    def ipmi_gateways(self, location: str) -> List[str]:
+        """Hosts that run ipmitool for *location*'s BMCs.
+
+        ``ipmi_gateways:`` when the location sets it, else ``gateways:``. They
+        differ at the teststand: its BMCs sit on the MC-2 IPMI segment
+        (192.168.157.0/24), which mu2edaq-gateway has no interface on, so they
+        are driven from the MC-2 gateways (verified live 2026-10-01).
+        """
+        explicit = self.location_info(location).get("ipmi_gateways")
+        return list(explicit) if explicit else self.gateways(location)
 
     def hostnames(self, location: str, network: str) -> List[str]:
         """Raw expanded hostnames for one location/network, upstream-compatible."""
@@ -518,8 +530,9 @@ def _validate(topology: "Topology",
     for host in topology._protected:
         raw_names.append((host, "protected:"))
     for loc, info in topology._locations.items():
-        for gw in (info or {}).get("gateways", []) or []:
-            raw_names.append((gw, f"locations.{loc}.gateways"))
+        for key in ("gateways", "ipmi_gateways"):
+            for gw in (info or {}).get(key, []) or []:
+                raw_names.append((gw, f"locations.{loc}.{key}"))
         for network, entries in ((info or {}).get("networks", {}) or {}).items():
             try:
                 hosts = expand_entries(entries, topology.domain, topology.default_prefix)

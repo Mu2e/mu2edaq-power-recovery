@@ -218,8 +218,11 @@ class TicketInfo:
 #: klist -s exits 0 when the cache holds a ticket that has not expired.  That
 #: is the authoritative validity test; the text parse below is only for the
 #: human-facing detail (which principal, how much longer).
-_PRINCIPAL_RE = re.compile(r"Default principal:\s*(\S+)", re.I)
-_CACHE_RE = re.compile(r"Ticket cache:\s*(\S+)", re.I)
+#: MIT prints "Ticket cache:" / "Default principal:"; Heimdal (macOS) prints
+#: "Credentials cache:" / "Principal:". The ticket table's "Principal" column
+#: heading has no colon, so it does not match.
+_PRINCIPAL_RE = re.compile(r"^\s*(?:Default\s+)?principal:\s*(\S+)", re.I | re.M)
+_CACHE_RE = re.compile(r"^\s*(?:Ticket|Credentials)\s+cache:\s*(\S+)", re.I | re.M)
 
 
 class KerberosManager:
@@ -305,16 +308,24 @@ class KerberosManager:
         and harmless -- validity comes from ``klist -s``, and this only feeds
         the "renew early" convenience check.
         """
+        import datetime as _dt
         for line in text.splitlines():
             parts = line.split()
             if len(parts) >= 4 and "/" in parts[0] and ":" in parts[1]:
+                # MIT: "10/01/26 13:24:02  10/02/26 15:24:02  krbtgt/..."
                 for fmt in ("%m/%d/%y %H:%M:%S", "%m/%d/%Y %H:%M:%S",
                             "%m/%d/%y %H:%M", "%m/%d/%Y %H:%M"):
                     try:
-                        import datetime as _dt
                         return _dt.datetime.strptime(f"{parts[2]} {parts[3]}", fmt).timestamp()
                     except ValueError:
                         continue
+            elif len(parts) >= 9 and ":" in parts[2] and ":" in parts[6]:
+                # Heimdal: "Oct  1 13:24:02 2026  Oct  2 15:24:02 2026  krbtgt/..."
+                try:
+                    return _dt.datetime.strptime(" ".join(parts[4:8]),
+                                                 "%b %d %H:%M:%S %Y").timestamp()
+                except ValueError:
+                    continue
         return None
 
     def current(self) -> TicketInfo:
@@ -346,7 +357,7 @@ class KerberosManager:
                     "--principal <principal> to have this tool acquire one."
                 )
             log.info("using the ambient Kerberos ticket: %s",
-                     info.principal or "(principal unknown)")
+                     principal or "(principal unknown)")
             return info
 
         cache: Any = self.cache_for(principal)

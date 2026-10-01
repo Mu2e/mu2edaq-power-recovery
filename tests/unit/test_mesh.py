@@ -53,7 +53,7 @@ class RoutingFactory:
         for loc in topology.locations:
             self.gateways.update(topology.gateways(loc))
 
-    def gateway_for(self, location):
+    def gateway_for(self, location, role="ssh"):
         gws = self.topology.gateways(location)
         return gws[0] if gws else None
 
@@ -425,8 +425,8 @@ def test_a_gatewayless_location_does_not_hide_behind_a_healthy_one(
     nodes = _nodes(topology, "mu2e-dl-01")
     ts = [n for n in topology.all_nodes(["teststand"]) if n.has_network("ipmi")][:1]
     assert ts, "the topology has a teststand BMC"
-    real = topology.gateways
-    monkeypatch.setattr(topology, "gateways",
+    real = topology.ipmi_gateways
+    monkeypatch.setattr(topology, "ipmi_gateways",
                         lambda loc: [] if loc == "teststand" else real(loc))
     (res,) = _probe(RoutingFactory(topology), checks_config, [IPMI]).run_all(
         nodes + ts)
@@ -474,3 +474,72 @@ def test_sigterm_mid_mesh_cancels_the_queued_sources(topology, checks_config):
         release.set()
         signal.signal(signal.SIGTERM, previous)
     assert len(started) == 1, "a queued mesh source was started"
+
+
+# ---------------------------------------------------------------------------
+# Found on the live cluster, 2026-10-01
+# ---------------------------------------------------------------------------
+
+DATA = {"name": "data", "full_mesh": True, "mtu_probe": False}
+
+
+def _two_sites(topology):
+    return (topology.resolve(["mu2e-trk-01", "mu2e-dl-01"], ["mc2"])
+            + topology.resolve(["mu2edaq07", "mu2edaq13"], ["teststand"]))
+
+
+def test_a_full_mesh_stays_inside_each_location(topology, checks_config):
+    """MC-2 and the teststand both use 10.226.9.0/24 on separate segments:
+    a cross-site pair is not a path (live: every one ARP-failed)."""
+    nodes = _two_sites(topology)
+    loc = {n.networks["data"]: n.location for n in nodes}
+    loc.update({n.hostname: n.location for n in nodes})
+    (res,) = _probe(RoutingFactory(topology), checks_config, [DATA]).run_all(nodes)
+    assert res.edges
+    assert all(loc[e.source] == loc[e.target] for e in res.edges)
+    assert len(res.edges) == 2 + 2      # 2 ordered pairs per two-node site
+
+
+def test_cross_location_true_restores_the_whole_run_mesh(topology, checks_config):
+    nodes = _two_sites(topology)
+    (res,) = _probe(RoutingFactory(topology), checks_config,
+                    [dict(DATA, cross_location=True)]).run_all(nodes)
+    assert len(res.edges) == 4 * 3
+
+
+def test_target_hosts_maps_network_names_back_to_nodes(topology, checks_config):
+    nodes = _two_sites(topology)
+    (res,) = _probe(RoutingFactory(topology), checks_config, [DATA]).run_all(nodes)
+    assert res.target_hosts == {n.networks["data"]: n.hostname for n in nodes}
+
+
+def test_a_lost_path_is_a_failure_not_a_jumbo_failure():
+    """Live run: 487 paths lost every packet and 9 had an MTU problem; the
+    summary said "496 jumbo-frame failure(s)"."""
+    lost = MeshEdge("a", "b-data", "data", ok=False, tested=True, loss_pct=100.0,
+                    mtu_ok=False)
+    small_only = MeshEdge("a", "c-data", "data", ok=True, tested=True, loss_pct=0.0,
+                          mtu_ok=False)
+    res = MeshResult(network="data", full_mesh=True, edges=[lost, small_only])
+    assert res.failures == [lost]
+    assert res.mtu_failures == [small_only]
+
+
+def test_ipmi_gateways_override_the_ssh_gateways(topology, checks_config, monkeypatch):
+    """The teststand's BMCs are on the MC-2 IPMI segment; mu2edaq-gateway has
+    no interface there, so they are probed (and driven) from MC-2's gateways."""
+    mc2_gws = topology.gateways("mc2")
+    monkeypatch.setitem(topology.location_info("teststand"), "ipmi_gateways", mc2_gws)
+    assert topology.ipmi_gateways("teststand") == mc2_gws
+    assert topology.gateways("teststand") == ["mu2edaq-gateway.fnal.gov"]
+    nodes = topology.resolve(["mu2edaq07"], ["teststand"])
+    (res,) = _probe(RoutingFactory(topology), checks_config, [IPMI]).run_all(nodes)
+    assert {e.source for e in res.edges} == set(mc2_gws)
+
+
+def test_ipmi_gateways_default_to_the_location_gateways(topology):
+    for loc in topology.locations:
+        if not topology.location_info(loc).get("ipmi_gateways"):
+            assert topology.ipmi_gateways(loc) == topology.gateways(loc)
+    assert topology.ipmi_gateways("mc2") == topology.gateways("mc2")
+    assert topology.ipmi_gateways("teststand") == topology.gateways("mc2")

@@ -101,6 +101,22 @@ in
 \(em the IPMI network in the shipped configuration \(em and every gateway
 listed is used there, not only the first that answers.
 .TP
+.I ipmi_gateways
+Optional. The hosts that run
+.B ipmitool
+for this location's BMCs, and the IPMI mesh's probe sources, when they are not
+the
+.IR gateways .
+Unset, the
+.I gateways
+are used. The shipped teststand sets it to the two MC-2 gateways: its BMCs are
+on the MC-2 IPMI segment, which
+.B mu2edaq-gateway
+has no interface on. A gateway that is not an IPMI gateway for its location
+reports
+.B net.ipmi_reach
+as skip.
+.TP
 .I subnets
 Network name to CIDR. These are what
 .I net.interfaces

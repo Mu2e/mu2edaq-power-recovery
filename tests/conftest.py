@@ -64,7 +64,7 @@ class FakeFactory:
         self.transport = transport
         self.topology = topology
 
-    def gateway_for(self, location):
+    def gateway_for(self, location, role="ssh"):
         gateways = self.topology.gateways(location)
         return gateways[0] if gateways else None
 

@@ -382,7 +382,7 @@ def test_root_transports_get_the_root_chain(settings, topology, manager,
                                             monkeypatch):
     factory = SSHFactory(settings, topology, kerberos=manager)
     # Resolving a gateway probes it for real; the chain is what is under test.
-    monkeypatch.setattr(factory, "gateway_for", lambda location: "gw.fnal.gov")
+    monkeypatch.setattr(factory, "gateway_for", lambda location, role="ssh": "gw.fnal.gov")
     node = topology.node("mu2e-trk-01")
     transport = factory.for_node(node, root=True)
     names = [c.name for c in transport.credentials]
@@ -1129,11 +1129,11 @@ def test_the_gateways_are_probed_once_even_if_every_worker_asks_at_once(
     probes = []
     factory = SSHFactory(settings, topology)
 
-    def slow_probe(self, location):
+    def slow_probe(self, location, role="ssh"):
         probes.append(location)
         time.sleep(0.05)          # widen the window a real probe leaves open
-        self._gateway_cache[location] = "mu2egateway01.fnal.gov"
-        return self._gateway_cache[location]
+        self._gateway_cache[(location, role)] = "mu2egateway01.fnal.gov"
+        return self._gateway_cache[(location, role)]
 
     monkeypatch.setattr(ssh_module.SSHFactory, "_select_gateway", slow_probe)
     with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
@@ -1537,3 +1537,42 @@ def test_identity_discovery_runs_once_per_manager(manager):
     # The live switch still applies: memoised discovery is not memoised policy.
     manager.settings.set("kerberos.use_service_keytabs", False)
     assert manager.available_identities() == []
+
+
+# klist output captured on the operator's laptop (macOS Heimdal, 2026-10-01)
+# and its MIT krb5 equivalent. The parser saw neither the principal nor the
+# expiry in the Heimdal form, so the min_lifetime renewal never applied there.
+HEIMDAL_KLIST = (
+    "Credentials cache: API:FA160045-3597-4D9D-B4E6-7E0DCCF88078\n"
+    "        Principal: anorman@FNAL.GOV\n"
+    "\n"
+    "  Issued                Expires               Principal\n"
+    "Oct  1 13:24:02 2026  Oct  2 15:24:02 2026  krbtgt/FNAL.GOV@FNAL.GOV\n"
+    "Oct  1 13:44:56 2026  Oct  2 15:24:02 2026  host/mu2egateway01.fnal.gov@FNAL.GOV\n"
+)
+MIT_KLIST = (
+    "Ticket cache: FILE:/tmp/krb5cc_501\n"
+    "Default principal: anorman@FNAL.GOV\n"
+    "\n"
+    "Valid starting       Expires              Service principal\n"
+    "10/01/2026 13:24:02  10/02/2026 15:24:02  krbtgt/FNAL.GOV@FNAL.GOV\n"
+)
+
+
+@pytest.mark.parametrize("text, cache", [
+    (HEIMDAL_KLIST, "API:FA160045-3597-4D9D-B4E6-7E0DCCF88078"),
+    (MIT_KLIST, "FILE:/tmp/krb5cc_501"),
+], ids=["heimdal", "mit"])
+def test_klist_principal_cache_and_expiry_parse_in_both_dialects(text, cache):
+    import datetime as dt
+    from mu2edaq_power_recovery.creds import kerberos as k
+    assert k._PRINCIPAL_RE.search(text).group(1) == "anorman@FNAL.GOV"
+    assert k._CACHE_RE.search(text).group(1) == cache
+    assert k.KerberosManager._parse_expiry(text) == \
+        dt.datetime(2026, 10, 2, 15, 24, 2).timestamp()
+
+
+def test_heimdal_expired_ticket_falls_through_to_the_next_line():
+    from mu2edaq_power_recovery.creds import kerberos as k
+    text = HEIMDAL_KLIST.replace("Oct  2 15:24:02 2026  krbtgt", ">>>Expired<<<  krbtgt", 1)
+    assert k.KerberosManager._parse_expiry(text) is not None

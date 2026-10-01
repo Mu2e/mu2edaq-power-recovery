@@ -120,7 +120,10 @@ def run(orch: Orchestrator, nodes: Optional[Sequence[Node]] = None,
                 f"{m.network}: {len(partial)} source(s) returned no result for "
                 f"some targets ({_sample(partial)}) -- those paths are UNKNOWN; "
                 f"the probe was probably cut off by its timeout")
-        one_way = [h for h in m.unreachable_targets() if h not in isolated]
+        # A target whose own host could not be logged into has not been shown
+        # to "probe out"; it belongs to the dark-source note above.
+        one_way = [h for h in m.unreachable_targets() if h not in isolated
+                   and m.target_hosts.get(h, h) not in dark]
         if one_way:
             result.notes.append(
                 f"{m.network}: {len(one_way)} host(s) could not be reached by "

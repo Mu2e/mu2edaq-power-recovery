@@ -116,6 +116,8 @@ class MeshResult:
     #: Pseudo-sources standing for "this location has no gateway": their
     #: edges are untested, but they are not hosts that could not be reached.
     pseudo_sources: List[str] = field(default_factory=list)
+    #: target name on this network -> the node's hostname (its ssh name).
+    target_hosts: Dict[str, str] = field(default_factory=dict)
 
     @property
     def tested(self) -> List[MeshEdge]:
@@ -132,7 +134,13 @@ class MeshResult:
 
     @property
     def mtu_failures(self) -> List[MeshEdge]:
-        return [e for e in self.edges if e.tested and e.mtu_ok is False]
+        """Paths that answer the ordinary ping but cannot carry a jumbo frame.
+
+        A path that lost every packet also fails the jumbo probe; counting it
+        here too reported 496 "jumbo-frame failures" on a live run in which
+        nine paths actually had an MTU problem.
+        """
+        return [e for e in self.edges if e.tested and e.ok and e.mtu_ok is False]
 
     def uncovered_targets(self) -> List[str]:
         """Targets with no tested edge at all -- nothing is known about them."""
@@ -410,8 +418,10 @@ class MeshProbe:
         orphaned: Dict[str, List[str]] = {}
         for loc in _locations_of(targets):
             names = [t.networks[network] for t in targets if t.location == loc]
-            gws = self.topology.gateways(loc) if (self.topology is not None
-                                                 and loc != "unknown") else []
+            gws = []
+            if self.topology is not None and loc != "unknown":
+                gws = self.topology.ipmi_gateways(loc) if network == "ipmi" \
+                    else self.topology.gateways(loc)
             if not gws:
                 log.warning("mesh %s: location %s has no gateway; %d target(s) "
                             "not probed", network, loc, len(names))
@@ -426,7 +436,7 @@ class MeshProbe:
     def run(self, nodes: Sequence[Any], network: str,
             full_mesh: bool = True, mtu_probe: bool = False,
             origin: str = "nodes", targets: Optional[str] = None,
-            deadline: Any = None) -> MeshResult:
+            deadline: Any = None, cross_location: bool = False) -> MeshResult:
         """Probe *network* across *nodes*.
 
         *targets* is ``all`` or ``anchors``; when omitted it follows
@@ -447,8 +457,15 @@ class MeshProbe:
 
         skipped = [n.hostname for n in nodes if not n.has_network(network)]
         target_nodes = self._targets(nodes, network, target_mode == "all")
-        per_location = isinstance(self.config.get("anchors"), dict) \
-            and target_mode == "anchors"
+        # A full mesh stays inside each location: the private networks are
+        # separate segments per site, and MC-2 and the teststand reuse
+        # 10.226.9.0/24, so a cross-site pair is not a path at all (verified
+        # live: every one fails with ARP "host unreachable").
+        # cross_location: true restores the whole-run mesh for a network that
+        # really spans sites.
+        per_location = (target_mode == "all" and not cross_location) or \
+            (isinstance(self.config.get("anchors"), dict)
+             and target_mode == "anchors")
         orphaned: Dict[str, List[str]] = {}
         if origin == "gateways":
             plans, source_names, orphaned = self._plan_gateways(target_nodes,
@@ -462,6 +479,7 @@ class MeshProbe:
                          sources=source_names,
                          targets=[n.hostname for n in target_nodes],
                          skipped=skipped, origin=origin, target_mode=target_mode)
+        out.target_hosts = {t.networks[network]: t.hostname for t in target_nodes}
         for loc, names in orphaned.items():
             pseudo = f"(no gateway: {loc})"
             out.pseudo_sources.append(pseudo)
@@ -554,6 +572,7 @@ class MeshProbe:
                 full_mesh=bool(entry.get("full_mesh", True)),
                 mtu_probe=bool(entry.get("mtu_probe", False)),
                 origin=str(entry.get("origin", "nodes")),
+                cross_location=bool(entry.get("cross_location", False)),
                 targets=entry.get("targets"),
                 deadline=deadline,
             ))

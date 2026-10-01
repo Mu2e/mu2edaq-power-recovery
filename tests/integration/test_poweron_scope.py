@@ -221,7 +221,10 @@ def test_each_bmc_is_driven_through_its_own_locations_gateway(settings, clock):
         phase2_poweron.run(orch)
         assert sorted(power_on_targets(orch)) == [
             ("mu2e-trk-01-ipmi.fnal.gov", "mu2egateway01.fnal.gov"),
-            ("mu2edaq04-ipmi.fnal.gov", "mu2edaq-gateway.fnal.gov")]
+            # The teststand's BMCs sit on the MC-2 IPMI segment, so its
+            # ipmi_gateways are MC-2's gateways -- still a client of its own.
+            ("mu2edaq04-ipmi.fnal.gov", "mu2egateway01.fnal.gov")]
+        assert orch.ipmi_clients["teststand"] is not orch.ipmi_clients["mc2"]
     finally:
         orch.close()
 
@@ -229,7 +232,7 @@ def test_each_bmc_is_driven_through_its_own_locations_gateway(settings, clock):
 def test_a_location_with_no_gateway_gets_no_client(settings, clock, monkeypatch):
     from mu2edaq_power_recovery.orchestrator import SimulatedSSHFactory
     monkeypatch.setattr(SimulatedSSHFactory, "gateway_for",
-                        lambda self, loc: None if loc == "teststand"
+                        lambda self, loc, role="ssh": None if loc == "teststand"
                         else self.topology.gateways(loc)[0])
     orch = build(settings, clock, locations=("mc2", "teststand"), sequence=MIXED)
     try:
