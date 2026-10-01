@@ -262,7 +262,21 @@ def parse_mdstat(text: str) -> List[MdArray]:
         name, state, _members = m.group(1), m.group(2), m.group(3)
         detail = ""
         healthy = state == "active"
+        block = []
         for follow in lines[idx + 1: idx + 4]:
+            # Stop at the next array: its counts and resync line are its own.
+            if re.match(r"^md\d+\s*:", follow.strip()):
+                break
+            block.append(follow)
+        if any(re.search(r"super external:(imsm|ddf)\b", f) for f in block):
+            # An Intel RST / DDF metadata container (members marked (S)) is
+            # always "inactive"; the arrays it holds are listed separately with
+            # "super external:/mdNNN/N". Live: dl-01's healthy RAID1 was
+            # reported degraded through its container.
+            arrays.append(MdArray(name=name, state=state, healthy=True,
+                                  detail="metadata container"))
+            continue
+        for follow in block:
             # mdstat writes [total/active], e.g. "[2/1] [U_]" for a two-disk
             # mirror with one disk missing.  The detail string echoes that
             # ordering verbatim -- printing it the other way round would have
@@ -401,6 +415,33 @@ def diff_sel(baseline: Dict[str, str], entries: List[SelEntry],
 # ---------------------------------------------------------------------------
 # misc
 # ---------------------------------------------------------------------------
+
+
+def smart_unreadable(text: str) -> bool:
+    """smartctl answered but could not read the verdict (``result: UNKNOWN!``).
+
+    Live on trk-11: "SMART Status command failed: scsi error aborted command".
+    That is "we could not look", not a SMART failure.
+    """
+    return bool(re.search(r"self-assessment test result:\s*UNKNOWN", text or "", re.I))
+
+
+def parse_proc_mounts(text: str) -> Dict[str, Tuple[str, str]]:
+    """``{mountpoint: (source, fstype)}`` from /proc/mounts.
+
+    Read instead of ``df`` for network mounts: ``df -l`` omits them by
+    definition, and plain ``df`` stats every mount, which hangs on a stale
+    NFS handle -- the failure the NFS check exists to find. Octal escapes
+    (``\\040`` for a space) are decoded.
+    """
+    out: Dict[str, Tuple[str, str]] = {}
+    for line in (text or "").splitlines():
+        fields = line.split()
+        if len(fields) < 3:
+            continue
+        unescape = lambda f: re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), f)  # noqa: E731
+        out[unescape(fields[1])] = (unescape(fields[0]), fields[2])
+    return out
 
 
 def parse_smart_health(text: str) -> Optional[bool]:

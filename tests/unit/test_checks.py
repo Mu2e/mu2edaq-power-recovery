@@ -199,13 +199,29 @@ def test_the_nfs_server_does_not_check_its_own_export(make_context):
 
 def test_nfs_from_the_wrong_server_fails(make_context, fake_transport):
     # Passes 'mountpoint' and fails the moment anything reads a file.
-    fake_transport.expect_first(r"\bdf\b", ScriptedResponse(stdout=(
-        "Filesystem            Type 1024-blocks   Used Available Capacity Mounted on\n"
-        "old-server:/home      nfs4     1000000 200000    800000      20% /home\n"
-        "mu2e-mgr-01:/daqlogs  nfs4     1000000 100000    900000      10% /daqlogs")))
+    fake_transport.expect_first(r"cat /proc/mounts", ScriptedResponse(stdout=(
+        "old-server:/home /home nfs4 rw,relatime 0 0\n"
+        "mu2e-mgr-01.fnal.gov:/daqlogs /daqlogs nfs4 rw,relatime 0 0")))
     result = run_check("disk.nfs_from_mgr", make_context("mu2e-dcs-01.fnal.gov"))
     assert result.status is Status.FAIL
     assert any("old-server" in entry for entry in result.data["wrong"])
+
+
+def test_nfs_from_the_manager_passes_on_live_proc_mounts(make_context):
+    """Live dcs-01: both mounts present; 'df -l' had reported them absent."""
+    result = run_check("disk.nfs_from_mgr", make_context("mu2e-dcs-01.fnal.gov"))
+    assert result.status is Status.OK, result.detail
+    assert result.data["sources"] == {"/home": "mu2e-mgr-01.fnal.gov:/home",
+                                      "/daqlogs": "mu2e-mgr-01.fnal.gov:/daqlogs"}
+
+
+def test_a_local_filesystem_where_nfs_is_expected_fails(make_context, fake_transport):
+    fake_transport.expect_first(r"cat /proc/mounts", ScriptedResponse(stdout=(
+        "/dev/sda3 /home xfs rw 0 0\n"
+        "mu2e-mgr-01.fnal.gov:/daqlogs /daqlogs nfs4 rw 0 0")))
+    result = run_check("disk.nfs_from_mgr", make_context("mu2e-dcs-01.fnal.gov"))
+    assert result.status is Status.FAIL
+    assert any("local xfs" in e for e in result.data["wrong"])
 
 
 def test_raid_degradation_fails(make_context, fake_transport):
@@ -406,8 +422,30 @@ def test_a_bmc_that_does_not_answer_still_fails_power_status(make_context,
                                                              fake_transport):
     fake_transport.expect_first(r"chassis power status", ScriptedResponse(
         stderr="Error: Unable to establish IPMI v2 / RMCP+ session", rc=1))
+    fake_transport.expect_first(r"^ping |ping -c", ScriptedResponse(
+        stdout="1 packets transmitted, 0 received, 100% packet loss", rc=1))
     result = run_check("power.status", make_context(ipmi=_ipmi(fake_transport)))
     assert result.status is Status.FAIL and "does not answer" in result.summary
+
+
+def test_a_bmc_that_pings_but_will_not_open_a_session_is_unknown(make_context,
+                                                                  fake_transport):
+    """Live: the teststand BMCs answer ping from the MC-2 gateways and refuse
+    the MC-2 account. Not "no standby power"; we could not look."""
+    fake_transport.expect_first(r"chassis power status", ScriptedResponse(
+        stderr="Error: Unable to establish IPMI v2 / RMCP+ session", rc=1))
+    result = run_check("power.status", make_context(ipmi=_ipmi(fake_transport)))
+    assert result.status is Status.UNKNOWN
+    assert "answers ping but will not open" in result.summary
+
+
+def test_an_unresolvable_bmc_name_is_unknown_not_dark(make_context, fake_transport):
+    fake_transport.expect_first(r"chassis power status", ScriptedResponse(
+        stderr="Address lookup for mu2e-trk-01-ipmi.fnal.gov failed\n"
+               "Could not open socket!\n"
+               "Error: Unable to establish IPMI v2 / RMCP+ session", rc=1))
+    result = run_check("power.status", make_context(ipmi=_ipmi(fake_transport)))
+    assert result.status is Status.UNKNOWN and "does not resolve" in result.summary
 
 
 def test_sel_empty_log_is_clean(make_context, fake_transport):
@@ -468,3 +506,34 @@ def test_sel_all_new_full_tail_notes_possible_truncation(make_context,
                         before=_rows(1, 20))
     assert result.data["possibly_truncated"] is True
     assert "scrolled out" in result.detail
+
+
+def test_login_script_noise_does_not_fail_a_good_login(make_context, fake_transport):
+    """Live cfo-01: mu2eshift logs in fine; its profile prints status lines
+    first and a kdestroy complaint on stderr."""
+    from mu2edaq_power_recovery.checks.reachability import LOGIN_MARKER
+    fake_transport.expect_first(r"su - mu2eshift", ScriptedResponse(
+        stdout=("Configuring Git User Information: \x1b[32mPass\x1b[0m\n"
+                "Configuring Git SSH Command: \x1b[31mFail\x1b[0m\n"
+                f"{LOGIN_MARKER}\n/home/mu2eshift\nmu2eshift\n"),
+        stderr="kdestroy: No credentials cache found while destroying cache\n"))
+    result = run_check("login.users", make_context("mu2e-cfo-01.fnal.gov"))
+    assert result.status is Status.OK, result.detail
+
+
+def test_a_login_without_a_home_still_fails(make_context, fake_transport):
+    from mu2edaq_power_recovery.checks.reachability import LOGIN_MARKER
+    fake_transport.expect_first(r"su - mu2eshift", ScriptedResponse(
+        stdout=f"{LOGIN_MARKER}\n", stderr="su: warning: cannot change directory to /home/mu2eshift",
+        rc=1))
+    result = run_check("login.users", make_context("mu2e-cfo-01.fnal.gov"))
+    assert result.status is Status.FAIL
+
+
+def test_smart_unreadable_is_unknown(make_context, fake_transport):
+    from tests.unit.test_parsers import TRK11_SDC
+    fake_transport.expect_first(r"smartctl -H /dev/nvme0n1",
+                                ScriptedResponse(stdout=TRK11_SDC, rc=4))
+    result = run_check("disk.smart", make_context("mu2e-trk-11.fnal.gov"))
+    assert result.status is Status.UNKNOWN
+    assert result.data["unreadable"] == ["nvme0n1"]

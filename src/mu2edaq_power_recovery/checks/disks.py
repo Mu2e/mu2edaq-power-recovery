@@ -12,7 +12,7 @@ from typing import Dict, List
 from ..transport.base import TransportError
 from .base import CheckContext, CheckResult, Status, register, result
 from .parsers import (find_disk_errors, parse_df, parse_mdstat,
-                      parse_smart_health)
+                      parse_proc_mounts, parse_smart_health, smart_unreadable)
 
 #: -P keeps one filesystem per line, -T shows the type, and the -x exclusions
 #: drop pseudo-filesystems that are always "full" and never interesting.
@@ -122,7 +122,9 @@ def disk_nfs_from_mgr(ctx: CheckContext) -> CheckResult:
         return result(ctx, "disk.nfs_from_mgr", Status.SKIP,
                       "no NFS mounts configured for this location", "", {}, started)
 
-    rows = {f.mountpoint: f for f in parse_df(ctx.run(DF_COMMAND).output)}
+    # /proc/mounts, not DF_COMMAND: that is 'df -l', local filesystems only,
+    # so every NFS mount read as "not mounted" (live, all three DCS hosts).
+    mounts = parse_proc_mounts(ctx.run(["cat", "/proc/mounts"]).output)
     wrong: List[str] = []
     unreadable: List[str] = []
     checked: Dict[str, str] = {}
@@ -131,13 +133,16 @@ def disk_nfs_from_mgr(ctx: CheckContext) -> CheckResult:
         path, server = entry["path"], entry["server"]
         if server.split(".")[0] == ctx.node.short:
             continue
-        row = rows.get(path)
+        row = mounts.get(path)
         if row is None:
             wrong.append(f"{path}: not mounted")
             continue
-        checked[path] = row.source
-        if server.split(".")[0] not in row.source:
-            wrong.append(f"{path}: mounted from {row.source}, expected {server}")
+        source, fstype = row
+        checked[path] = source
+        if not fstype.startswith("nfs"):
+            wrong.append(f"{path}: a local {fstype} filesystem, expected NFS from {server}")
+        elif server.split(".")[0] not in source:
+            wrong.append(f"{path}: mounted from {source}, expected {server}")
         # A stale NFS handle hangs rather than failing, so bound this hard.
         try:
             if not ctx.run(["ls", "-d", path], timeout=20).ok:
@@ -177,22 +182,32 @@ def disk_smart(ctx: CheckContext) -> CheckResult:
 
     failed: List[str] = []
     unsupported: List[str] = []
+    unreadable: List[str] = []
     passed: List[str] = []
     for dev in devices:
         res = ctx.run(["smartctl", "-H", f"/dev/{dev}"], root=True, timeout=45)
         verdict = parse_smart_health(res.output)
-        if verdict is None:
+        if smart_unreadable(res.output):
+            unreadable.append(dev)
+        elif verdict is None:
             unsupported.append(dev)
         elif verdict:
             passed.append(dev)
         else:
             failed.append(dev)
 
-    data = {"passed": passed, "failed": failed, "unsupported": unsupported}
+    data = {"passed": passed, "failed": failed, "unsupported": unsupported,
+            "unreadable": unreadable}
     if failed:
         return result(ctx, "disk.smart", Status.FAIL,
                       f"SMART reports failure on {', '.join(failed)}",
                       "replace before returning the node to service", data, started)
+    if unreadable:
+        return result(ctx, "disk.smart", Status.UNKNOWN,
+                      f"SMART verdict could not be read on {', '.join(unreadable)}",
+                      "the device answered smartctl but not its health query -- "
+                      "often a failing drive; see disk.errors for this boot",
+                      data, started)
     summary = f"{len(passed)} device(s) pass SMART"
     if unsupported:
         summary += f", {len(unsupported)} without SMART data"

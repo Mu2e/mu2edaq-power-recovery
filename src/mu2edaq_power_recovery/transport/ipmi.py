@@ -264,6 +264,10 @@ class IPMIClient:
         self.breaker = breaker if breaker is not None else CredentialBreaker()
         #: Ping each BMC from the gateway before an unproven invocation.
         self.reachability_precheck = reachability_precheck
+        #: bmc -> why power_status() found it UNREACHABLE: "unresolved" (no
+        #: DNS on the gateway), "no_session" (answers ping, no IPMI session),
+        #: "dark" (answers nothing) or "gateway" (the gateway itself failed).
+        self.unreachable_reason: Dict[str, str] = {}
 
     @property
     def credentials_refused(self) -> Optional[str]:
@@ -564,13 +568,39 @@ class IPMIClient:
             result = self._run(bmc_host, ["chassis", "power", "status"])
         except IPMICredentialsRefused:
             return PowerState.REFUSED
+        except IPMIUnreachable:
+            self.unreachable_reason[bmc_host] = "dark"
+            return PowerState.UNREACHABLE
         except IPMIError:
+            self.unreachable_reason[bmc_host] = "gateway"
             return PowerState.UNREACHABLE
         if not result.ok:
             if result.meta.get("credentials_refused"):
                 return PowerState.REFUSED
+            self.unreachable_reason[bmc_host] = self._why_unreachable(bmc_host, result)
             return PowerState.UNREACHABLE
         return PowerState.parse(result.output)
+
+    def _why_unreachable(self, bmc_host: str, result: CommandResult) -> str:
+        """Tell a missing name and a BMC that will not talk from a dark one.
+
+        All three end in ipmitool's "Unable to establish" line. On the live
+        teststand they were all reported as "does not answer ... no standby
+        power", which is true only of the last. One ping from the gateway, on
+        failure only, separates a BMC that answers but refuses a session.
+        """
+        text = (result.stderr + result.stdout).lower()
+        if UNRESOLVED in text:
+            return "unresolved"
+        if result.meta.get("answered_ping"):
+            return "no_session"
+        if UNESTABLISHED in text and self.reachability_precheck:
+            try:
+                if self._precheck(bmc_host):
+                    return "no_session"
+            except IPMIError:
+                pass
+        return "dark"
 
     def sensors(self, bmc_host: str) -> List[SensorReading]:
         """Parse ``sdr elist`` into readings.

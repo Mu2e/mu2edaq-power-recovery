@@ -706,7 +706,10 @@ def test_unable_to_establish_after_a_proven_credential_does_not_count():
     for i in range(4):
         assert client.power_status(f"bmc-{i}") is PowerState.UNREACHABLE
     assert client.credentials_refused is None
-    assert gateway.pings == 0, "a proven credential needs no pre-check"
+    # No pre-check before any invocation; one diagnostic ping after each
+    # failure, to tell "answers but no session" from dark.
+    assert gateway.invocations == 4
+    assert gateway.pings == 4
 
 
 def test_with_the_precheck_off_nothing_is_pinged_and_nothing_trips():

@@ -353,3 +353,57 @@ def test_a_capture_cut_mid_row_drops_only_the_fragments():
     text = (LIVE_SEL["mu2e-trk-01"][0] + "\nb3c7 | 0\n...[output truncated]...\nsserted\n"
             + LIVE_SEL["mu2e-trk-01"][2])
     assert [e.record_id for e in parse_sel_list(text)] == ["b240", "b62e"]
+
+
+# /proc/mdstat on mu2e-dl-01, 2026-10-01: a healthy Intel RST (IMSM) RAID1
+# and its metadata container, which is always "inactive" with (S) members.
+DL01_MDSTAT = """Personalities : [raid1]
+md126 : active raid1 nvme0n1[1] nvme1n1[0]
+      927916032 blocks super external:/md127/0 [2/2] [UU]
+
+md127 : inactive nvme1n1[1](S) nvme0n1[0](S)
+      10402 blocks super external:imsm
+
+unused devices: <none>
+"""
+
+
+def test_an_imsm_container_is_not_a_degraded_array():
+    from mu2edaq_power_recovery.checks.parsers import parse_mdstat
+    arrays = {a.name: a for a in parse_mdstat(DL01_MDSTAT)}
+    assert arrays["md126"].healthy and arrays["md127"].healthy
+    assert arrays["md127"].detail == "metadata container"
+
+
+def test_mdstat_lookahead_stops_at_the_next_array():
+    from mu2edaq_power_recovery.checks.parsers import parse_mdstat
+    text = ("md0 : active raid1 sda1[0] sdb1[1]\n"
+            "md1 : active raid1 sdc1[0] sdd1[1]\n"
+            "      100 blocks [2/1] [U_]\n")
+    arrays = {a.name: a for a in parse_mdstat(text)}
+    assert arrays["md0"].healthy and not arrays["md1"].healthy
+
+
+# smartctl -H on mu2e-trk-11 /dev/sdc, 2026-10-01.
+TRK11_SDC = """smartctl 7.2 2020-12-30 r5155 [x86_64-linux-5.14.0-687.31.1.el9_8.x86_64] (local build)
+
+Read SMART Data failed: scsi error aborted command
+
+=== START OF READ SMART DATA SECTION ===
+SMART Status command failed: scsi error aborted command
+SMART overall-health self-assessment test result: UNKNOWN!
+SMART Status, Attributes and Thresholds cannot be read.
+"""
+
+
+def test_an_unreadable_smart_verdict_is_not_a_failure():
+    from mu2edaq_power_recovery.checks.parsers import smart_unreadable
+    assert smart_unreadable(TRK11_SDC)
+    assert not smart_unreadable("SMART overall-health self-assessment test result: FAILED!")
+    assert not smart_unreadable("SMART overall-health self-assessment test result: PASSED")
+
+
+def test_proc_mounts_decodes_octal_escapes():
+    from mu2edaq_power_recovery.checks.parsers import parse_proc_mounts
+    m = parse_proc_mounts("srv:/a\\040b /mnt/a\\040b nfs4 rw 0 0\n")
+    assert m == {"/mnt/a b": ("srv:/a b", "nfs4")}
