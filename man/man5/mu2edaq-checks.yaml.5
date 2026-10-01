@@ -39,6 +39,14 @@ Load average per core above which a freshly booted node is suspicious.
 Uptime above which a node that phase 2 just powered on is flagged \(em it did
 not actually reboot, so the IPMI command probably reached a different chassis.
 .TP
+.I kernel_taint_ignore
+Kernel taint flags, by letter, that
+.B host.kernel
+does not warn about. Default
+.BR "[O, E]" :
+the DAQ driver stack (\fBmu2e\fR, \fBTRACE\fR) is an out-of-tree, unsigned
+module on every DAQ node. Any other flag still warns, and the summary names it.
+.TP
 .IR ping_count ", " ping_timeout_s ", " ssh_connect_timeout_s ", " ipmi_timeout_s
 Per-probe budgets.
 .SS mounts

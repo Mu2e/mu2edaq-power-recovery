@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import time
+from typing import List
 
 from .base import CheckContext, CheckResult, Status, register, result
 from .parsers import parse_load, parse_proc_uptime
@@ -68,14 +69,31 @@ def host_kernel(ctx: CheckContext) -> CheckResult:
         tainted = int(tainted_raw)
     except ValueError:
         tainted = 0
-    data = {"kernel": release, "tainted": tainted}
+    flags = taint_flags(tainted)
+    ignore = set(ctx.threshold("kernel_taint_ignore", ["O", "E"]) or [])
+    unexpected = [f for f in flags if f not in ignore]
+    data = {"kernel": release, "tainted": tainted, "flags": flags,
+            "ignored": sorted(set(flags) & ignore)}
     if not release:
         return result(ctx, "host.kernel", Status.UNKNOWN,
                       "could not read the kernel release", "", data, started)
-    if tainted:
+    if unexpected:
         return result(ctx, "host.kernel", Status.WARN,
-                      f"kernel {release}, tainted ({tainted})",
+                      f"kernel {release}, tainted {''.join(unexpected)} ({tainted})",
                       "a tainted kernel after a power event often means a driver "
                       "failed to load or a machine check was recorded",
                       data, started)
-    return result(ctx, "host.kernel", Status.OK, f"kernel {release}", "", data, started)
+    note = f" (taint {''.join(flags)} expected)" if flags else ""
+    return result(ctx, "host.kernel", Status.OK, f"kernel {release}{note}", "",
+                  data, started)
+
+
+#: /proc/sys/kernel/tainted bit -> the letter the kernel uses for it
+#: (Documentation/admin-guide/tainted-kernels.rst).
+TAINT_LETTERS = "PFSRMBUDAWCIOELKXT"
+
+
+def taint_flags(word: int) -> List[str]:
+    """Letters for the bits set in a taint word, lowest bit first."""
+    return [TAINT_LETTERS[i] if i < len(TAINT_LETTERS) else f"bit{i}"
+            for i in range(max(word.bit_length(), 0)) if word >> i & 1]

@@ -25,6 +25,11 @@ thresholds:
   # A node that claims an uptime longer than this after we just powered it on
   # did not actually reboot -- flagged so the operator notices.
   max_post_boot_uptime_s: 3600
+  # Kernel taint flags host.kernel does not warn about. The DAQ driver stack
+  # (mu2e, TRACE) is out-of-tree (O) and unsigned (E) on every DAQ node --
+  # verified live 2026-10-01 -- so those two are expected. Anything else
+  # (W warning, M machine check, D oops, ...) still warns.
+  kernel_taint_ignore: [O, E]
   # ICMP / TCP probe budget.
   ping_count: 3
   ping_timeout_s: 5

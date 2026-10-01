@@ -338,8 +338,9 @@ def test_uptime_flags_a_node_that_did_not_actually_reboot(make_context):
 
 
 def test_a_tainted_kernel_warns(make_context, fake_transport):
+    # 4096 (O) alone is the expected DAQ driver; 4096|128 adds M, a machine check.
     fake_transport.expect_first(r"/proc/sys/kernel/tainted",
-                                ScriptedResponse(stdout="4096"))
+                                ScriptedResponse(stdout="4224"))
     assert run_check("host.kernel", make_context()).status is Status.WARN
 
 
@@ -537,3 +538,19 @@ def test_smart_unreadable_is_unknown(make_context, fake_transport):
     result = run_check("disk.smart", make_context("mu2e-trk-11.fnal.gov"))
     assert result.status is Status.UNKNOWN
     assert result.data["unreadable"] == ["nvme0n1"]
+
+
+@pytest.mark.parametrize("word, status, letters", [
+    (12288, Status.OK, ""),          # O|E: mu2e and TRACE modules, live
+    (12292, Status.WARN, "S"),       # plus S: CPU out of spec, live on calo-02
+    (512, Status.WARN, "W"),         # a kernel WARN since boot
+    (0, Status.OK, ""),
+])
+def test_kernel_taint_ignores_only_the_configured_flags(make_context, fake_transport,
+                                                        word, status, letters):
+    fake_transport.expect_first(r"/proc/sys/kernel/tainted",
+                                ScriptedResponse(stdout=str(word)))
+    result = run_check("host.kernel", make_context())
+    assert result.status is status
+    if letters:
+        assert f"tainted {letters} " in result.summary
