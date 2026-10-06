@@ -42,7 +42,8 @@ import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-from .base import Command, CommandResult, TimeoutExpired, Transport, TransportError, as_string
+from .base import (Command, CommandResult, TimeoutExpired, Transport, TransportError,
+                   as_string, is_deadline_exempt)
 from .local import LocalTransport
 
 log = logging.getLogger(__name__)
@@ -237,7 +238,7 @@ class SSHTransport(Transport):
         """
         wanted = float(timeout or self.command_timeout)
         deadline = self.deadline_source() if self.deadline_source else None
-        if deadline is None:
+        if deadline is None or is_deadline_exempt():
             return wanted
         if deadline.expired():
             raise TimeoutExpired(f"{self.host}: run.phase_timeout expired; "

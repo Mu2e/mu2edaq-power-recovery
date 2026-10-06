@@ -772,3 +772,58 @@ def test_an_unresolvable_name_never_counts_toward_the_credential_stop(gateway):
     assert "does not resolve" in result.meta["diagnosis"]
     assert "credential" not in result.meta["diagnosis"].split(".")[0]
     assert not result.meta.get("credentials_refused")
+
+
+# ---------------------------------------------------------------------------
+# PR #30 review: a state-changing call is never cut short by the phase budget
+# ---------------------------------------------------------------------------
+
+class ExemptRecordingGateway(Transport):
+    """Records, per command, whether it ran exempt from the phase deadline."""
+
+    host = "mu2egateway01.fnal.gov"
+
+    def __init__(self, state="off"):
+        self.state, self.seen = state, []
+
+    def run(self, command, timeout=None, user=None, input_text=None, check=False):
+        from mu2edaq_power_recovery.transport.base import is_deadline_exempt
+        text = str(command)
+        self.seen.append((text, is_deadline_exempt()))
+        if "power on" in text:
+            self.state = "on"
+            return CommandResult(command=text, rc=0, stdout="Chassis Power Control: Up/On")
+        if text.startswith("ping "):
+            return CommandResult(command=text, rc=0, stdout="1 received")
+        return CommandResult(command=text, rc=0, stdout=f"Chassis Power is {self.state}")
+
+
+def test_power_on_and_its_confirmation_run_exempt_from_the_deadline():
+    gateway = ExemptRecordingGateway()
+    client = IPMIClient(gateway=gateway, username="MU2E", password="x", retries=0,
+                        dry_run=False)
+    outcome = client.ensure_on("mu2e-trk-01-ipmi.fnal.gov")
+    assert outcome["action"] == "power_on" and outcome["ok"]
+    exempt = {("power on" in c, "power status" in c): e for c, e in gateway.seen
+              if "chassis" in c}
+    assert exempt[(True, False)] is True                 # the power command
+    statuses = [e for c, e in gateway.seen if "power status" in c]
+    assert statuses == [False, True]   # read before: capped; confirm after: exempt
+
+
+def test_an_exempt_ssh_call_ignores_an_expired_budget():
+    from mu2edaq_power_recovery.transport.base import deadline_exempt
+    from mu2edaq_power_recovery.transport.ssh import SSHTransport
+
+    class Expired:
+        def expired(self):
+            return True
+
+        def remaining(self):
+            return 0.0
+
+    t = SSHTransport(host="h", deadline_source=lambda: Expired(), command_timeout=30)
+    with pytest.raises(Exception):
+        t._capped(30)
+    with deadline_exempt():
+        assert t._capped(30) == 30.0

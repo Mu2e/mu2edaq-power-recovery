@@ -49,6 +49,7 @@ from typing import Any, Dict, FrozenSet, List, Optional, Sequence
 from ..checks import CheckResult, Status
 from ..orchestrator import NodeAssessment, Orchestrator
 from ..topology import Node, Topology, TopologyError, expand_entries
+from ..transport.ipmi import IPMIError
 from .base import (TIMEOUT_SUMMARY, Deadline, PhaseResult, overall_status,
                    phase_deadline)
 
@@ -452,7 +453,15 @@ def _power_stage(orch: Orchestrator, nodes: Sequence[Node],
         # still leaves evidence of what it was attempting.
         orch.store.record_action(node.hostname, "power_on", node.ipmi_host,
                                  "attempting", dry_run, "")
-        outcome = ipmi.ensure_on(node.ipmi_host, node_host=node.hostname)
+        try:
+            outcome = ipmi.ensure_on(node.ipmi_host, node_host=node.hostname)
+        except IPMIError as exc:
+            # One node's IPMI failure is that node's outcome, not the run's:
+            # the rest of the stage still gets its commands and the phase is
+            # still finished and recorded (PR #30 review).
+            outcome = {"action": "failed", "ok": False,
+                       "detail": f"IPMI error: {exc}"}
+            log.error("%s: %s", node.hostname, outcome["detail"])
         outcomes[node.hostname] = outcome
         _record(orch, node, outcome, dry_run)
         log.info("%s: %s (%s)", node.short, outcome["action"], outcome["detail"])

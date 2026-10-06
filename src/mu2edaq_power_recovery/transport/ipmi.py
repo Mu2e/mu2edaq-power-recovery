@@ -65,7 +65,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
-from .base import CommandResult, Transport, TransportError
+from .base import CommandResult, Transport, TransportError, deadline_exempt
 
 log = logging.getLogger(__name__)
 
@@ -703,6 +703,10 @@ class IPMIClient:
                                  rc=0, stdout=msg, host=bmc_host,
                                  meta={"dry_run": True, "would_run": verb})
         log.warning("IPMI %s -> %s (%s)", verb, bmc_host, target)
+        if verb in STATE_CHANGING_VERBS:
+            # Never cut short once started: see deadline_exempt().
+            with deadline_exempt():
+                return self._run(bmc_host, ["chassis", "power", verb])
         return self._run(bmc_host, ["chassis", "power", verb])
 
     def power_on(self, bmc_host: str, node_host: Optional[str] = None) -> CommandResult:
@@ -741,7 +745,9 @@ class IPMIClient:
         if not result.ok:
             return {"before": before.value, "action": "failed", "after": before.value,
                     "ok": False, "detail": result.stderr.strip() or result.stdout.strip()}
-        after = self.power_status(bmc_host)
+        with deadline_exempt():
+            # The command was sent; record what it did whatever the budget says.
+            after = self.power_status(bmc_host)
         return {"before": before.value, "action": "power_on", "after": after.value,
                 "ok": after is PowerState.ON,
                 "detail": f"issued chassis power on; now {after.value}"}

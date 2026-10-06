@@ -369,3 +369,26 @@ def test_phase3_timeout_leaves_unprobed_paths_unknown(orch, clock):
     unprobed = [e for net in result.data["networks"] for e in net["edges"]
                 if e["detail"] == TIMEOUT_SUMMARY]
     assert unprobed and all(e["status"] == "unknown" for e in unprobed)
+
+
+def test_an_ipmi_error_on_one_node_does_not_abandon_the_stage(orch, monkeypatch):
+    """PR #30 review: an IPMIError from ensure_on crashed the run, so the rest
+    of the stage got no command and the phase was never finished."""
+    from mu2edaq_power_recovery.transport.ipmi import IPMIError
+    nodes = plan(orch, from_stage="cfo", until_stage="readout").stages[-1].nodes[:3]
+    calls = []
+
+    class Flaky:
+        def ensure_on(self, bmc, node_host=None):
+            calls.append(node_host)
+            if node_host == nodes[0].hostname:
+                raise IPMIError("cannot reach gateway: run.phase_timeout expired")
+            return {"action": "none", "ok": True, "before": "on", "after": "on",
+                    "detail": "already powered on"}
+
+    monkeypatch.setattr(orch, "ipmi_for", lambda node: Flaky())
+    out = phase2_poweron._power_stage(orch, nodes, {"name": "readout"})
+    assert calls == [n.hostname for n in nodes]
+    assert out[nodes[0].hostname]["action"] == "failed"
+    assert "IPMI error" in out[nodes[0].hostname]["detail"]
+    assert all(out[n.hostname]["ok"] for n in nodes[1:])
