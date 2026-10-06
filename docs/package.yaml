@@ -1,0 +1,345 @@
+schema: mega-review/1
+# Reviewed revision: origin/main dc91bb2 (v0.2.0, merged 2026-10-06 19:19 UTC).
+# This branch (mu2e-sept-mega-review) is at 8f1746f, 29 commits behind; every
+# file:line below is against dc91bb2. Rebase before Wave 4 (see notes.revision).
+package: mu2edaq-power-recovery
+tier: A
+group: operations
+repo:
+  url: git@github.com:Mu2e/mu2edaq-power-recovery.git
+  exists: true
+  issues_enabled: true
+doc_dir: docs
+summary: >
+  Four-phase recovery of the Mu2e DAQ clusters after a power outage, driven
+  from an off-site workstation - read-only assessment, dependency-ordered IPMI
+  power-on run through the gateways, inter-node network mesh check, and a
+  static HTML report optionally posted to the ECL
+languages: [python, cpp, bash, powershell, html]
+loc: 27955
+
+runtime:
+  executables:
+    - name: mu2e-power-recovery
+      kind: cli
+      man_page: man/man1/mu2e-power-recovery.1
+    - name: mu2e-power-state
+      kind: cli
+      man_page: man/man1/mu2e-power-state.1
+    - name: mu2e-power-on
+      kind: cli
+      man_page: man/man1/mu2e-power-on.1
+    - name: mu2e-power-netcheck
+      kind: cli
+      man_page: man/man1/mu2e-power-netcheck.1
+    - name: mu2e-power-report
+      kind: cli
+      man_page: man/man1/mu2e-power-report.1
+    - name: mu2e-node-inventory
+      kind: cli
+      man_page: man/man1/mu2e-node-inventory.1
+    - name: mu2e-ipmi-tool
+      kind: cli
+      man_page: man/man1/mu2e-ipmi-tool.1
+    - name: mu2e-ssh-probe
+      kind: cli
+      man_page: man/man1/mu2e-ssh-probe.1
+    - name: mu2e-vault-ipmi
+      kind: cli
+      man_page: man/man1/mu2e-vault-ipmi.1
+    - name: mu2e-probe
+      kind: cli
+      man_page: man/man1/mu2e-probe.1
+    - name: python -m mu2edaq_power_recovery.runlock
+      kind: cli
+      man_page: man/man1/mu2edaq-runlock.1      # on origin/main only (added in v0.2.0)
+    - name: tools/generate-docs.py
+      kind: script
+      man_page: man/man1/mu2edaq-generate-docs.1
+    - name: bootstrap.sh
+      kind: script
+      man_page: man/man1/mu2edaq-power-recovery-bootstrap.1
+    - name: start-mu2edaq-power-recovery.sh
+      kind: script
+      man_page: man/man1/mu2edaq-power-recovery-bootstrap.1
+    - name: stop-mu2edaq-power-recovery.sh
+      kind: script
+      man_page: man/man1/mu2edaq-power-recovery-bootstrap.1
+    - name: bootstrap.ps1
+      kind: script
+      man_page: man/man1/mu2edaq-power-recovery-bootstrap.1
+    - name: start-mu2edaq-power-recovery.ps1
+      kind: script
+      man_page: man/man1/mu2edaq-power-recovery-bootstrap.1
+    - name: stop-mu2edaq-power-recovery.ps1
+      kind: script
+      man_page: man/man1/mu2edaq-power-recovery-bootstrap.1
+    - name: libmu2eprobe (C/C++ library and pybind11 module mu2eprobe)
+      kind: library
+      man_page: man/man3/libmu2eprobe.3
+    - name: mu2edaq_power_recovery (Python package)
+      kind: library
+      waiver: application package, not a public import API; layout in man/man7/mu2edaq-power-recovery.7 and docs/DESIGN.md
+  services: []
+  ports: []          # binds nothing; outbound endpoints are in docs/INTERFACES.md section 5
+  config_files:
+    - config/power-recovery.yaml
+    - config/topology.yaml
+    - config/power-sequence.yaml
+    - config/checks.yaml
+    - config/.env
+  env_vars:
+    - MU2E_POWER_RECOVERY_<DOTTED_PATH>
+    - MU2E_POWER_RECOVERY_ARM
+    - MU2E_POWER_RECOVERY_UPDATED
+    - MU2E_POWER_RECOVERY_RUN_LOCK_FILE
+    - VAULT_ADDR
+    - VAULT_TOKEN
+    - KRB5CCNAME
+    - NO_COLOR
+    - FORCE_COLOR
+    - VENV_DIR
+
+interactions:
+  depends_on:
+    - package: mu2edaq-kerberos
+      via: subprocess
+      direction: out
+      evidence: "src/mu2edaq_power_recovery/creds/ticketsource.py:37"
+  depended_on_by: []
+  external:
+    - vault (ssivault.fnal.gov:8200)
+    - kerberos-kdc
+    - ecl (dbweb8.fnal.gov:8443/ECL/mu2e)
+    - ecl-client (normanajn/ecl-client)
+    - ipmi-bmc (via gateways)
+    - github.com (phase-0 self-update)
+    - pypi (bootstrap)
+    - rsync/scp publish target
+
+quality:
+  tests: {present: true, framework: pytest, count: 799}
+  ci: {present: false, workflows: []}
+  license: BSD-3-Clause
+  artifacts_clean: true
+
+findings:
+  - id: PWR-001
+    severity: S1
+    type: bug
+    title: "[ipmi-tool] destructive ipmitool commands not spelled 'chassis power off|cycle|reset|soft' bypass --execute, confirmation and the protected-host refusal"
+    issue: pending
+    fingerprint: ebd1006d
+  - id: PWR-002
+    severity: S2
+    type: bug
+    title: "[selfupdate] the phase-0 re-exec drops the entry point: mu2e-power-on --execute restarts as --phase assess"
+    issue: pending
+    fingerprint: d15a7a54
+  - id: PWR-003
+    severity: S3
+    type: bug
+    title: "[config] power-sequence.yaml never powers 12 of the 48 MC-2 inventory nodes or any teststand node"
+    issue: pending
+    fingerprint: 11a8569f
+  - id: PWR-004
+    severity: S3
+    type: bug
+    title: "[topology] mu2e-mgr-01 is the phase-2 NFS stage here but absent from the authoritative nodes_config.yaml"
+    issue: pending
+    fingerprint: 2b60420b
+  - id: PWR-005
+    severity: S3
+    type: bug
+    title: "[bootstrap] bootstrap.sh rewrites the tracked requirements.txt, dirtying the checkout and switching off the phase-0 update"
+    issue: pending
+    fingerprint: 832886f2
+  - id: PWR-006
+    severity: S3
+    type: enhancement
+    title: "[selfupdate] phase 0 fast-forwards to and executes unverified remote code, then installs unpinned dependencies, at the start of every live run"
+    issue: pending
+    fingerprint: fc4d7f3a
+  - id: PWR-007
+    severity: S3
+    type: bug
+    title: "[vault] the ~/.ipmipasswd fallback has no permission check and is taken on any Vault error, not only an outage"
+    issue: pending
+    fingerprint: 0ae7f39e
+  - id: PWR-008
+    severity: S3
+    type: bug
+    title: "[ipmi-tool] mu2e-ipmi-tool ignores ipmi.username, so the fix its own --diagnose recommends does not reach it"
+    issue: pending
+    fingerprint: f982c0cd
+  - id: PWR-009
+    severity: S3
+    type: bug
+    title: "[publish] rsync --delete runs against an unvalidated report.publish.target"
+    issue: pending
+    fingerprint: 40ea2585
+  - id: PWR-010
+    severity: S3
+    type: bug
+    title: "[ssh] ssh.options do not reach the -J hop, and GSSAPIDelegateCredentials forwards root-capable tickets to every node"
+    issue: pending
+    fingerprint: 447b548d
+  - id: PWR-011
+    severity: S3
+    type: enhancement
+    title: "[ci] 799 pytest tests and a CTest suite with no CI workflow"
+    issue: pending
+    fingerprint: 9cbf95ee
+  - id: PWR-012
+    severity: S4
+    type: bug
+    title: "[kerberos] the mu2edaq-kerberos organisation is not pinned; VAULT_ORG in the operator's environment changes the fallback identities"
+    issue: pending
+    fingerprint: 9544a926
+  - id: PWR-013
+    severity: S4
+    type: documentation
+    title: "[docs] the teststand IPMI subnet is still given as 192.168.150.0/24 in six places"
+    issue: pending
+    fingerprint: 794b0f99
+  - id: PWR-014
+    severity: S4
+    type: documentation
+    title: "[man] .TH manual title is not the suite's 'Mu2e DAQ Manual'"
+    issue: pending
+    fingerprint: f27c0f14
+
+notes:
+  revision: >
+    The review branch was checked out at 8f1746f (v0.1.x, 2026-09-29).
+    origin/main moved to dc91bb2 (v0.2.0) on 2026-10-06, when PRs #26-#33
+    landed. Those PRs closed #1-#24 and changed 107 files (+15.6k/-1.7k),
+    including every man page, and added runlock.py, creds/bootstrap.py and
+    man1/mu2edaq-runlock.1. 8f1746f is an ancestor of dc91bb2. This review
+    reads dc91bb2 from a git-archive export, and the three docs committed here
+    cite it. They are new files only, so a fast-forward or rebase of this
+    branch onto origin/main applies cleanly. No checkout, reset or merge was
+    done here (CONTRACT section 11), and the foreign requirements.txt edit
+    would block a fast-forward anyway. The superproject gitlink is at 40fbe02,
+    older than both.
+  topology_vs_sequence: >
+    topology.yaml MC-2 has 48 nodes (37 BMCs): trk 01-18, calo 01-14
+    (config/topology.yaml:95-96). power-sequence.yaml stages 36 MC-2 nodes:
+    trk 01-14, calo 01-11 (config/power-sequence.yaml:97-98), plus gateways
+    01/02 (verify-only), mgr-01, dl-01/02, dcs-01/02, cfo-01, crv-01 and
+    stm-01/02. The sequencer never powers a node the topology lacks: 0
+    unknown. It never powers 12 MC-2 inventory nodes: dcs-03, trk-15..18,
+    calo-12..14, extmon-01, worker-01..03 (10 of them have BMCs). It has no
+    teststand stage (17 nodes, 8 BMCs), and --location teststand on a
+    power-on exits 2. Nine of the 28 readout nodes have no BMC (trk 05, 06,
+    07, 08, 10, 13; calo 08, 09, 10) and are recorded no_bmc. topology.yaml
+    vs operations nodes_config.yaml: identical per network for mc2 and heerc
+    except mu2e-mgr-01 (lab + ipmi), which is only in power-recovery
+    (PWR-004). These counts agree with CONTRACT section 9.7.
+  protected_hosts: >
+    protected: is gateway01/02, mu2edaq-gateway, mgr-01, dcs-01, matched by
+    exact FQDN or short name (topology.py:360-365). It is independent of
+    roles:, so no role regex can add or remove protection.
+    IPMIClient.power() refuses off/cycle/reset/soft for those hosts before
+    building the command, regardless of --execute or --yes
+    (transport/ipmi.py:753-761). Phase 2 only ever sends 'on'
+    (phase2_poweron.py:480). Not enforced on every path: mu2e-ipmi-tool
+    passes any other spelling straight to ipmitool with no dry-run, prompt
+    or protection: 'power off', 'chassis power down|acpi|diag', a trailing
+    token, 'chassis policy always-off', raw chassis control. Verified with
+    the package's own fixtures, including a default (no -n/-c) 'power off'
+    that reaches all 37 MC-2 BMCs. That is PWR-001 (S1). Latent second-line
+    gap: power() checks node_host or bmc_host, and a BMC name never matches
+    protected:. mu2e-ssh-probe --root --run is an unrestricted remote shell,
+    outside the scope of protected: by design.
+  dry_run: >
+    Drivers: per-invocation authorisation (--execute, or the ARM token with
+    run.dry_run false and a matching run.label). Config alone exits 2, and
+    --simulate overrides everything (cli.py:282-371). mu2e-ipmi-tool: gated
+    only for the five canonical chassis power verbs (PWR-001).
+  secrets: >
+    No path found by which the BMC password, Vault token or ECL key reaches
+    the HTML report, the run store or the ECL post. The password goes in on
+    stdin and is exported as IPMI_PASSWORD for ipmitool -E
+    (transport/ipmi.py:480-497). CommandResult.command is overwritten
+    (:505). settings.redacted() masks keys ending
+    pass/passwd/password/token/secret/key. ECL credentials are read only at
+    post time. 'vault login' prints the new token to the operator's
+    terminal (its stdout is sent to stderr); that never reaches the report.
+  ipmi_invocation: >
+    ipmitool -I lanplus -H <bmc> -U <vault username> -L Operator -C 3 -E,
+    wrapped in 'timeout max(3*ipmi.timeout,20)', run on the location's
+    ipmi gateway over a direct ssh. -N/-R are not sent by default
+    (ipmi.message_timeout and ipmi.tool_retries are null,
+    config/power-recovery.yaml:132-133; transport/ipmi.py:333-336).
+    Teststand BMCs are driven from the MC-2 gateways (ipmi_gateways:).
+    Upstream mu2e_ipmi.sh also passes -e^; this package does not, unless
+    ipmi.extra_args is set.
+  host_keys: >
+    StrictHostKeyChecking=accept-new (TOFU), never 'no'
+    (config/power-recovery.yaml:94). A changed key is classified 'hostkey',
+    stops the credential chain and is reported as a probable reimage
+    (transport/ssh.py:99-129, :327). Command-line -o options do not apply to
+    the -J hop, which uses the operator's ssh_config (PWR-010).
+  ipmipasswd: >
+    Read with Path.read_text(), with no mode or owner check. Taken on any
+    VaultError, including permission denied and a wrong path, not only on
+    an outage (PWR-007).
+  selfupdate: >
+    Fetches selfupdate.remote (origin) at the checked-out branch or
+    selfupdate.branch and fast-forwards only. It refuses a dirty tree, a
+    diverged branch or a detached HEAD. If rebuild_globs match, it runs
+    bootstrap.sh (pip install -e .[dev] against >= bounds), rolling back on
+    a failed rebuild, then execve's 'python -m mu2edaq_power_recovery'. No
+    signature or hash verification (PWR-006). The re-exec loses the
+    single-phase entry point (PWR-002). bootstrap.sh's requirements.txt
+    rewrite dirties the tree and disables later updates (PWR-005).
+  foreign_changes: >
+    The uncommitted requirements.txt in this checkout is exactly
+    bootstrap.sh's pip-freeze rewrite under Python 3.12 (bootstrap.sh:65-75).
+    Left unstaged, as instructed. .claude/ left untouched.
+  kerberos_coupling: >
+    get-kerberos-ticket and vault-client are resolved in this order: config
+    path, then PATH, then ../mu2edaq-kerberos/venv/bin, then (ticket command
+    only) the sibling's get-kerberos-ticket.sh
+    (creds/ticketsource.py:176-195). '--org mu2e' is NOT passed by default:
+    kerberos.vault_client_args is [] and the example in the comment is not
+    applied. The organisation therefore comes from VAULT_ORG or
+    mu2edaq-kerberos's default_organization (mu2e) (PWR-012).
+  operations_lineage: >
+    No runtime call into mu2edaq-operations (repo Mu2e/daq-operations), so
+    there is no depends_on entry: no 'via' value fits a copied data format.
+    What is copied: topology.yaml mirrors scripts/nodes_config.yaml
+    (config/topology.yaml:4-7); the ipmitool form mirrors
+    scripts/mu2e_ipmi.sh (transport/ipmi.py:301-338); protected: extends its
+    exclude_list (config/topology.yaml:30); disk thresholds come from
+    scripts/check_functions.sh (checks/disks.py:4); ~/.ipmipasswd is that
+    script's convention (creds/vault.py:17-18).
+  discovery: >
+    Not a mu2edaq-discovery consumer or announcer, so CONTRACT section 9.5
+    does not apply.
+  man_pages: >
+    Branch 8f1746f: 18 pages. origin/main: 19 (adds mu2edaq-runlock.1).
+    Every page in both trees passes 'mandoc -T lint' with no ERROR, WARNING
+    or UNSUPP (STYLE line-length notes only) and 'groff -mandoc -t -Tutf8
+    -ww -z' with no output. Every .TH section matches its directory. All 9
+    console scripts have a man1 page. No man-page edits were made. The .TH
+    manual title deviates from the contract (PWR-014), and fixing it here
+    would conflict with the v0.2.0 rewrite of every page.
+  tests: >
+    799 tests on dc91bb2 (pytest -o addopts= -q, Python 3.12 venv,
+    git-archive export): 798 passed, 1 failed. The failure is
+    test_the_lock_file_is_ignored_by_git, which needs a .git directory. A
+    CTest target exists (tests/cpp/test_probe.cpp) and was not built here.
+  loc: >
+    27955 = Python src 15194 + tests 9747 + tools/generate-docs.py 374 +
+    C++ (src/cpp, include, bindings, tests/cpp) 946 + Jinja templates 947 +
+    sh/ps1 505 + CMakeLists.txt 242, on dc91bb2.
+  license: >
+    LICENSE is the Fermi Forward Discovery Group BSD-3-Clause text with the
+    U.S. Government licence clause. pyproject.toml points at the file.
+  dedup: >
+    gh issue list --state all on 2026-10-06 returned 25 issues: #1-#24
+    closed by PRs #26-#32, #25 (MC-1 inventory) open. No fingerprint or
+    two-token title overlap, so all 14 findings are new. PWR-003 is related
+    to #25 but covers MC-2 and the teststand.
