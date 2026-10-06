@@ -263,9 +263,9 @@ genuinely needed, and the gateway-side wall-clock bound was widened so it cannot
 itself cut ipmitool's retries short. Diverging from a known-working invocation
 is a choice that has to earn itself.
 
-**A credential rejection is neither retried nor repeated.** All 45 BMCs share
-one credential set, so the first rejection settles the matter: the run stops
-issuing IPMI and reports one diagnosis naming the refused username and how to
+**A credential rejection is neither retried nor repeated.** The BMCs of a
+location share one credential set, so the first rejection settles the matter
+there: the run stops issuing IPMI to that location and reports one diagnosis naming the refused username and how to
 find the right one. Previously it retried the same rejected credentials three
 times per BMC, with four ipmitool retries inside each, and then did the same to
 the next BMC — a few hundred failed authentications against machines that count
@@ -275,7 +275,8 @@ deliberately **excluded**: a dark chassis says exactly that, and after an outage
 a dark chassis is the expected case. `ipmi.stop_on_auth_failure: false`
 overrides the whole behaviour.
 
-**The stop is a synchronised circuit breaker, shared by every IPMI client.**
+**The stop is a synchronised circuit breaker, one per location, shared by
+that location's IPMI clients.**
 Phase 1 assesses sixteen nodes at once, so an unsynchronised "refused?" flag let
 many workers pass the check and each present the bad credential to a different
 BMC before the first rejection landed. `CredentialBreaker` (in
@@ -287,8 +288,12 @@ never invoke ipmitool. Once proven, calls run concurrently.
 
 Serialising unproven calls would make a cluster whose BMCs are mostly dark cost
 one full ipmitool timeout per BMC, in sequence, so each unproven call is
-preceded by a **reachability pre-check** outside the gate: one
-`ping -c 1 -W 1 <bmc>` from the same gateway. No reply raises
+preceded by a **reachability pre-check** outside the gate:
+`ping -c 3 -i 0.2 -W 1 <bmc>` from the same gateway (BSD dialect
+`-c 3 -W 1000`), and any reply counts. Three echoes, not one: right after an
+outage the gateway's ARP entry for a BMC is cold and the first echo is often
+lost, and with a single echo that made a live BMC UNREACHABLE, so `ensure_on`
+never switched its chassis on (PR #27 review). No reply at all raises
 `IPMIUnreachable` (an `IPMIError`, so `PowerState.UNREACHABLE`) with no
 ipmitool invocation and no gate taken, so dark BMCs are assessed concurrently.
 Phase 1's `assess_node` then reports `power.sensors` and `power.sel` UNKNOWN
@@ -297,16 +302,23 @@ pre-check also gives "Unable to establish" a meaning it lacks on its own: from
 a BMC that has *just answered ping*, while no BMC has accepted the credential,
 it is most likely a wrong username (`_DIAGNOSES`). `ESTABLISH_FAILURE_LIMIT`
 (2) distinct such BMCs trip the breaker; one does not, because a single BMC
-wanting another cipher suite must not stop the run. RAKP and "unauthorized
+wanting another cipher suite must not stop its location. RAKP and "unauthorized
 name" still trip it on the first occurrence. `ipmi.reachability_precheck:
 false` (for BMCs that filter ICMP) restores the earlier behaviour: every
 unproven call goes to ipmitool, one at a time, and "Unable to establish" never
 trips. A gateway without `ping` (rc 126/127) skips the pre-check with a
 warning. The
-concurrency is a constant (1), not a setting. The object is shared rather than
-per client because the BMC account is shared: a client per location must stop
-with the others. A credential refusal surfaces as `PowerState.REFUSED` and the
-checks report it UNKNOWN — it is "we could not look", and it is kept apart from
+concurrency is a constant (1), not a setting. The object is shared by the
+clients of one location (`Orchestrator.ipmi_breaker_for`) because their BMCs
+share an account, and it is *not* shared between locations because theirs do
+not: on 2026-10-01 the teststand's BMCs (`mu2edaq-gateway-ipmi`,
+`mu2edaq04-ipmi`, `mu2edaq13-ipmi`) answered ping and refused the MC-2 account
+with "Unable to establish IPMI v2 / RMCP+ session" while MC-2's BMCs accepted
+it. With one run-wide breaker, two teststand BMCs probed before any MC-2 BMC
+proved the credential tripped the stop and blocked all MC-2 IPMI for the run
+(PR #27 review). The diagnosis names the location (`CredentialBreaker.scope`).
+A credential refusal surfaces as `PowerState.REFUSED` and the checks report it
+UNKNOWN — it is "we could not look", and it is kept apart from
 the protected-host refusal (`meta["reason"] == "protected"`), which is a
 deliberate decision of the tool.
 
@@ -515,8 +527,9 @@ run the stage's profile → evaluate `require:` (`all` / `majority` / `any`).
   `out_of_scope` without calling `ensure_on` — defence in depth against a plan
   bug.
 - **One IPMI client per location**, each on a gateway of its own location
-  (`Orchestrator.ipmi_for`); the IPMI subnets are per site. All share the
-  run's one `CredentialBreaker` and keep the protected-host check.
+  (`Orchestrator.ipmi_for`); the IPMI subnets are per site. Each takes its
+  location's `CredentialBreaker` (the BMC account differs between sites) and
+  keeps the protected-host check.
 - **Boot waits are concurrent.** Every node of a stage is waited for at once
   under one stage deadline, `now + min(boot_timeout, phase time left)`, with
   ssh attempts bounded by a semaphore of `ssh.max_sessions` and starts

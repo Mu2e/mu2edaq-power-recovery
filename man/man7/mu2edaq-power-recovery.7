@@ -176,8 +176,9 @@ to copy the report anywhere, reporting
 The publisher needs a refusal of its own because it copies with the filesystem
 rather than through a transport, so scripting the transports does not reach it.
 .IP \(bu 2
-The first IPMI credential rejection stops IPMI for the rest of the run. All the
-BMCs share one credential set, so the first refusal settles the matter, and
+The first IPMI credential rejection stops IPMI to that location for the rest of
+the run. The BMCs of a location share one credential set, so the first refusal
+settles the matter there (other locations are judged separately), and
 repeating it only walks the BMC accounts towards lockout; the run reports one
 diagnosis naming the username that was refused. Only an RAKP failure or an
 .I "unauthorized name"

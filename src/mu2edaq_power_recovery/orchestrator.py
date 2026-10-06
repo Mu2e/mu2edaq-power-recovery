@@ -198,9 +198,12 @@ class Orchestrator:
         #: phases). Every ssh transport the factory builds caps its per-call
         #: timeout at the time this has left; see :meth:`budget`.
         self._deadline: Any = None
-        #: One BMC account serves every BMC, so one breaker serves every IPMI
-        #: client this run builds, whichever gateway it runs ipmitool on.
-        self.ipmi_breaker = CredentialBreaker()
+        #: location -> its CredentialBreaker, shared by every IPMI client of
+        #: that location whichever gateway it runs ipmitool on. Per location,
+        #: not per run: the BMC account is not the same everywhere (on
+        #: 2026-10-01 the teststand's BMCs refused the account MC-2's accept),
+        #: so a refusal at one site must not stop IPMI at another.
+        self.ipmi_breakers: Dict[str, CredentialBreaker] = {}
         self.ssh_factory: Any = None
         #: Per-node values carried between phases (SEL baselines, boot flags).
         self.baselines: Dict[str, Dict[str, Any]] = {}
@@ -321,7 +324,8 @@ class Orchestrator:
             # phase-2 power path, which are the parts most worth rehearsing.
             # dry_run is forced on, so even the simulated client refuses to
             # pretend it switched anything.
-            # One per location, like a real run, all on the shared breaker.
+            # One per location, like a real run, each on its location's
+            # breaker.
             for location in self.locations:
                 gateway = self.ssh_factory.gateway_for(location, role="ipmi")
                 if not gateway:
@@ -330,7 +334,7 @@ class Orchestrator:
                     gateway=self.ssh_factory.for_host(gateway, direct=True),
                     username="simulated", password="simulated",
                     dry_run=True, protected=self.topology.is_protected,
-                    breaker=self.ipmi_breaker)
+                    breaker=self.ipmi_breaker_for(location))
             self.ipmi = next(iter(self.ipmi_clients.values()), None)
             info["notes"].append("simulated run: no credentials acquired, no "
                                  "host contacted; all command output is scripted")
@@ -400,9 +404,10 @@ class Orchestrator:
         The IPMI subnets are per site and not routable between them, so a BMC
         must be driven from its own location's gateway; one client for the
         whole run (the first gateway that answered anywhere) would send a
-        teststand BMC's commands through MC-2. Every client shares the run's
-        one :class:`CredentialBreaker` -- one BMC account serves every BMC --
-        and keeps the protected-host refusal.
+        teststand BMC's commands through MC-2. Each client takes its
+        location's :class:`CredentialBreaker` (:meth:`ipmi_breaker_for`) --
+        the BMC account differs between sites, so one site's refusal must not
+        stop another's IPMI -- and keeps the protected-host refusal.
         """
         clients: Dict[str, IPMIClient] = {}
         for location in self.locations:
@@ -415,13 +420,27 @@ class Orchestrator:
                     f"unavailable there, so its power state cannot be read "
                     f"or changed")
                 continue
-            clients[location] = self._make_ipmi_client(creds, gateway_host)
+            clients[location] = self._make_ipmi_client(creds, gateway_host,
+                                                       location)
             log.info("IPMI commands for %s will be issued from %s",
                      location, gateway_host)
         return clients
 
-    def _make_ipmi_client(self, creds: Any, gateway_host: str) -> IPMIClient:
-        """An IPMI client that runs ipmitool on *gateway_host*."""
+    def ipmi_breaker_for(self, location: str) -> CredentialBreaker:
+        """The :class:`CredentialBreaker` shared by *location*'s IPMI clients.
+
+        Created on first use. Every client driving that location's BMCs must
+        take this one: a client with its own breaker would present a refused
+        credential again.
+        """
+        breaker = self.ipmi_breakers.get(location)
+        if breaker is None:
+            breaker = self.ipmi_breakers[location] = CredentialBreaker(location)
+        return breaker
+
+    def _make_ipmi_client(self, creds: Any, gateway_host: str,
+                          location: str) -> IPMIClient:
+        """An IPMI client that runs ipmitool on *gateway_host* for *location*."""
         gateway = self.ssh_factory.for_host(gateway_host, direct=True)
         return IPMIClient(
             gateway=gateway,
@@ -440,7 +459,7 @@ class Orchestrator:
             extra_args=self.settings.get("ipmi.extra_args", []),
             stop_on_auth_failure=bool(
                 self.settings.get("ipmi.stop_on_auth_failure", True)),
-            breaker=self.ipmi_breaker,
+            breaker=self.ipmi_breaker_for(location),
             reachability_precheck=bool(
                 self.settings.get("ipmi.reachability_precheck", True)),
         )

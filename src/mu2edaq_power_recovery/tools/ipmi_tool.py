@@ -28,7 +28,7 @@ from .. import console
 from ..cli import install_sigterm_handler
 from ..creds import KerberosError, VaultCredentials, VaultError
 from ..creds.bootstrap import credential_session
-from ..transport import IPMIClient, LocalTransport
+from ..transport import CredentialBreaker, IPMIClient, LocalTransport
 from ..transport.base import TransportError
 from ..transport.ipmi import DESTRUCTIVE_VERBS, STATE_CHANGING_VERBS
 from ._common import add_common_arguments, add_credential_arguments, bootstrap
@@ -229,6 +229,9 @@ def run(argv: Optional[Sequence[str]], credentials: ExitStack) -> int:
         # -c/-l sweep being sent the same rejected credential.
         stop_on_auth_failure=bool(
             settings.get("ipmi.stop_on_auth_failure", True)),
+        # One location per invocation, so its own breaker is exactly the
+        # run's per-location one; scoped so the diagnosis names it.
+        breaker=CredentialBreaker(location),
         reachability_precheck=bool(
             settings.get("ipmi.reachability_precheck", True)),
     )

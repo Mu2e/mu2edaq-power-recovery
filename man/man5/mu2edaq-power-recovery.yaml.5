@@ -343,14 +343,16 @@ before the first SSH attempt.
 .I stop_on_auth_failure
 Stop issuing IPMI commands once a BMC has answered and rejected the
 credentials \(em an RAKP failure, or "unauthorized name". One credential set
-serves every BMC, so the next one rejects it too, and each attempt is
+serves the BMCs of a location, so the next one there rejects it too, and each attempt is
 .I retries
 invocations here with four ipmitool retries inside each. Defaults to
 .BR true .
 While it is true, IPMI commands are also issued one at a time until a first
 BMC accepts the credential, so under concurrent assessment a wrong credential
 reaches exactly one BMC; after that first success they run concurrently. The
-state is shared by every IPMI client of the run. A refusal is reported as
+state is kept per location and shared by that location's IPMI clients: the
+BMC account differs between sites (the teststand's BMCs refuse the account
+MC-2's accept), so a refusal at one location does not stop IPMI at another. A refusal is reported as
 .BR unknown ,
 not as a BMC that does not answer.
 Set it false only to gather evidence from several BMCs deliberately; the run
@@ -361,16 +363,18 @@ A BMC that simply does not answer is not this \(em a dark chassis reports
 that is the expected case.
 The exception is a BMC that has just answered the
 .I reachability_precheck
-ping: two distinct such BMCs failing with "Unable to establish" while no BMC
-has yet accepted the credential trip the stop as well, because a live BMC that
+ping: two distinct such BMCs of a location failing with "Unable to establish"
+while no BMC there has yet accepted the credential trip the stop as well, because a live BMC that
 refuses the session is most likely being sent the wrong username. An RAKP
 failure or "unauthorized name" still trips it on the first occurrence.
 .TP
 .I reachability_precheck
-While the credential is unproven, send one
-.B ping \-c 1 \-W 1
-to the BMC from the gateway before each ipmitool invocation. A BMC that does
-not answer is reported unreachable at once: ipmitool is not run, and the call
+While the credential is unproven, send
+.B ping \-c 3 \-i 0.2 \-W 1
+to the BMC from the gateway before each ipmitool invocation. Any reply counts:
+right after an outage the gateway's ARP entry for the BMC is cold and the
+first echo is often lost. A BMC that answers none is reported unreachable at
+once: ipmitool is not run, and the call
 does not wait behind the one-at-a-time credential gate, so dark BMCs are
 assessed concurrently rather than each costing a serialised ipmitool timeout.
 In phase 1, a node whose

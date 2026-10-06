@@ -307,13 +307,17 @@ could fire for two nodes or for neither.
   With `origin: gateways` coverage is per target (`uncovered_targets()`): a
   dark gateway whose partner tested every BMC does not make the network
   UNKNOWN, and a location with BMCs but no gateway is UNKNOWN, never OK.
-- **One `CredentialBreaker` per BMC account, shared by every `IPMIClient`.**
-  Pass the orchestrator's `ipmi_breaker` to any client you build; a client with
-  its own breaker would present a refused credential again. While unproven it
+- **One `CredentialBreaker` per location, shared by that location's
+  `IPMIClient`s.** Pass `orch.ipmi_breaker_for(location)` to any client you
+  build; a client with its own breaker would present a refused credential
+  again, and one breaker for the whole run would let one site's refusal stop
+  another's IPMI — the BMC account is not the same everywhere (live,
+  2026-10-01: the teststand's BMCs refuse the account MC-2's accept). While unproven it
   admits one invocation at a time (`AUTH_PROBE_CONCURRENCY`, a constant, not a
   config key); do not raise it. The reachability ping
-  (`ipmi.reachability_precheck`) runs *before* the gate and must stay
-  gate-free — it is what keeps dark BMCs from being serialised. "Unable to
+  (`ipmi.reachability_precheck`, `PRECHECK_ECHOES` = 3 echoes, any reply
+  counts — a cold ARP entry loses the first) runs *before* the gate and must
+  stay gate-free — it is what keeps dark BMCs from being serialised. "Unable to
   establish" trips the breaker only from BMCs that answered that ping, and
   only at `ESTABLISH_FAILURE_LIMIT` (2) distinct BMCs; RAKP / "unauthorized
   name" trip it at once. After `power.status` is UNREACHABLE or REFUSED,
@@ -343,8 +347,8 @@ could fire for two nodes or for neither.
   time, not in `run_stage`.
 - **A BMC is driven through its own location's gateway.** Use
   `Orchestrator.ipmi_for(node)`, not `orch.ipmi`, for per-node IPMI; build any
-  new client with `_make_ipmi_client(creds, gateway)` so it gets the shared
-  breaker and `protected=topology.is_protected`.
+  new client with `_make_ipmi_client(creds, gateway, location)` so it gets
+  its location's breaker and `protected=topology.is_protected`.
 - **Time goes through the orchestrator's clock and sleep.** No `time.sleep` or
   `time.monotonic` in phases; use `orch.clock`/`orch.sleep` and a `Deadline`
   (`phases/base.py`), so tests run on a fake clock. Run phase work under
@@ -381,8 +385,8 @@ could fire for two nodes or for neither.
   the stop script's TERM marks the run `interrupted` and runs cleanup; only
   SIGKILL (`--force`) skips it.
 - **Power commands within a stage are serial.** `_power_stage` walks the
-  stage's nodes in order (deliberately: the breaker serialises them until the
-  BMC account is proven, and it spreads the inrush). A stage of dark BMCs
+  stage's nodes in order (deliberately: the location's breaker serialises them
+  until the BMC account is proven, and it spreads the inrush). A stage of dark BMCs
   therefore costs one `ipmi.timeout` × retries per node before the boot wait.
 - **`mu2e-trk-15`..`18` are in the inventory but in no phase-2 stage**
   (`readout` lists trk 1-14). Left as is by decision; `--node mu2e-trk-15`

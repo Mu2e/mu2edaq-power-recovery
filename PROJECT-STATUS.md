@@ -615,9 +615,12 @@ by how much an operator would care.
   BMCs before the first rejection landed. `CredentialBreaker` now serialises
   invocations until a first success proves the credential, re-reads the refusal
   after taking the gate and before every retry, and is shared by every client of
-  the run. A refusal is `PowerState.REFUSED` -> UNKNOWN, not FAIL "BMC does not
+  a location (originally of the run; made per location after the 2026-10-01
+  live test showed the teststand's BMCs refuse the account MC-2's accept —
+  PR #27 review). A refusal is `PowerState.REFUSED` -> UNKNOWN, not FAIL "BMC does not
   answer". The serial-while-dark trade-off is gone: each unproven call is
-  preceded by a gate-free `ping -c 1 -W 1` of the BMC from the gateway
+  preceded by a gate-free `ping -c 3 -i 0.2 -W 1` (any reply counts; it was
+  one echo until PR #27 review, which a cold ARP entry could lose) of the BMC from the gateway
   (`ipmi.reachability_precheck`, default true), so dark BMCs are reported
   UNREACHABLE concurrently without ipmitool, and phase 1 reports their
   `power.sensors`/`power.sel` UNKNOWN without asking again. Two distinct BMCs

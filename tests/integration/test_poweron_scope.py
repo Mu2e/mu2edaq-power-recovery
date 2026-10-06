@@ -208,9 +208,13 @@ def test_each_bmc_is_driven_through_its_own_locations_gateway(settings, clock):
     orch = build(settings, clock, locations=("mc2", "teststand"), sequence=MIXED)
     try:
         assert set(orch.ipmi_clients) == {"mc2", "teststand"}
-        # One breaker for every client: one BMC account.
-        assert {id(c.breaker) for c in orch.ipmi_clients.values()} == \
-            {id(orch.ipmi_breaker)}
+        # One breaker per location, not per run: the BMC account differs
+        # between sites (live, 2026-10-01).
+        for location, client in orch.ipmi_clients.items():
+            assert client.breaker is orch.ipmi_breaker_for(location)
+            assert client.breaker.scope == location
+        assert orch.ipmi_clients["mc2"].breaker is not \
+            orch.ipmi_clients["teststand"].breaker
         assert all(c.protected == orch.topology.is_protected
                    for c in orch.ipmi_clients.values())
         arm(orch)
@@ -225,6 +229,43 @@ def test_each_bmc_is_driven_through_its_own_locations_gateway(settings, clock):
             # ipmi_gateways are MC-2's gateways -- still a client of its own.
             ("mu2edaq04-ipmi.fnal.gov", "mu2egateway01.fnal.gov")]
         assert orch.ipmi_clients["teststand"] is not orch.ipmi_clients["mc2"]
+    finally:
+        orch.close()
+
+
+#: ipmitool against a teststand BMC with the MC-2 account, live 2026-10-01:
+#: the BMC answered ping and still would not open a session.
+UNESTABLISHED = "Error: Unable to establish IPMI v2 / RMCP+ session"
+
+
+def test_a_refusal_at_the_teststand_does_not_stop_mc2s_ipmi(settings, clock):
+    # The live failure: teststand BMCs answer ping but refuse the MC-2
+    # account. Probed before any MC-2 BMC has proven the credential, two of
+    # them trip a breaker -- which, shared run-wide, blocked all MC-2 IPMI.
+    orch = build(settings, clock, locations=("mc2", "teststand"), sequence=MIXED)
+    try:
+        ts_bmcs = [orch.topology.node(n).ipmi_host
+                   for n in ("mu2edaq04", "mu2edaq13")]
+        mc2_bmc = orch.topology.node("mu2e-trk-01").ipmi_host
+
+        def respond(command):
+            if any(f"-H {b} " in command for b in ts_bmcs):
+                return ScriptedResponse(stderr=UNESTABLISHED, rc=1)
+            return ScriptedResponse(stdout="Chassis Power is on")
+        orch.ssh_factory.base.expect_first(r"chassis power status", respond)
+
+        ts, mc2 = orch.ipmi_clients["teststand"], orch.ipmi_clients["mc2"]
+        for bmc in ts_bmcs:
+            ts.power_status(bmc)
+        assert ts.credentials_refused is not None
+        assert "teststand" in ts.credentials_refused
+
+        assert mc2.credentials_refused is None
+        assert mc2.power_status(mc2_bmc).name == "ON"
+        assert mc2.breaker.proven.is_set()
+        # Proving MC-2's account says nothing about the teststand's.
+        assert ts.credentials_refused is not None
+        assert not ts.breaker.proven.is_set()
     finally:
         orch.close()
 

@@ -135,7 +135,7 @@ def test_a_failed_sel_read_records_no_baseline(orch):
 def test_sensors_and_sel_are_not_asked_after_a_dark_bmc(orch):
     node = _nodes(orch, "mu2e-trk-01")[0]
     orch.ssh_factory.base.expect_first(
-        r"^ping -c 1 -W 1 -q " + node.ipmi_host.replace(".", r"\."),
+        r"^ping -c 3 -i 0\.2 -W 1 -q " + node.ipmi_host.replace(".", r"\."),
         ScriptedResponse(rc=1, stdout="1 packets transmitted, 0 received"))
     result = phase1_assess.run(orch, [node])
     by_id = {r.check_id: r for r in result.assessments[0].results}

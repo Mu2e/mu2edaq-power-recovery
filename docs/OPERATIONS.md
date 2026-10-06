@@ -428,12 +428,15 @@ you are least able to notice.
 
 ## When the run stops issuing IPMI
 
-If a BMC *answers and rejects* the credentials, the run stops issuing IPMI
-altogether and reports one diagnosis naming the refused username. That is
-deliberate: all 45 BMCs share one credential set, so the first rejection settles
-the matter, and retrying it against the other 44 only advances lockout counters
-on every BMC in the building. (45 nodes of the 65 in the topology carry an
-`ipmi:` interface: 37 at MC-2, 8 at the teststand.)
+If a BMC *answers and rejects* the credentials, the run stops issuing IPMI to
+that location's BMCs and reports one diagnosis naming the refused username and
+the location. That is deliberate: a location's BMCs share one credential set,
+so the first rejection settles the matter there, and retrying it against the
+rest only advances lockout counters. (45 nodes of the 65 in the topology carry
+an `ipmi:` interface: 37 at MC-2, 8 at the teststand.) Locations are judged
+separately because their accounts differ: on 2026-10-01 the teststand's BMCs
+answered ping and refused the account MC-2's BMCs accepted. A teststand refusal
+leaves MC-2's IPMI running, and the other way round.
 
 ```sh
 mu2e-vault-ipmi --fields                              # what the secret holds now
@@ -451,19 +454,21 @@ The refusal shows as **UNKNOWN** on `power.status`, `power.sensors` and
 `power.sel` ("IPMI credentials refused"), not as FAIL "BMC does not answer",
 and phase 2 records `credentials_refused` for each node rather than
 `unreachable`. Phase 1's readiness block says phase 2 is not ready. Only one
-BMC was actually asked: until a credential has worked once, IPMI commands are
-issued one at a time.
+BMC per location was actually asked: until a credential has worked once at a
+location, IPMI commands to it are issued one at a time.
 
-Each of those unproven commands is preceded by one `ping -c 1 -W 1 <bmc>` from
-the gateway. A BMC that does not answer is reported **FAIL** "does not answer"
+Each of those unproven commands is preceded by `ping -c 3 -i 0.2 -W 1 <bmc>`
+from the gateway, and any one reply counts: right after an outage the gateway's
+ARP entry for the BMC is cold and the first echo is often lost. A BMC that
+answers none of the three is reported **FAIL** "does not answer"
 on `power.status` straight away, without ipmitool and without waiting its turn,
 and its `power.sensors` / `power.sel` are **UNKNOWN** ("not read: the BMC did
 not answer"). If the BMCs filter ICMP, every one will look dark: set
 `ipmi.reachability_precheck: false`.
 
 Two BMCs that *do* answer ping and then fail with `Unable to establish IPMI v2 /
-RMCP+ session`, before any BMC has accepted the credential, also stop the run's
-IPMI — the diagnosis says "likeliest cause is a wrong username". Check the
+RMCP+ session`, before any BMC of that location has accepted the credential,
+also stop that location's IPMI — the diagnosis says "likeliest cause is a wrong username". Check the
 username first (`mu2e-ipmi-tool --diagnose`, above), then the cipher suite.
 
 A BMC that simply does **not answer** is not treated this way, and says much the

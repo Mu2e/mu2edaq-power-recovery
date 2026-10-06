@@ -296,8 +296,9 @@ the cipher suite \(em some BMCs need
 .I ipmi.cipher_suite: 17
 rather than 3.
 .PP
-A rejected credential is neither retried nor repeated. Every BMC shares one
-credential set, so the first rejection settles the matter for the whole run:
+A rejected credential is neither retried nor repeated. The BMCs of a location
+share one credential set, so the first rejection settles the matter for that
+location:
 .BR mu2e-power-on (1)
 stops issuing IPMI and reports a single diagnosis naming the refused username,
 rather than walking the same wrong credential through all forty-five chassis
