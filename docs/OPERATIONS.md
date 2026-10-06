@@ -311,8 +311,25 @@ later.
 To regenerate or repost afterwards:
 
 ```sh
-mu2e-power-report --run-id 17 --post-ecl
+mu2e-power-report --run-id 17              # re-render run 17 only
+mu2e-power-report --run-id 17 --post-ecl   # ...and post it
 ```
+
+What regeneration does and does not do:
+
+- It works on run 17 itself. No new run is created, run 17's status and
+  finish time are not changed, and a `report` phase plus events are added to
+  run 17's timeline. `html/runs/17/` is re-rendered from the store; the top
+  level of `html/` changes only if 17 is the newest run.
+- It needs no Kerberos ticket. Vault is contacted only for `--post-ecl`, to
+  read the ECL credentials. A run id that is not in the store exits 2 and
+  writes nothing — check `html/runs.html` for the ids.
+- The logbook entry carries run 17's own pages, `detail.html` included. If the
+  post fails, the local report is still complete; the failure is an `error`
+  event in run 17's timeline and in `html/runs/17/data/report.json` (`ecl`).
+  Fix the credential or the network and run the same command again.
+- "Outstanding problems" lists only what is still wrong. A failure that a
+  later phase re-checked and passed is under "Resolved during the run".
 
 ---
 
@@ -509,7 +526,8 @@ interrupt was handled) do these apply:
 
 - **The run is left as `running` in the store.** It is never marked
   `interrupted`, and the phase in progress records no end. `mu2e-power-report
-  --run-id <id>` still builds a report from the evidence already stored.
+  --run-id <id>` still builds a report from the evidence already stored; it
+  shows the run as `not finished (running)` and does not change that status.
 - **The run's private Kerberos caches are not destroyed.** Cleanup never
   executes, so the caches it created — including any root-capable service
   tickets — survive the process. On macOS one of them may also still be the
@@ -552,8 +570,9 @@ Ctrl-C (SIGINT) takes the same clean path as SIGTERM.
 
 ## Afterwards
 
-- `html/` holds the report; `html/runs/<id>/` holds this run's copy as you read
-  it at the time.
+- `html/` holds the newest run's report; `html/runs/<id>/` holds each run's
+  own pages and data, rendered from the store — they never contain another
+  run's evidence, and `mu2e-power-report --run-id <id>` rebuilds them.
 - `data/power-recovery.db` holds everything, including the full command output
   behind every check.
 - `logs/power-recovery.log` holds the run log, rotated.

@@ -80,6 +80,21 @@ per node → checks return `CheckResult` → `NodeAssessment` rolls them up →
 `PhaseResult` → run store → report/console/ECL. Phases never render; they
 return `PhaseResult`, so console, HTML and logbook output cannot drift apart.
 
+**Report lifecycle.** `run_phases()` runs phases 1-3 only and persists each
+result's verdict/notes/duration into its phase row (`data._result`). `main()`
+then finishes the run (`finish_run`, on error and interrupt paths too) before
+anything is assembled: `phase4_report.assemble(store, rid)` records the report
+phase against `rid` and builds the narrative from the final export;
+`ReportWriter.render_run()` renders `runs/<rid>/` from that export alone (the
+top level is re-rendered only when `rid` is the newest run); `phase4_report.post()`
+posts with the bundle's pages and records the outcome on `rid`; publication
+runs once, last. Report-only runs `store.attach(rid)` and never call
+`prepare_credentials`. Current state is `phase4_report.reconcile()`: newest
+result per `(hostname, check_id)`; headline, counts, exit code and ECL text all
+come from it. With `--json`, stdout is one JSON document and every human line
+goes to stderr — print to the `out` stream `main` passes down, never bare
+`print()`.
+
 ## 4. Configuration schema
 
 Four YAML files in `config/`, each with a man page in section 5:
@@ -356,6 +371,16 @@ could fire for two nodes or for neither.
   continues.
   `ambient_warning()` covers one fatal condition and one benign one, so making
   it halt means separating them first.
+- **Resolved in fix/report-lifecycle** (kept so nobody re-adds them):
+  `--run-id` regeneration attaches to the selected run and needs no
+  credentials (#3); the run is finished before the report is rendered or
+  posted (#4); superseded failures are `resolved`, not outstanding (#5);
+  `runs/<id>/` is rendered from that run's data only — no `archive_run` copy
+  of the shared directory (#6); ECL attachments are the run's rendered bundle
+  and Vault is created only to post (#18); `--json` stdout is exactly one
+  JSON document (#24). Remaining: an interactive `vault login` child inherits
+  fd 1, so a first-time Vault login under `--json --post-ecl` can print to
+  stdout.
 - **Nothing has been run against the live cluster end to end.** See
   [PROJECT-STATUS.md](PROJECT-STATUS.md) §6.3 for what is and is not verified.
 

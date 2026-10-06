@@ -109,3 +109,31 @@ def test_a_database_url_overrides_the_sqlite_path(settings, tmp_path):
     store = RunStore.from_settings(settings)
     assert store.url.endswith("explicit.db")
     store.close()
+
+
+def test_attach_selects_an_existing_run_without_inserting_one(store):
+    first = store.start_run("one", True, {}, {})
+    store.finish_run("complete")
+    store.start_run("two", True, {}, {})
+    run = store.attach(first)
+    assert run["id"] == first and store.run_id == first
+    assert len(store.list_runs()) == 2
+    with pytest.raises(KeyError):
+        store.attach(99)
+
+
+def test_phase_and_event_writes_can_name_their_run(store):
+    first = store.start_run("one", True, {}, {})
+    second = store.start_run("two", True, {}, {})      # now current
+    phase_id = store.start_phase("report", 4, run_id=first)
+    store.record_event("for the first run", run_id=first)
+    store.finish_phase("complete", "done", {"x": 1}, phase_id=phase_id)
+    store.annotate_phase(phase_id, {"_result": {"status": "ok"}})
+    assert [p["name"] for p in store.get_phases(first)] == ["report"]
+    assert store.get_phases(second) == []
+    assert store.get_phases(first)[0]["data"] == {"x": 1,
+                                                  "_result": {"status": "ok"}}
+    assert [e["message"] for e in store.get_events(first)] == ["for the first run"]
+    store.finish_run("error", run_id=first)
+    assert store.get_run(first)["status"] == "error"
+    assert store.get_run(second)["status"] == "running"

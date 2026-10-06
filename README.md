@@ -179,8 +179,19 @@ JSON files (`inventory`, `assess`, `poweron`, `network`, `report`, `summary`,
 browser. They are data files rather than per-page companions: the four phase
 pages each have one, `about`/`api`/`sitemap` have none, and the run history and
 detail pages are covered indirectly by `summary.json` and `report.json`. The
-generated `api.html` lists exactly what is there. Re-running a phase refreshes
-its page in place; each run is archived under `html/runs/<id>/`.
+generated `api.html` lists exactly what is there.
+
+Each run is rendered into `html/runs/<id>/` from that run's stored rows alone,
+with pages only for the phases it contains; the top level of `html/` is the
+newest run's view plus the run history. The report is rendered after the run is
+finished (so it carries its final status), and current state is reconciled: a
+failure a later phase re-checked and passed is listed as *resolved*, not
+outstanding. `mu2e-power-report --run-id N` regenerates run N in place — no new
+run, no credentials unless it posts to the logbook — and with `--post-ecl`
+attaches run N's rendered pages. With `--json`, stdout is exactly one JSON
+object (`{version, run_id, status, exit_code, phases, report}`), so
+`mu2e-power-recovery --phase all --simulate --json | jq .status` works; all
+human-readable output goes to stderr.
 
 ## Credentials
 

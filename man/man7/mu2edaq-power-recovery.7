@@ -194,11 +194,22 @@ Set
 .I ipmi.stop_on_auth_failure
 false to carry on regardless.
 .SH REPORTS
-Each phase writes a static HTML page and a JSON companion into
+Every run is rendered, from its own stored rows only, into
+.I html/runs/<id>/
+\(em static HTML pages plus JSON in
+.IR data/ ,
+no server, no build step, readable from a laptop or copied to a web area. A run
+gets a page only for the phases it contains, and its navigation links only
+those. The top level of
 .I html/
-\(em no server, no build step, readable from a laptop or copied to a web area.
-Re-running a phase refreshes its page in place; each run is also archived under
-.IR html/runs/<id>/ .
+is the newest run's view plus the run history; regenerating an older run
+rewrites that run's bundle only. The report is rendered after the run is
+finished, so it carries the final status, and its current state is reconciled:
+a failure a later phase re-checked and passed is resolved, not outstanding
+(see
+.B REPORT LIFECYCLE
+in
+.BR mu2e-power-recovery (1)).
 The pages are overview, initial state, power on, network, detailed report, run
 history, about, API and site map.
 .SH ENVIRONMENT
@@ -337,7 +348,10 @@ Configuration: the main file, the topology, the power sequence, the checks.
 The run store: runs, phases, nodes, check results, actions and events.
 .TP
 .I html/
-The generated report site.
+The report site: the newest run's view,
+.IR runs.html ,
+and one bundle per run under
+.IR html/runs/<id>/ .
 .TP
 .I logs/power-recovery.log
 Rotating log.

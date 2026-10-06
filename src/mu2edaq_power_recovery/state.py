@@ -170,30 +170,67 @@ class RunStore:
         log.info("run %s started (%s)", self.run_id, "dry run" if dry_run else "LIVE")
         return self.run_id
 
-    def finish_run(self, status: str = "complete") -> None:
-        if self.run_id is None:
+    def attach(self, run_id: int) -> Dict[str, Any]:
+        """Make an existing run the current one, without inserting a row.
+
+        Report regeneration operates on the run it was asked about: phase 4's
+        phase row and events belong to *that* run, and a local re-render must
+        not leave an unrelated empty run in the history. Raises
+        :class:`KeyError` when the run is not in the store.
+        """
+        run = self.get_run(run_id)
+        if run is None:
+            raise KeyError(run_id)
+        self.run_id = int(run_id)
+        self.phase_id = None
+        return run
+
+    def finish_run(self, status: str = "complete",
+                   run_id: Optional[int] = None) -> None:
+        rid = run_id or self.run_id
+        if rid is None:
             return
         with self._connect() as conn:
-            conn.execute(runs.update().where(runs.c.id == self.run_id).values(
+            conn.execute(runs.update().where(runs.c.id == rid).values(
                 finished_at=_now(), status=status))
 
     # -- phases ------------------------------------------------------------
 
-    def start_phase(self, name: str, number: int) -> int:
+    def start_phase(self, name: str, number: int,
+                    run_id: Optional[int] = None) -> int:
+        """Open a phase row against *run_id* (default: the current run)."""
         with self._connect() as conn:
             result = conn.execute(phases.insert().values(
-                run_id=self.run_id, name=name, number=number,
+                run_id=run_id or self.run_id, name=name, number=number,
                 started_at=_now(), status="running", data={}))
             self.phase_id = int(result.inserted_primary_key[0])
         return self.phase_id
 
     def finish_phase(self, status: str, summary: str = "",
-                     data: Optional[Dict[str, Any]] = None) -> None:
-        if self.phase_id is None:
+                     data: Optional[Dict[str, Any]] = None,
+                     phase_id: Optional[int] = None) -> None:
+        pid = phase_id or self.phase_id
+        if pid is None:
             return
         with self._connect() as conn:
-            conn.execute(phases.update().where(phases.c.id == self.phase_id).values(
+            conn.execute(phases.update().where(phases.c.id == pid).values(
                 finished_at=_now(), status=status, summary=summary, data=data or {}))
+
+    def annotate_phase(self, phase_id: int, extra: Dict[str, Any]) -> None:
+        """Merge *extra* into a phase row's ``data``.
+
+        Used to persist what the phase *returned* -- its verdict, notes,
+        title and duration -- beside what it stored itself, so every report
+        page can be rebuilt from the store alone.
+        """
+        rows = self._rows(select(phases.c.data).where(phases.c.id == phase_id))
+        if not rows:
+            return
+        merged = dict(rows[0]["data"] or {})
+        merged.update(extra)
+        with self._connect() as conn:
+            conn.execute(phases.update().where(phases.c.id == phase_id)
+                         .values(data=merged))
 
     # -- results -----------------------------------------------------------
 
@@ -240,10 +277,12 @@ class RunStore:
                 action=action, target=target, outcome=outcome,
                 dry_run=1 if dry_run else 0, detail=detail, recorded_at=_now()))
 
-    def record_event(self, message: str, level: str = "info") -> None:
+    def record_event(self, message: str, level: str = "info",
+                     run_id: Optional[int] = None) -> None:
         with self._connect() as conn:
             conn.execute(events.insert().values(
-                run_id=self.run_id, level=level, message=message, recorded_at=_now()))
+                run_id=run_id or self.run_id, level=level, message=message,
+                recorded_at=_now()))
 
     # -- reads -------------------------------------------------------------
 

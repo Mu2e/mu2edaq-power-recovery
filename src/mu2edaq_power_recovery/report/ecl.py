@@ -73,7 +73,8 @@ class ECLPoster:
         lines.append(f"Run          : {run.get('id')}  ({run.get('label') or 'unlabelled'})")
         lines.append(f"Operator     : {run.get('operator')} on {run.get('workstation')}")
         lines.append(f"Started      : {run.get('started_at')}")
-        lines.append(f"Finished     : {run.get('finished_at') or '(still running)'}")
+        lines.append(f"Finished     : {run.get('finished_at') or '(not finished; status ' + str(run.get('status') or 'unknown') + ')'}")
+        lines.append(f"Run status   : {run.get('status') or 'unknown'}")
         lines.append(f"Mode         : {'DRY RUN -- nothing was switched on' if narrative.get('dry_run') else 'live'}")
         version = (run.get("version") or {})
         lines.append(f"Tool version : {version.get('package_version')} "
@@ -111,6 +112,18 @@ class ECLPoster:
             if len(outstanding) > 60:
                 lines.append(f"  ... and {len(outstanding) - 60} more "
                              f"(see the attached report)")
+            lines.append("")
+
+        resolved = narrative.get("resolved", [])
+        if resolved:
+            lines.append(f"Resolved during the run ({len(resolved)})")
+            lines.append("-" * 60)
+            for item in resolved[:30]:
+                lines.append(f"  {item['node']:<28} {item['check']:<18} "
+                             f"{item['status']} in {item['phase']}, "
+                             f"{item['current_status']} in {item['resolved_by']}")
+            if len(resolved) > 30:
+                lines.append(f"  ... and {len(resolved) - 30} more")
             lines.append("")
 
         if narrative.get("power_problems"):

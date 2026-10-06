@@ -612,7 +612,11 @@ class Orchestrator:
                 summary=a.summary(), power_state=a.power_state,
                 data={"power_action": a.power_action,
                       "duration": round(a.duration, 2),
-                      "networks": a.node.networks})
+                      "networks": a.node.networks,
+                      # Kept so a page rebuilt from the store, and phase 4's
+                      # reconciliation, can tell UNREACHABLE from FAIL.
+                      "unreachable": a.unreachable,
+                      "timed_out": a.timed_out})
 
     def close(self) -> None:
         # Unwinds credential_session(), whose finally runs

@@ -44,7 +44,7 @@ Every requirement from `Project-Description.md`, and where it is met.
 | 8 | Per-site network segments and CIDRs | ✅ | `topology.yaml` `subnets:` |
 | 9 | Current-state tool, on-screen report | ✅ | `console.py`, `mu2e-power-state` |
 | 10 | Webpage with tables by area and by class | ✅ | `report/templates/assess.html` |
-| 11 | Re-running updates the webpage | ✅ | `ReportWriter.write_phase` rewrites in place |
+| 11 | Re-running updates the webpage | ✅ | `ReportWriter.render_run`: each run's bundle under `runs/<id>/`, the top level shows the newest run |
 | 12 | Check for GitHub updates and rebuild first | ✅ | `selfupdate.py` |
 | 13 | Print version information | ✅ | `version.py` banner |
 | 14 | Phase 1 takes no corrective action | ✅ | Read-only checks; asserted by test |
@@ -125,7 +125,7 @@ Every requirement from `Project-Description.md`, and where it is met.
 | `unit/test_checks.py` | 50 | Every check's pass and fail path; framework containment; ping dialects; SEL empty/short/rotated/cleared/identical/unread; refused credential is UNKNOWN |
 | `unit/test_ipmi.py` | 54 | **Safety gates**, credentials, invocation shape, failure diagnosis, credential stop, breaker under barrier-forced concurrency |
 | `unit/test_ipmi_tool.py` | 8 | `mu2e-ipmi-tool` target selection: no un-filtering, skipped-node reasons, exit 2 before Vault, confirmation lists hostnames |
-| `unit/test_state.py` | 8 | Round-trip, refusal auditing, append-not-overwrite |
+| `unit/test_state.py` | 10 | Round-trip, refusal auditing, append-not-overwrite, `attach` without a new row, writes that name their run |
 | `unit/test_vault.py` | 11 | KV path resolution, folder-vs-secret, synonyms, file fallback |
 | `unit/test_credentials.py` | 86 | Primary-first chains, root fallback, ssh-failure classification, KRB5CCNAME, collection caches, host keys, cleanup, password prompting; typed default-cache guard errors, the guard's precondition, barrier-forced concurrent mints |
 | `unit/test_credential_bootstrap.py` | 16 | The shared credential bootstrap: login/ticket pairs attempted by `mu2e-ssh-probe` and `mu2e-ipmi-tool`, show-only mints nothing, cleanup on success/exception/interrupt, the disabled-fallbacks note and event |
@@ -134,7 +134,8 @@ Every requirement from `Project-Description.md`, and where it is met.
 | `unit/test_sweep.py` | 8 | Both backends, identical semantics |
 | `unit/test_selfupdate.py` | 13 | Dirty tree, divergence, fast-forward, re-exec guard |
 | `integration/test_phases.py` | 26 | All four phases end to end; simulation hermeticity |
-| `integration/test_report.py` | 20 | Page rendering, archiving, publication, ECL body |
+| `integration/test_report.py` | 21 | Page rendering, per-run bundles, publication, ECL body |
+| `integration/test_report_lifecycle.py` | 21 | `--run-id` regeneration on the selected run with no credentials; missing run exits 2; final status in every artefact, also after error/interrupt; reconciliation (resolved, unrechecked, subset re-check); two runs in one output dir; ECL attachments = the run's bundle; `--json` parses as a whole, no ANSI |
 | `integration/test_cli.py` | 14 | Driver, flags, exit codes, JSON output |
 
 **C++** — `ctest`, 7 test groups: version/OpenMP agreement, unresolvable names,
@@ -766,6 +767,65 @@ by how much an operator would care.
   checks it happens once per node rather than thirteen times. Worth knowing
   before pointing a run at a cluster whose sshd is rate-limiting.
 
+The six items below were found in the 2026-09 issue review of the report
+path and are fixed together, as one restructuring of `cli.main`, `run_phases`,
+`write_report` and phase 4 (docs/DESIGN.md, "Report data flow").
+
+- ~~**`--run-id` regeneration mixed two runs.**~~ **Fixed (#3,
+  fix/report-lifecycle).** A report-only invocation always started a new run,
+  attached the `report` phase to it (via the mutable `store.run_id`) while
+  exporting the selected one, so `summary.json` named run 2, `report.json` run
+  1; and it called `prepare_credentials()` first. Now `--run-id` is valid only
+  with `--phase report` and is checked before anything touches credentials (a
+  missing id exits 2, no row, no traceback); report-only runs skip
+  `prepare_credentials` and `RunStore.attach(N)` the run without inserting a
+  row; `start_phase`/`record_event`/`finish_phase`/`finish_run` take an
+  explicit run or phase id, so phase 4's row and events land on run N, and its
+  status and `finished_at` are never changed by regenerating it.
+- ~~**The report was rendered and posted before the run was finished.**~~
+  **Fixed (#4, fix/report-lifecycle).** Every report said `running`,
+  `finished_at: null`, "Finished: in progress", "(still running)".
+  `run_phases` now runs phases 1-3 only; `main` computes the final status and
+  calls `finish_run` (also on the error and interrupt paths) before phase 4
+  `assemble()`s from the final export. The error/interrupt paths render the
+  bundle with the terminal status (never posting or publishing).
+- ~~**Superseded failures were listed as outstanding.**~~ **Fixed (#5,
+  fix/report-lifecycle).** `phase4_report.reconcile()` takes the newest result
+  per `(hostname, check_id)`; superseded failures with a good current result
+  are `resolved` (still in the evidence and timeline); node status is the
+  roll-up of current checks (UNKNOWN if its latest assessment was
+  unreachable). Headline, counts, verdict, next steps, ECL text and the exit
+  status all come from that table plus the latest phase-3 verdict. Phase-2
+  profiles re-check subsets, so an unrechecked phase-1 failure stays
+  outstanding. A phase-1 fail / phase-2 pass run now exits 0.
+- ~~**Per-run archives copied other runs' pages and JSON.**~~ **Fixed (#6,
+  fix/report-lifecycle).** `archive_run` copied every top-level page and all of
+  `data/` into `runs/<id>/`. Replaced by `ReportWriter.render_run(export,
+  narrative, version) -> Bundle`, which empties and renders `runs/<id>/` from
+  that run's stored rows only, with pages only for phases present and a nav
+  that links only those. Each phase's returned verdict/notes/duration is
+  persisted in its row (`data._result`) so pages rebuild from the store. The
+  top level is a latest view: the newest run's bundle, rendered again (its
+  run-history link differs), with absent phases' pages and data removed.
+- ~~**ECL attachments were missing or stale.**~~ **Fixed (#18,
+  fix/report-lifecycle).** Report-only posting attached nothing (pages were
+  rendered after the post), and a full run attached a pre-render of the shared
+  directory. Now: assemble, render the bundle, post with `bundle.paths` (the
+  bundle's HTML pages, `detail.html` included), record the outcome as an event
+  on the run and in the bundle's `report.json`, then publish once. Vault is
+  created lazily only for the post (`phase4_report.make_vault`); `--simulate`
+  never posts; a failed post leaves the local report complete.
+- ~~**`--json` output was not JSON.**~~ **Fixed (#24, fix/report-lifecycle).**
+  Banners, mode notices, tables, report and self-update lines went to stdout
+  before the document; the test sliced from the first `[`. Now stdout carries
+  exactly one document: `{version, run_id, status, exit_code, phases, report}`
+  (with `error` on the failure paths), or the listing for `--list-checks` /
+  `--list-nodes`. Human output goes to stderr, `sys.stdout` is redirected to
+  stderr while the run executes, and the self-update rebuild's output is sent
+  to stderr. One gap remains: an interactive `vault login` child spawned by
+  `creds/vault.py` inherits file descriptor 1, so a first-time Vault login
+  under `--json --post-ecl` can still write its prompt to stdout.
+
 ---
 
 ## 7. Design decisions
@@ -793,6 +853,9 @@ Recorded here in brief; the reasoning is in [docs/DESIGN.md](docs/DESIGN.md).
 | Static HTML report | A Flask/Litestar service | Must be readable from a laptop, copyable to a web area, attachable to a logbook entry |
 | Re-running a phase appends to the store | Overwrite | A second assessment must not erase the evidence that a repair was needed |
 | Phase 4 re-reads the store | Keep results in memory | Makes the report regenerable hours later without touching the cluster |
+| Finish the run, then assemble, render, post, publish | Render during the run | The report is the record; it must carry the final status, and the logbook must get the finished bundle (#4, #18) |
+| Per-run bundles rendered from the store | Copy the shared top level into `runs/<id>/` | A copy inherits other runs' pages; a render from stored rows cannot (#6) |
+| Current state = newest result per node and check | Every historical failure is outstanding | A failure a later phase re-checked and passed is resolved, not a to-do (#5) |
 | C++ only for the reachability sweep | C++ throughout, or none | It is the one place where process/GIL overhead dominates; everything else is I/O-bound |
 | Protected-host refusal is not overridable | A `--force` flag | Powering down a gateway from a remote recovery session is never the intent |
 | No automatic remediation | Restart services, remount | An outage is not the moment to discover what an automatic fix does when its assumptions fail |
