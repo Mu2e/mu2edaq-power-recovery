@@ -21,9 +21,12 @@ targets: all``: it proves every BMC answers ICMP from the hosts that will
 later drive it.
 
 An edge carries ``tested``.  A source that could not be reached, a probe that
-raised, or output without the target's BEGIN/END markers means the path was
-never looked at: that edge is UNKNOWN, not FAIL, and is excluded from the
-isolation analysis.  A completed ping with no replies is FAIL.
+raised, output without the target's BEGIN/END markers, or a block in which
+ping never produced its statistics summary (ping missing, not permitted, or
+rejecting an option) means the path was never looked at: that edge is
+UNKNOWN, not FAIL, and is excluded from the isolation analysis.  A completed
+ping with no replies is FAIL, and so is a name that does not resolve or a
+source with no route to it -- those are answers about the path.
 
 With ``origin: gateways`` coverage is decided per *target*: a BMC is tested if
 any gateway of its location completed a probe to it.  One dark gateway whose
@@ -40,7 +43,7 @@ import logging
 import shlex
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Collection, Dict, List, Optional, Sequence, Tuple
 
 from ..transport.base import TransportError
 from .base import Status
@@ -50,13 +53,31 @@ from .reachability import _ping_command
 log = logging.getLogger(__name__)
 
 
+#: ping's messages for a name that does not resolve (iputils, older iputils,
+#: BSD/macOS).
+_NXDOMAIN = ("Name or service not known", "unknown host", "cannot resolve")
+
+#: Messages ping prints *instead of* a statistics summary that are still an
+#: answer about the path: the name does not resolve, or the source's routing
+#: table has nothing for it.  Any other block without a summary means ping
+#: itself never ran -- ``sh: ping: not found``, ``Operation not permitted``
+#: without cap_net_raw, BusyBox rejecting ``-M do`` -- and the script's
+#: ``|| true`` hides that exit status, so the block is all there is to go on.
+_PATH_ANSWERS = _NXDOMAIN + ("Network is unreachable", "No route to host")
+
+#: The same for the jumbo-frame probe: a local or path MTU refusal is the
+#: answer the probe exists to get.
+_MTU_ANSWERS = _PATH_ANSWERS + ("Message too long", "message too long",
+                                "Frag needed")
+
+
 @dataclass
 class MeshEdge:
     """One source -> target probe on one network.
 
     ``tested`` is False when the probe never ran to completion for this pair
-    -- the source was unreachable, the probe raised, or the output lacked this
-    target's markers.  Such an edge says nothing about the path and is
+    -- the source was unreachable, the probe raised, the output lacked this
+    target's markers, or ping itself never ran (no statistics summary).  Such an edge says nothing about the path and is
     UNKNOWN; only a tested edge can be FAIL.
     """
 
@@ -116,6 +137,8 @@ class MeshResult:
     #: Pseudo-sources standing for "this location has no gateway": their
     #: edges are untested, but they are not hosts that could not be reached.
     pseudo_sources: List[str] = field(default_factory=list)
+    #: target name on this network -> the node's hostname (its ssh name).
+    target_hosts: Dict[str, str] = field(default_factory=dict)
 
     @property
     def tested(self) -> List[MeshEdge]:
@@ -132,7 +155,13 @@ class MeshResult:
 
     @property
     def mtu_failures(self) -> List[MeshEdge]:
-        return [e for e in self.edges if e.tested and e.mtu_ok is False]
+        """Paths that answer the ordinary ping but cannot carry a jumbo frame.
+
+        A path that lost every packet also fails the jumbo probe; counting it
+        here too reported 496 "jumbo-frame failures" on a live run in which
+        nine paths actually had an MTU problem.
+        """
+        return [e for e in self.edges if e.tested and e.ok and e.mtu_ok is False]
 
     def uncovered_targets(self) -> List[str]:
         """Targets with no tested edge at all -- nothing is known about them."""
@@ -179,6 +208,15 @@ class MeshResult:
             by_source.setdefault(edge.source, []).append(edge)
         return sorted(src for src, edges in by_source.items()
                       if edges and not any(e.ok for e in edges))
+
+    def unresolved_targets(self) -> List[str]:
+        """Tested targets whose name did not resolve on the source.
+
+        An inventory or DNS problem, not a network one: on the live cluster
+        four teststand BMC names in the topology have no DNS entry at all.
+        """
+        return sorted({e.target for e in self.failures
+                       if any(m in (e.detail or "") for m in _NXDOMAIN)})
 
     def unreachable_targets(self) -> List[str]:
         """Targets that no source reached, among the sources that were tested."""
@@ -370,9 +408,20 @@ class MeshProbe:
                 continue
             ping_block, mtu_block = blocks
             stats = parse_ping(ping_block)
+            if not stats.transmitted and not _answered(ping_block, _PATH_ANSWERS):
+                # ping never ran here; nothing was learned about the path.
+                edges.append(_untested(
+                    source, name, network,
+                    "ping produced no result on the source: "
+                    + _first_line(ping_block)))
+                continue
             mtu_ok: Optional[bool] = None
             if mtu_probe and mtu_block:
-                mtu_ok = parse_ping(mtu_block).alive
+                mtu_stats = parse_ping(mtu_block)
+                # The same rule for the jumbo probe: BusyBox rejecting -M do
+                # says nothing about the path's MTU, so mtu_ok stays None.
+                if mtu_stats.transmitted or _answered(mtu_block, _MTU_ANSWERS):
+                    mtu_ok = mtu_stats.alive
             edges.append(MeshEdge(
                 source=source, target=name, network=network,
                 ok=stats.alive, loss_pct=stats.loss_pct,
@@ -410,15 +459,20 @@ class MeshProbe:
         orphaned: Dict[str, List[str]] = {}
         for loc in _locations_of(targets):
             names = [t.networks[network] for t in targets if t.location == loc]
-            gws = self.topology.gateways(loc) if (self.topology is not None
-                                                 and loc != "unknown") else []
+            gws = []
+            if self.topology is not None and loc != "unknown":
+                gws = self.topology.ipmi_gateways(loc) if network == "ipmi" \
+                    else self.topology.gateways(loc)
             if not gws:
                 log.warning("mesh %s: location %s has no gateway; %d target(s) "
                             "not probed", network, loc, len(names))
                 orphaned[loc] = names
                 continue
             for gw in gws:
-                gateways.append(gw)
+                if gw not in gateways:
+                    # The teststand's ipmi_gateways are MC-2's: one host,
+                    # two plans, but one source.
+                    gateways.append(gw)
                 plans.append((gw, lambda g=gw: self.ssh_factory.for_host(g, direct=True),
                               names))
         return plans, gateways, orphaned
@@ -426,7 +480,7 @@ class MeshProbe:
     def run(self, nodes: Sequence[Any], network: str,
             full_mesh: bool = True, mtu_probe: bool = False,
             origin: str = "nodes", targets: Optional[str] = None,
-            deadline: Any = None) -> MeshResult:
+            deadline: Any = None, cross_location: bool = False) -> MeshResult:
         """Probe *network* across *nodes*.
 
         *targets* is ``all`` or ``anchors``; when omitted it follows
@@ -447,8 +501,15 @@ class MeshProbe:
 
         skipped = [n.hostname for n in nodes if not n.has_network(network)]
         target_nodes = self._targets(nodes, network, target_mode == "all")
-        per_location = isinstance(self.config.get("anchors"), dict) \
-            and target_mode == "anchors"
+        # A full mesh stays inside each location: the private networks are
+        # separate segments per site, and MC-2 and the teststand reuse
+        # 10.226.9.0/24, so a cross-site pair is not a path at all (verified
+        # live: every one fails with ARP "host unreachable").
+        # cross_location: true restores the whole-run mesh for a network that
+        # really spans sites.
+        per_location = (target_mode == "all" and not cross_location) or \
+            (isinstance(self.config.get("anchors"), dict)
+             and target_mode == "anchors")
         orphaned: Dict[str, List[str]] = {}
         if origin == "gateways":
             plans, source_names, orphaned = self._plan_gateways(target_nodes,
@@ -462,6 +523,7 @@ class MeshProbe:
                          sources=source_names,
                          targets=[n.hostname for n in target_nodes],
                          skipped=skipped, origin=origin, target_mode=target_mode)
+        out.target_hosts = {t.networks[network]: t.hostname for t in target_nodes}
         for loc, names in orphaned.items():
             pseudo = f"(no gateway: {loc})"
             out.pseudo_sources.append(pseudo)
@@ -544,20 +606,45 @@ class MeshProbe:
                     f"{len(uncovered)} of its {len(mine)} target(s) were tested "
                     f"by no other gateway -- those are UNKNOWN")
 
-    def run_all(self, nodes: Sequence[Any], deadline: Any = None) -> List[MeshResult]:
-        """Probe every network listed in checks.yaml's mesh section."""
+    def run_all(self, nodes: Sequence[Any], deadline: Any = None,
+                exclude: Collection[str] = ()) -> List[MeshResult]:
+        """Probe every network listed in checks.yaml's mesh section.
+
+        *exclude* names hosts (phase 3: those that failed an earlier phase)
+        left out of ``origin: nodes`` networks only.  An ``origin: gateways``
+        network still probes every node's BMC: a BMC does not depend on the
+        host OS, and the BMCs of the nodes that did not come back are the
+        ones the operator needs next.
+        """
+        excluded = set(exclude)
+        kept = [n for n in nodes if n.hostname not in excluded]
         results: List[MeshResult] = []
         for entry in self.config.get("networks", []) or []:
+            origin = str(entry.get("origin", "nodes"))
             results.append(self.run(
-                nodes,
+                nodes if origin == "gateways" else kept,
                 network=entry["name"],
                 full_mesh=bool(entry.get("full_mesh", True)),
                 mtu_probe=bool(entry.get("mtu_probe", False)),
-                origin=str(entry.get("origin", "nodes")),
+                origin=origin,
+                cross_location=bool(entry.get("cross_location", False)),
                 targets=entry.get("targets"),
                 deadline=deadline,
             ))
         return results
+
+
+def _answered(block: str, markers: Sequence[str]) -> bool:
+    """True if a ping block with no summary still carries an answer in *markers*."""
+    return any(m in block for m in markers)
+
+
+def _first_line(block: str) -> str:
+    """The first non-blank line of *block* -- ping's own reason it did not run."""
+    for line in block.splitlines():
+        if line.strip():
+            return line.strip()[:200]
+    return "(empty)"
 
 
 def _locations_of(nodes: Sequence[Any]) -> List[str]:

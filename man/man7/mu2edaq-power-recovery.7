@@ -1,4 +1,4 @@
-.TH MU2EDAQ-POWER-RECOVERY 7 "2026-09-17" "mu2edaq-power-recovery 0.1.0" "Overview"
+.TH MU2EDAQ-POWER-RECOVERY 7 "2026-09-29" "mu2edaq-power-recovery 0.2.0" "Overview"
 .SH NAME
 mu2edaq-power-recovery \- overview of the Mu2e DAQ power-outage recovery tools
 .SH DESCRIPTION
@@ -149,7 +149,9 @@ or
 equal to the configured
 .IR run.label );
 .I run.dry_run: false
-in configuration alone is refused. A simulated run cannot be armed at all.
+in configuration alone is refused for any invocation that includes phase 2;
+the read-only phases always run as a dry run. A simulated run cannot be armed
+at all.
 .IP \(bu 2
 Phase 2 powers only what
 .BR \-\-node / \-\-location / \-\-from / \-\-until
@@ -176,8 +178,14 @@ to copy the report anywhere, reporting
 The publisher needs a refusal of its own because it copies with the filesystem
 rather than through a transport, so scripting the transports does not reach it.
 .IP \(bu 2
-The first IPMI credential rejection stops IPMI for the rest of the run. All the
-BMCs share one credential set, so the first refusal settles the matter, and
+A simulated run is marked as one in the run store, and a later
+.B mu2e-power-report
+refuses (exit 2) to post it to the logbook or publish it, whatever its own
+options, so scripted results can never be filed as a real dry run.
+.IP \(bu 2
+The first IPMI credential rejection stops IPMI to that location for the rest of
+the run. The BMCs of a location share one credential set, so the first refusal
+settles the matter there (other locations are judged separately), and
 repeating it only walks the BMC accounts towards lockout; the run reports one
 diagnosis naming the username that was refused. Only an RAKP failure or an
 .I "unauthorized name"

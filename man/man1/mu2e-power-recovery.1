@@ -1,4 +1,4 @@
-.TH MU2E-POWER-RECOVERY 1 "2026-09-18" "mu2edaq-power-recovery 0.1.0" "Mu2e DAQ Operations"
+.TH MU2E-POWER-RECOVERY 1 "2026-09-29" "mu2edaq-power-recovery 0.2.0" "Mu2e DAQ Operations"
 .SH NAME
 mu2e-power-recovery \- assess, power on, verify and report on the Mu2e DAQ clusters after a power outage
 .SH SYNOPSIS
@@ -313,7 +313,7 @@ exit.
 .TP
 .B \-\-version
 Print
-.I mu2edaq-power-recovery 0.1.0
+.I mu2edaq-power-recovery 0.2.0
 and exit. The same flag is accepted by
 .BR mu2e-power-state (1),
 .BR mu2e-power-on (1),
@@ -391,7 +391,10 @@ failures that are still current are
 .IR outstanding .
 Phase 2's profiles re-check subsets, so a phase-1 failure of a check phase 2
 did not run again stays outstanding. A node's status is the roll-up of its
-current checks, or UNREACHABLE when its latest assessment could not reach it.
+current checks. When its latest assessment could not reach it, the status is
+the worse of UNREACHABLE and that roll-up: a failure nothing has superseded
+keeps the node FAILED, since "we could not look again" does not clear "it is
+broken".
 The headline, counts, next steps, the logbook text and the exit status are all
 derived from this one reconciled table, together with the latest phase-3
 verdict.
@@ -425,7 +428,10 @@ data files of phases the newest run lacks removed, plus
 (the run history). Regenerating an older run rewrites its bundle and leaves the
 top level as it is.
 .I report.keep_runs
-bounds the number of bundles kept.
+bounds the number of bundles kept: the newest that many, plus the bundle just
+rendered. Regenerating an old run therefore never deletes its own bundle
+before it can be posted, nor a newer run's; the surplus one goes at the next
+render of a newer run.
 .SH JSON OUTPUT
 With
 .BR \-\-json ,
@@ -476,6 +482,60 @@ the remote does not, the tool says so and runs the code that is checked out
 rather than reconciling anything itself. A fetch that fails or times out is a
 warning, never a stop. When an update is applied, the process re-executes once
 so the new code is actually the code that runs.
+.PP
+If the update touched a build input
+.RI ( selfupdate.rebuild_globs )
+and the rebuild
+.RB ( bootstrap.sh )
+fails, is missing, or cannot start, the update is abandoned: the checkout is
+reset to the full pre-update revision
+.RB ( "git reset \-\-hard" ,
+or
+.B \-\-keep
+when a dirty tree was allowed by
+.IR selfupdate.allow_dirty ,
+which keeps local edits), the process is
+.I not
+re-executed, and the run continues on the code it started with. The message
+asks the operator to run
+.B ./bootstrap.sh
+by hand, and warns that a partly run bootstrap may already have changed the
+virtual environment. If the reset itself fails the run stops with exit 2: the
+checkout no longer matches the running code, which still imports modules from
+disk. What phase 0 did (full before/after revisions, whether it rolled back,
+the revision it attempted) is stored in the run's provenance
+.RI ( version.selfupdate
+in the run store and the report).
+.SH RUN LOCK
+An invocation that can act on hardware \(em phases 1, 2 or 3 without
+.B \-\-simulate
+\(em takes an exclusive operating-system lock on
+.I run.lock_file
+.RI ( logs/power-recovery.lock )
+before phase 0, and a second such invocation exits 2 naming the holder's pid,
+start time, host and command line.
+.BR \-\-simulate ,
+.BR \-\-list\-checks ,
+.B \-\-list\-nodes
+and report-only runs do not take it. The kernel releases the lock however the
+process ends; the file, with the last holder's JSON record, is left in place
+and believed only while the lock is held. The lock is released immediately
+before the phase-0 re-exec and taken again by the new process.
+Phase 0 itself runs only under the lock: an invocation that does not take it
+\(em a report regeneration, a listing \(em never updates the checkout, which a
+live run may be executing from. The lock file is ignored by git, so it never
+makes the checkout look modified to phase 0.
+.PP
+.RS
+.EX
+python \-m mu2edaq_power_recovery.runlock status    # holder, or "not running"
+python \-m mu2edaq_power_recovery.runlock pid       # pid only while held
+.EE
+.RE
+.PP
+.B stop\-mu2edaq\-power\-recovery.sh
+signals only the pid the lock reports, and only while that process's command
+line is still the driver's.
 .SH DIAGNOSING A REFUSED LOGIN
 The primary login and ticket are logged before anything is attempted, and each
 attempt is logged at debug level in the form
@@ -549,7 +609,27 @@ From the YAML file,
 or
 .BR MU2E_POWER_RECOVERY_RUN_DRY_RUN=false ,
 with neither of the above: exit 2, with a message naming where the setting came
-from and both ways to authorise.
+from and both ways to authorise \(em for an invocation that includes phase 2
+.RB ( "\-\-phase poweron" ,
+.BR "\-\-phase all" ,
+.BR mu2e-power-on ).
+.TP
+.B Read-only invocations
+.BR "\-\-phase assess" ,
+.BR network ,
+.B report
+and their drivers
+.RB ( mu2e-power-state ,
+.BR mu2e-power-netcheck ,
+.BR mu2e-power-report )
+cannot issue a power command, so nothing is authorised and nothing is
+refused: they always run as a dry run, whatever
+.IR run.dry_run ,
+.B \-\-execute
+or the token say, and log an info line naming what was ignored. Refusing them
+would stop every read-only driver at a site that set
+.I run.dry_run: false
+for the token path.
 .PP
 The decision is made before phase 0 and before any credential. A live run
 prints
@@ -724,6 +804,12 @@ and one bundle per run under
 .TP
 .I logs/power-recovery.log
 Rotating log of every run.
+.TP
+.I logs/power-recovery.lock
+The run lock
+.RI ( run.lock_file );
+see
+.BR "RUN LOCK" .
 .SH ENVIRONMENT
 Every configuration key can be overridden by an environment variable named
 .BI MU2E_POWER_RECOVERY_ KEY
@@ -776,7 +862,8 @@ A phase completed but one or more nodes failed their checks.
 .TP
 .B 2
 The run could not start: configuration, credentials, no reachable gateway, a
-live run the invocation did not authorise, a phase-2 stage or node selection
+live run the invocation did not authorise, another run holding the run lock, a
+failed update that could not be rolled back, a phase-2 stage or node selection
 that cannot be honoured, or a
 .B \-\-run\-id
 that is misplaced or not in the store; or it stopped on an internal error

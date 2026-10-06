@@ -22,7 +22,7 @@
       <td class="px-3 py-2">{{ r.operator }}</td>
       <td class="px-3 py-2 font-mono text-xs">{{ r.started_at }}</td>
       <td class="px-3 py-2">{{ r.status }}</td>
-      <td class="px-3 py-2">{{ 'dry run' if r.dry_run else 'live' }}</td>
+      <td class="px-3 py-2">{% if r.simulated %}<span class="font-semibold text-violet-800 dark:text-violet-300">simulated</span>{% elif r.dry_run %}dry run{% else %}live{% endif %}</td>
       <td class="px-3 py-2"><a class="text-sky-700 underline dark:text-sky-400" href="runs/{{ r.id }}/index.html">open</a></td>
     </tr>
     {% else %}

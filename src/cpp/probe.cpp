@@ -36,7 +36,7 @@
 namespace mu2eprobe {
 namespace {
 
-constexpr const char* kVersion = "0.1.0";
+constexpr const char* kVersion = "0.2.0";
 
 using Clock = std::chrono::steady_clock;
 

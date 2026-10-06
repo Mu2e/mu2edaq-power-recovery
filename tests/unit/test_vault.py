@@ -149,3 +149,30 @@ def test_credentials_redact_the_password(vault):
     redacted = vault.ipmi().redacted()
     assert redacted["password"] == "<redacted>"
     assert redacted["username"] == "MU2E"
+
+
+def test_vault_login_output_goes_to_stderr_not_stdout(settings, monkeypatch, capsys):
+    """``vault login`` prints token details on stdout; under --json that
+    corrupted the one JSON document. Its stdout is our stderr; stdin and
+    stderr stay inherited so it can still prompt."""
+    import subprocess
+    import sys
+    calls = []
+
+    def fake_call(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return 0
+
+    monkeypatch.setattr(subprocess, "call", fake_call)
+    creds = VaultCredentials(settings)
+    monkeypatch.setattr(creds, "_cached_token", lambda: "tok")
+    assert creds._interactive_login() == "tok"
+    (argv, kwargs), = calls
+    assert argv[:2] == ["vault", "login"]
+    try:
+        expected = sys.stderr.fileno()
+    except (AttributeError, OSError, ValueError):
+        expected = 2
+    assert kwargs.get("stdout") == expected
+    assert "stdin" not in kwargs and "stderr" not in kwargs
+    assert capsys.readouterr().out == ""

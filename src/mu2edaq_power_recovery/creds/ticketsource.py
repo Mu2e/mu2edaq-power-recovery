@@ -47,6 +47,16 @@ class TicketSourceError(RuntimeError):
     """mu2edaq-kerberos is unavailable, or could not mint a ticket."""
 
 
+class TicketTimeout(TicketSourceError):
+    """``get-kerberos-ticket`` ran and did not finish in time.
+
+    Its own type because the command *ran*: unlike an ordinary failure it may
+    have minted a ticket before it hung, which on macOS lands in the API:
+    collection under a name only a collection lookup can recover. The caller
+    records that name for cleanup on this type, not on the message.
+    """
+
+
 class DefaultCacheGuardError(TicketSourceError):
     """The operator's default credential cache cannot be protected.
 
@@ -378,7 +388,7 @@ class TicketSource:
             # have repointed the default cache before it hung -- and returning
             # a bare timeout would leave the pointer moved and let the chain
             # try the next six identities under the wrong identity.
-            timed_out = TicketSourceError(
+            timed_out = TicketTimeout(
                 f"get-kerberos-ticket timed out after {timeout}s for {identity}")
             timed_out.__cause__ = exc
             result = None
@@ -421,12 +431,13 @@ class TicketSource:
         # after: a cache for this identity very likely already exists from an
         # earlier run, in which case the mint refreshes it in place and nothing
         # "appears".
-        for principal, name in self.collection().items():
-            if principal.split("/")[0] == identity:
-                log.debug("%s is in the credential collection as %s",
-                          identity, name)
-                return ServiceTicket(identity=identity, cache=name,
-                                     principal=principal)
+        found = self.collection_cache_for(identity)
+        if found:
+            principal, name = found
+            log.debug("%s is in the credential collection as %s",
+                      identity, name)
+            return ServiceTicket(identity=identity, cache=name,
+                                 principal=principal)
 
         raise TicketSourceError(
             f"get-kerberos-ticket reported success for {identity} but the "
@@ -538,6 +549,19 @@ class TicketSource:
             if len(parts) >= 2 and "@" in parts[0] and ":" in parts[1]:
                 caches[parts[0]] = parts[1]
         return caches
+
+    def collection_cache_for(self, identity: str) -> Optional[Tuple[str, str]]:
+        """``(principal, ccache name)`` of *identity*'s cache in the collection.
+
+        Matched on the principal's first component (``mu2edaq/mu2e@FNAL.GOV``
+        is ``mu2edaq``), so only a cache for that service identity is ever
+        returned -- never the operator's. None when there is none, or when
+        ``klist -l`` cannot be read.
+        """
+        for principal, name in self.collection().items():
+            if principal.split("/")[0] == identity:
+                return principal, name
+        return None
 
     def restore_default(self, principal: str) -> bool:
         """Point the default credential cache back at *principal*.

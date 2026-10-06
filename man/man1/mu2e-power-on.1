@@ -1,4 +1,4 @@
-.TH MU2E-POWER-ON 1 "2026-09-18" "mu2edaq-power-recovery 0.1.0" "Mu2e DAQ Operations"
+.TH MU2E-POWER-ON 1 "2026-09-29" "mu2edaq-power-recovery 0.2.0" "Mu2e DAQ Operations"
 .SH NAME
 mu2e-power-on \- phase 2: bring the Mu2e DAQ cluster up in dependency order
 .SH SYNOPSIS
@@ -154,8 +154,9 @@ and
 .BR \-\-execute .
 The gateway stage never issues a power command at all; it verifies only.
 .PP
-All the BMCs share one credential set, so a refused BMC credential is not
-retried and not repeated: the first rejection stops the run issuing IPMI and
+The BMCs of a location share one credential set, so a refused BMC credential
+is not retried and not repeated: the first rejection stops the run issuing
+IPMI to that location (other locations, whose account may differ, carry on) and
 produces one diagnosis naming the username that was refused, instead of walking
 the same wrong credential through every chassis and locking the account on
 each. Only a RAKP failure or
@@ -285,7 +286,7 @@ Print the option summary and exit.
 .TP
 .B \-\-version
 Print
-.I mu2edaq-power-recovery 0.1.0
+.I mu2edaq-power-recovery 0.2.0
 and exit.
 .TP
 .BI \-\-config " FILE"
@@ -333,8 +334,9 @@ The sequence ran but a stage failed, or nodes failed their checks.
 .TP
 .B 2
 The sequence could not start: no gateway, no BMC credentials, a stage or node
-selection that cannot be honoured, or a configuration that asks for a live run
-this invocation did not authorise.
+selection that cannot be honoured, a configuration that asks for a live run
+this invocation did not authorise, or another run holding the run lock
+.RI ( run.lock_file ).
 .SH EXAMPLES
 See what would happen, without doing it:
 .RS

@@ -1,4 +1,4 @@
-.TH MU2EDAQ-POWER-RECOVERY.YAML 5 "2026-09-18" "mu2edaq-power-recovery 0.1.0" "File Formats"
+.TH MU2EDAQ-POWER-RECOVERY.YAML 5 "2026-09-29" "mu2edaq-power-recovery 0.2.0" "File Formats"
 .SH NAME
 power-recovery.yaml \- main configuration for the Mu2e DAQ power-recovery tools
 .SH SYNOPSIS
@@ -127,8 +127,9 @@ or when the process environment carries
 .BI MU2E_POWER_RECOVERY_ARM= label
 equal to a non-empty
 .IR run.label .
-With this key false and neither of those, the run exits 2 and says both ways to
-authorise. A token given while this key is true, with no label, or with the
+With this key false and neither of those, a run that includes phase 2 exits 2
+and says both ways to authorise; the read-only phases (assess, network,
+report) cannot issue a power command and run as a dry run regardless. A token given while this key is true, with no label, or with the
 wrong label, also exits 2.
 .B \-\-execute
 works whatever this key says. The token is never a configuration key and is a
@@ -168,6 +169,35 @@ Default stage range for phase 2; normally set with
 .BR \-\-from / \-\-until .
 A name that is not a stage of the sequence, or a reversed range, exits 2 before
 any credential is acquired, listing the valid names.
+.TP
+.I lock_file
+The single-run lock. Default
+.IR logs/power-recovery.lock ,
+relative to the project root. Every invocation that can act on hardware
+(phases 1, 2 or 3 without
+.BR \-\-simulate )
+takes an exclusive, non-blocking operating-system lock on this file before the
+phase-0 update:
+.BR flock (2)
+on Linux and macOS,
+.B msvcrt.locking
+on Windows. A second such run exits 2 naming the holder's pid, start time,
+host and command line.
+.BR \-\-simulate ,
+.BR \-\-list\-checks ,
+.B \-\-list\-nodes
+and report-only runs do not take it. After locking, the holder writes the JSON
+record
+.RI { pid ", " started_at ", " cmdline ", " host }
+into the file. The record is only believed while the lock is held: the kernel
+releases the lock when the process ends, however it ends, so a free lock means
+the recorded pid is stale and it is never signalled. The file itself is left in
+place. The lock is released immediately before the phase-0 re-exec and taken
+again by the re-executed process. Inspect it with
+.BR "python \-m mu2edaq_power_recovery.runlock status" ;
+.B pid
+prints the holder's pid only while the lock is held (exit 1 otherwise), which
+is what the stop scripts use.
 .SS topology
 .TP
 .IR file ", " sequence_file ", " checks_file
@@ -314,14 +344,16 @@ before the first SSH attempt.
 .I stop_on_auth_failure
 Stop issuing IPMI commands once a BMC has answered and rejected the
 credentials \(em an RAKP failure, or "unauthorized name". One credential set
-serves every BMC, so the next one rejects it too, and each attempt is
+serves the BMCs of a location, so the next one there rejects it too, and each attempt is
 .I retries
 invocations here with four ipmitool retries inside each. Defaults to
 .BR true .
 While it is true, IPMI commands are also issued one at a time until a first
 BMC accepts the credential, so under concurrent assessment a wrong credential
 reaches exactly one BMC; after that first success they run concurrently. The
-state is shared by every IPMI client of the run. A refusal is reported as
+state is kept per location and shared by that location's IPMI clients: the
+BMC account differs between sites (the teststand's BMCs refuse the account
+MC-2's accept), so a refusal at one location does not stop IPMI at another. A refusal is reported as
 .BR unknown ,
 not as a BMC that does not answer.
 Set it false only to gather evidence from several BMCs deliberately; the run
@@ -332,16 +364,18 @@ A BMC that simply does not answer is not this \(em a dark chassis reports
 that is the expected case.
 The exception is a BMC that has just answered the
 .I reachability_precheck
-ping: two distinct such BMCs failing with "Unable to establish" while no BMC
-has yet accepted the credential trip the stop as well, because a live BMC that
+ping: two distinct such BMCs of a location failing with "Unable to establish"
+while no BMC there has yet accepted the credential trip the stop as well, because a live BMC that
 refuses the session is most likely being sent the wrong username. An RAKP
 failure or "unauthorized name" still trips it on the first occurrence.
 .TP
 .I reachability_precheck
-While the credential is unproven, send one
-.B ping \-c 1 \-W 1
-to the BMC from the gateway before each ipmitool invocation. A BMC that does
-not answer is reported unreachable at once: ipmitool is not run, and the call
+While the credential is unproven, send
+.B ping \-c 3 \-i 0.2 \-W 1
+to the BMC from the gateway before each ipmitool invocation. Any reply counts:
+right after an outage the gateway's ARP entry for the BMC is cold and the
+first echo is often lost. A BMC that answers none is reported unreachable at
+once: ipmitool is not run, and the call
 does not wait behind the one-at-a-time credential gate, so dark BMCs are
 assessed concurrently rather than each costing a serialised ipmitool timeout.
 In phase 1, a node whose
@@ -507,7 +541,12 @@ Where the static site is written, and its heading.
 .I keep_runs
 How many per-run report bundles to keep under
 .IR output_dir/runs/ ;
-each is rendered from that run's stored data alone.
+each is rendered from that run's stored data alone. Pruning keeps the newest
+.I keep_runs
+by run id and, in addition, the bundle just rendered, so regenerating an old
+run neither deletes its own bundle nor a newer one.
+.I 0
+keeps every bundle.
 .TP
 .I publish
 .IR enabled ", " method

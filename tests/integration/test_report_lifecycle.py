@@ -48,6 +48,23 @@ def _json(path):
     return json.loads(Path(path).read_text())
 
 
+def _no_credentials_from_here(monkeypatch):
+    from mu2edaq_power_recovery.orchestrator import Orchestrator
+    monkeypatch.setattr(Orchestrator, "prepare_credentials",
+                        lambda self: pytest.fail("prepare_credentials called"))
+
+
+def _as_real_runs(tmp_path):
+    """Mark the stored runs as not simulated.
+
+    The suite can only create runs with --simulate (a real one would contact
+    the cluster), and a simulated run is never posted or published. Tests of
+    the posting path seed with a rehearsal and then clear the flag, which
+    stands in for a real dry run stored by an earlier invocation.
+    """
+    _db(tmp_path, "update runs set simulated = 0")
+
+
 @pytest.fixture
 def no_credentials(monkeypatch):
     from mu2edaq_power_recovery.orchestrator import Orchestrator
@@ -254,6 +271,40 @@ def test_a_later_failure_supersedes_an_earlier_pass(store):
     assert [o["phase"] for o in narrative["outstanding"]] == ["poweron"]
 
 
+def test_an_unreachable_node_keeps_its_unsuperseded_failure(store):
+    # Phase 1 sees a FAIL; phase 2 then cannot reach the node and records no
+    # checks. The failure is still current: the node is FAIL, not UNKNOWN,
+    # and the run is a failure ("it is broken"), not "we could not look".
+    _phase(store, "assess", 1, [("n1", "disk.mounts", Status.FAIL),
+                                ("n1", "ping.lab", Status.OK)], {"n1": "fail"})
+    store.start_phase("poweron", 2)
+    store.record_node("n1", "mc2", "readout", "unknown",
+                      data={"unreachable": True})
+    store.finish_phase("complete")
+    export = store.export_run()
+    state = phase4_report.reconcile(export)
+    assert state["node_status"] == {"n1": "fail"}
+    assert state["status"] is Status.FAIL
+    narrative = phase4_report.build_narrative(export)
+    assert narrative["counts"]["fail"] == 1
+    assert narrative["counts"]["unknown"] == 0
+    assert narrative["failed"] == ["n1"] and narrative["unreachable"] == []
+    assert "1 failed, 0 unreachable" in narrative["headline"]
+    assert [(o["check"], o["phase"]) for o in narrative["outstanding"]] == \
+        [("disk.mounts", "assess")]
+
+
+def test_an_unreachable_node_with_only_good_checks_is_unknown(store):
+    _phase(store, "assess", 1, [("n1", "ping.lab", Status.OK)])
+    store.start_phase("poweron", 2)
+    store.record_node("n1", "mc2", "readout", "unknown",
+                      data={"unreachable": True})
+    store.finish_phase("complete")
+    state = phase4_report.reconcile(store.export_run())
+    assert state["node_status"] == {"n1": "unknown"}
+    assert state["status"] is Status.UNKNOWN
+
+
 def test_phase1_fail_then_phase2_pass_exits_0(tmp_path, monkeypatch):
     # End to end: /home is missing when phase 1 looks, back when phase 2
     # re-checks. The run is healthy; the report says the failure is resolved.
@@ -349,6 +400,7 @@ def test_report_only_post_attaches_the_run_bundle(tmp_path, ecl_stub, monkeypatc
     module, posted = ecl_stub
     assert run_cli(tmp_path, "--phase", "assess", "--node", "mu2e-trk-01") == 0
     assert run_cli(tmp_path, "--phase", "network", "--node", "mu2e-dl-01") in (0, 1)
+    _as_real_runs(tmp_path)
 
     from mu2edaq_power_recovery.orchestrator import Orchestrator
     monkeypatch.setattr(Orchestrator, "prepare_credentials",
@@ -369,10 +421,38 @@ def test_report_only_post_attaches_the_run_bundle(tmp_path, ecl_stub, monkeypatc
     assert _run_count(tmp_path) == 2
 
 
+def test_regenerating_an_old_run_keeps_its_bundle_and_newer_ones(
+        tmp_path, ecl_stub, monkeypatch):
+    # keep_runs=1: rendering run 2 prunes runs/1. Regenerating run 1 used to
+    # render runs/1 and then prune it as the oldest, leaving only runs/2, so
+    # --post-ecl attached files that had just been deleted.
+    _module, posted = ecl_stub
+    monkeypatch.setenv("MU2E_POWER_RECOVERY_REPORT_KEEP_RUNS", "1")
+    assert run_cli(tmp_path, "--phase", "assess", "--node", "mu2e-trk-01") == 0
+    assert run_cli(tmp_path, "--phase", "assess", "--node", "mu2e-trk-02") == 0
+    runs_dir = tmp_path / "html" / "runs"
+    assert sorted(d.name for d in runs_dir.iterdir()) == ["2"]
+    _as_real_runs(tmp_path)
+    _no_credentials_from_here(monkeypatch)
+
+    assert run_cli(tmp_path, "--phase", "report", "--run-id", "1", "--post-ecl",
+                   simulate=False) == 0
+    assert sorted(d.name for d in runs_dir.iterdir()) == ["1", "2"]
+    files = posted[0]["files"]
+    assert files and all(Path(f).exists() for f in files)
+    assert all(f.startswith(str(runs_dir / "1")) for f in files)
+
+    # The next render of a newer run applies keep_runs again.
+    assert run_cli(tmp_path, "--phase", "report", "--run-id", "2",
+                   simulate=False) == 0
+    assert sorted(d.name for d in runs_dir.iterdir()) == ["2"]
+
+
 def test_a_failed_post_leaves_the_complete_local_report(tmp_path, ecl_stub):
     module, _posted = ecl_stub
     module.fail = True
     assert run_cli(tmp_path, "--phase", "assess", "--node", "mu2e-trk-01") == 0
+    _as_real_runs(tmp_path)
     assert run_cli(tmp_path, "--phase", "report", "--post-ecl",
                    simulate=False) == 0
     bundle = tmp_path / "html" / "runs" / "1"
@@ -391,6 +471,60 @@ def test_a_simulated_run_never_posts(tmp_path, ecl_stub):
     assert posted == []
     report = _json(tmp_path / "html" / "runs" / "1" / "data" / "report.json")
     assert "simulated" in report["ecl"]["reason"]
+
+
+@pytest.mark.parametrize("flags", [["--post-ecl"], ["--publish"],
+                                   ["--publish-target", "/nowhere"],
+                                   ["--run-id", "1", "--post-ecl"]])
+def test_a_stored_simulated_run_is_never_posted_or_published_later(
+        tmp_path, ecl_stub, capsys, monkeypatch, flags):
+    # '--phase all --simulate' then a non-simulated 'mu2e-power-report
+    # --post-ecl' used to post the rehearsal as if it were a real dry run.
+    _module, posted = ecl_stub
+    assert run_cli(tmp_path, "--phase", "all", "--node", "mu2e-trk-01",
+                   "--node", "mu2e-trk-02") == 0
+    assert _db(tmp_path, "select simulated from runs") == [(1,)]
+    _no_credentials_from_here(monkeypatch)
+    reports_before = _db(tmp_path, "select count(*) from phases "
+                                   "where name = 'report'")
+    capsys.readouterr()
+    code = run_cli(tmp_path, "--phase", "report", *flags, simulate=False)
+    err = capsys.readouterr().err
+    assert code == 2
+    assert "run 1 was a simulated run" in err
+    assert posted == []
+    assert not (tmp_path / "nowhere").exists()
+    # Refused before anything was recorded against the run.
+    assert _db(tmp_path, "select count(*) from phases where name = 'report'") \
+        == reports_before
+
+
+def test_a_stored_simulated_run_still_regenerates_locally(tmp_path, ecl_stub,
+                                                          monkeypatch):
+    _module, posted = ecl_stub
+    assert run_cli(tmp_path, "--phase", "all", "--node", "mu2e-trk-01",
+                   "--node", "mu2e-trk-02") == 0
+    _no_credentials_from_here(monkeypatch)
+    assert run_cli(tmp_path, "--phase", "report", simulate=False) == 0
+    assert posted == []
+    bundle = tmp_path / "html" / "runs" / "1"
+    assert "SIMULATED" in (bundle / "index.html").read_text()
+    assert "SIMULATED RUN" in (bundle / "detail.html").read_text()
+    assert "simulated" in (tmp_path / "html" / "runs.html").read_text()
+    assert _json(bundle / "data" / "run-export.json")["run"]["simulated"] == 1
+
+
+def test_post_refuses_a_stored_simulated_run_directly(tmp_path, ecl_stub):
+    # The second line behind the driver's refusal: phase4_report.post()
+    # itself reads the stored flag, whatever the orchestrator says.
+    _module, posted = ecl_stub
+    store = RunStore(f"sqlite:///{tmp_path / 'p.db'}")
+    rid = store.start_run("t", True, {}, {}, simulated=True)
+    orch = types.SimpleNamespace(simulate=False, store=store, settings=None)
+    info = phase4_report.post(orch, rid, {"run": {}})
+    store.close()
+    assert info["posted"] is False and "simulated" in info["reason"]
+    assert posted == []
 
 
 # ---------------------------------------------------------------------------

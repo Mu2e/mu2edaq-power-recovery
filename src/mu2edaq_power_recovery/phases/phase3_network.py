@@ -6,9 +6,12 @@ switch that came back with a VLAN missing, a port in the wrong group, or jumbo
 frames off on one uplink leaves every node individually healthy and the DAQ
 unable to move data.
 
-Only nodes that passed phase 2 are probed by default -- probing a node that is
-known to be down adds a full ping timeout per pair and tells the operator
-nothing they do not already know.
+Only nodes that passed an earlier phase are probed by default on the
+``origin: nodes`` networks -- probing a node that is known to be down adds a
+full ping timeout per pair and tells the operator nothing they do not already
+know.  The ``origin: gateways`` networks (IPMI) still probe every node's BMC:
+the BMC does not depend on the host OS, and the BMCs of the nodes that did not
+come back are exactly the ones the operator needs to reach next.
 """
 from __future__ import annotations
 
@@ -38,14 +41,19 @@ def run(orch: Orchestrator, nodes: Optional[Sequence[Node]] = None,
                          started_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
 
     targets = list(nodes if nodes is not None else orch.nodes())
+    if nodes is None:
+        result.notes.extend(orch.empty_location_notes())
+    excluded: List[str] = []
     if not include_failed:
-        targets, excluded = _reachable_only(orch, targets)
+        _, excluded = _reachable_only(orch, targets)
         if excluded:
             result.notes.append(
-                f"{len(excluded)} node(s) excluded because they did not pass an "
-                f"earlier phase: {', '.join(sorted(excluded)[:8])}"
+                f"{len(excluded)} node(s) excluded from node-to-node probes "
+                f"because they did not pass an earlier phase: "
+                f"{', '.join(sorted(excluded)[:8])}"
                 + (" ..." if len(excluded) > 8 else "")
-                + ". Use --include-failed to probe them anyway.")
+                + ". Their BMCs are still probed from the gateways. "
+                  "Use --include-failed to probe them anyway.")
     if not targets:
         result.status = Status.UNKNOWN
         result.summary = "no nodes available to probe"
@@ -59,7 +67,8 @@ def run(orch: Orchestrator, nodes: Optional[Sequence[Node]] = None,
                       topology=orch.topology)
     deadline = phase_deadline(orch)
     with orch.budget(deadline):
-        mesh_results: List[MeshResult] = probe.run_all(targets, deadline=deadline)
+        mesh_results: List[MeshResult] = probe.run_all(targets, deadline=deadline,
+                                                       exclude=excluded)
     not_run = sum(1 for m in mesh_results for e in m.untested
                   if e.detail == TIMEOUT_SUMMARY)
 
@@ -118,8 +127,23 @@ def run(orch: Orchestrator, nodes: Optional[Sequence[Node]] = None,
                 f"{m.network}: {len(partial)} source(s) returned no result for "
                 f"some targets ({_sample(partial)}) -- those paths are UNKNOWN; "
                 f"the probe was probably cut off by its timeout")
-        one_way = [h for h in m.unreachable_targets() if h not in isolated]
-        if one_way:
+        # A target whose own host could not be logged into has not been shown
+        # to "probe out"; it belongs to the dark-source note above.
+        unresolved = m.unresolved_targets()
+        if unresolved:
+            result.notes.append(
+                f"{m.network}: {len(unresolved)} name(s) do not resolve "
+                f"({_sample(unresolved)}) -- fix the inventory or DNS; this is "
+                f"not a network fault")
+        one_way = [h for h in m.unreachable_targets() if h not in isolated
+                   and h not in unresolved
+                   and m.target_hosts.get(h, h) not in dark]
+        if one_way and m.origin == "gateways":
+            result.notes.append(
+                f"{m.network}: {len(one_way)} target(s) answered no gateway "
+                f"({_sample(one_way)}) -- the BMC is unpowered, hung or "
+                f"misaddressed, or its switch port is down")
+        elif one_way:
             result.notes.append(
                 f"{m.network}: {len(one_way)} host(s) could not be reached by "
                 f"anyone although they probe out themselves ({_sample(one_way)}) "

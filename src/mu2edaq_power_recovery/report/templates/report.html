@@ -13,7 +13,12 @@
 
 <section class="mb-8 rounded-lg border-l-4 border-sky-500 bg-sky-50 p-4 dark:bg-sky-950/40">
   <h3 class="text-base font-semibold">{{ narrative.headline }}</h3>
-  {% if narrative.dry_run %}
+  {% if narrative.simulated %}
+  <p class="mt-1 text-sm font-medium text-violet-800 dark:text-violet-300">
+    SIMULATED RUN &mdash; no host was contacted; every result on these pages
+    is scripted. It is never posted to the logbook or published.
+  </p>
+  {% elif narrative.dry_run %}
   <p class="mt-1 text-sm font-medium text-amber-800 dark:text-amber-300">
     This was a dry run &mdash; no chassis was switched on.
   </p>

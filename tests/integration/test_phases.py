@@ -135,7 +135,7 @@ def test_a_failed_sel_read_records_no_baseline(orch):
 def test_sensors_and_sel_are_not_asked_after_a_dark_bmc(orch):
     node = _nodes(orch, "mu2e-trk-01")[0]
     orch.ssh_factory.base.expect_first(
-        r"^ping -c 1 -W 1 -q " + node.ipmi_host.replace(".", r"\."),
+        r"^ping -c 3 -i 0\.2 -W 1 -q " + node.ipmi_host.replace(".", r"\."),
         ScriptedResponse(rc=1, stdout="1 packets transmitted, 0 received"))
     result = phase1_assess.run(orch, [node])
     by_id = {r.check_id: r for r in result.assessments[0].results}
@@ -338,6 +338,25 @@ def test_mesh_edges_come_back_in_a_stable_order(orch):
     assert edges == sorted(edges)
 
 
+def test_failed_nodes_leave_the_node_mesh_but_their_bmcs_are_probed(orch):
+    """PR #28 review: a BMC is independent of the host OS, and the BMCs of the
+    nodes that did not come back are the ones the operator needs next."""
+    dead = "mu2e-dl-02.fnal.gov"
+    orch.store.start_phase("assess", 1)
+    orch.store.record_node(dead, "mc2", "readout", "fail", "did not boot")
+    orch.store.record_node("mu2e-dl-01.fnal.gov", "mc2", "readout", "ok")
+    orch.store.finish_phase("complete")
+    result = phase3_network.run(orch, _nodes(orch, "mu2e-dl-01", "mu2e-dl-02",
+                                             "mu2e-cfo-01"))
+    by_net = {n["network"]: n for n in result.data["networks"]}
+    for net in ("data", "lab"):
+        assert dead not in by_net[net]["sources"]
+        assert dead not in by_net[net]["targets"]
+    assert dead in by_net["ipmi"]["targets"]
+    assert "mu2e-dl-02-ipmi.fnal.gov" in {e["target"] for e in by_net["ipmi"]["edges"]}
+    assert any("BMCs are still probed" in n for n in result.notes)
+
+
 # ---------------------------------------------------------------------------
 # phase 4
 # ---------------------------------------------------------------------------
@@ -453,3 +472,17 @@ def test_an_interrupt_from_a_worker_is_not_swallowed_or_waited_out(orch,
     # The one worker may already have taken the next node off the queue
     # before the main thread saw the interrupt; nothing after that runs.
     assert len(started) <= 2
+
+
+def test_a_node_summary_keeps_failed_and_unchecked_apart(topology):
+    """Live: mu2edaq13 read '3 of 17 checks failed' for three UNKNOWNs."""
+    from mu2edaq_power_recovery.checks.base import CheckResult
+    node = topology.resolve(["mu2edaq13"], ["teststand"])[0]
+    a = NodeAssessment(node=node)
+    a.results = [CheckResult(node.hostname, "power.status", Status.UNKNOWN),
+                 CheckResult(node.hostname, "power.sel", Status.UNKNOWN),
+                 CheckResult(node.hostname, "disk.local", Status.FAIL),
+                 CheckResult(node.hostname, "ssh.login", Status.OK)]
+    text = a.summary()
+    assert "1 of 4 checks failed: disk.local" in text
+    assert "2 could not be checked: power.status, power.sel" in text

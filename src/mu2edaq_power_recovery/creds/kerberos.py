@@ -47,7 +47,7 @@ from ..transport.base import TransportError
 from ..transport.local import LocalTransport
 from .ticketsource import (DefaultCacheDisplaced, DefaultCacheGuardError,
                            DefaultCacheUnverifiable, NoDefaultCache,
-                           TicketSource, TicketSourceError)
+                           TicketSource, TicketSourceError, TicketTimeout)
 
 log = logging.getLogger(__name__)
 
@@ -218,8 +218,11 @@ class TicketInfo:
 #: klist -s exits 0 when the cache holds a ticket that has not expired.  That
 #: is the authoritative validity test; the text parse below is only for the
 #: human-facing detail (which principal, how much longer).
-_PRINCIPAL_RE = re.compile(r"Default principal:\s*(\S+)", re.I)
-_CACHE_RE = re.compile(r"Ticket cache:\s*(\S+)", re.I)
+#: MIT prints "Ticket cache:" / "Default principal:"; Heimdal (macOS) prints
+#: "Credentials cache:" / "Principal:". The ticket table's "Principal" column
+#: heading has no colon, so it does not match.
+_PRINCIPAL_RE = re.compile(r"^\s*(?:Default\s+)?principal:\s*(\S+)", re.I | re.M)
+_CACHE_RE = re.compile(r"^\s*(?:Ticket|Credentials)\s+cache:\s*(\S+)", re.I | re.M)
 
 
 class KerberosManager:
@@ -305,16 +308,24 @@ class KerberosManager:
         and harmless -- validity comes from ``klist -s``, and this only feeds
         the "renew early" convenience check.
         """
+        import datetime as _dt
         for line in text.splitlines():
             parts = line.split()
             if len(parts) >= 4 and "/" in parts[0] and ":" in parts[1]:
+                # MIT: "10/01/26 13:24:02  10/02/26 15:24:02  krbtgt/..."
                 for fmt in ("%m/%d/%y %H:%M:%S", "%m/%d/%Y %H:%M:%S",
                             "%m/%d/%y %H:%M", "%m/%d/%Y %H:%M"):
                     try:
-                        import datetime as _dt
                         return _dt.datetime.strptime(f"{parts[2]} {parts[3]}", fmt).timestamp()
                     except ValueError:
                         continue
+            elif len(parts) >= 9 and ":" in parts[2] and ":" in parts[6]:
+                # Heimdal: "Oct  1 13:24:02 2026  Oct  2 15:24:02 2026  krbtgt/..."
+                try:
+                    return _dt.datetime.strptime(" ".join(parts[4:8]),
+                                                 "%b %d %H:%M:%S %Y").timestamp()
+                except ValueError:
+                    continue
         return None
 
     def current(self) -> TicketInfo:
@@ -346,7 +357,7 @@ class KerberosManager:
                     "--principal <principal> to have this tool acquire one."
                 )
             log.info("using the ambient Kerberos ticket: %s",
-                     info.principal or "(principal unknown)")
+                     principal or "(principal unknown)")
             return info
 
         cache: Any = self.cache_for(principal)
@@ -436,6 +447,14 @@ class KerberosManager:
             try:
                 result = runner.run(["kinit", "-c", target, principal],
                                     timeout=60, input_text=password)
+            except BaseException:
+                # Interrupted (Ctrl-C, or SIGTERM raised as KeyboardInterrupt)
+                # or timed out with kinit running: it may already have minted,
+                # and on macOS that ticket is in the API: collection as the
+                # new default while _caches[role] still holds the FILE: path.
+                # Same as TicketSource.ticket(): settle, then re-raise.
+                self._settle_interrupted_kinit(principal, role, before)
+                raise
             finally:
                 del password
             self._restore_default_if_displaced(principal, before)
@@ -447,6 +466,64 @@ class KerberosManager:
             raise KerberosError(f"kinit failed for {principal}: "
                                 f"{detail[-1] if detail else 'unknown error'}")
         log.info("acquired %s ticket for %s", role, principal)
+
+    def _settle_interrupted_kinit(self, principal: str, role: str,
+                                  before: Optional[str]) -> None:
+        """After a kinit that did not return: restore, and record its cache.
+
+        Called with the mint lock held and an exception in flight. Puts the
+        default back if the kinit displaced it, then looks *principal* up in
+        the collection and records the cache it names for :meth:`cleanup` --
+        otherwise a root ticket minted into API:<uuid> outlives the run as the
+        operator's default. Each step runs only ``kswitch``/``klist``, and
+        either can itself fail or be interrupted; both are logged and dropped
+        so the caller's exception is the one that propagates.
+        """
+        try:
+            self._restore_default_if_displaced(principal, before)
+        except BaseException as exc:            # noqa: BLE001 -- see above
+            log.error("could not restore the default credential cache after "
+                      "an interrupted kinit for %s: %r", principal, exc)
+        finally:
+            self._ambient = _UNSET
+        self._record_collection_cache(
+            f"{role}@collection", principal, before,
+            lambda: self._collection_cache_for(principal))
+
+    def _record_collection_cache(self, key: str, principal: str,
+                                 before: Optional[str], lookup) -> None:
+        """Record the collection cache an unfinished mint may have left.
+
+        *lookup* returns the ccache name (or ``(principal, name)``) holding
+        *principal*, or None. Recorded under its own *key*, beside the FILE:
+        path already in ``_caches``, so cleanup() destroys whichever exists.
+        Only a non-file name is recorded -- a FILE: cache is the pre-recorded
+        path or nothing of ours -- and never the cache of *before*, the
+        principal that was the default when the mint began: that one was the
+        operator's before this run touched it. Failures are logged, never
+        raised: this runs while another exception is propagating.
+        """
+        try:
+            found = lookup()
+        except BaseException as exc:            # noqa: BLE001 -- bookkeeping only
+            log.error("could not look %s up in the credential collection "
+                      "after an unfinished mint; if a ticket was minted it "
+                      "may survive the run (klist -l; kdestroy -c <name>): %r",
+                      principal, exc)
+            return
+        if isinstance(found, tuple):
+            held, name = found
+        else:
+            held, name = principal, found
+        if not name or str(name).startswith("FILE:"):
+            return
+        if before and held.split("@")[0] == before.split("@")[0]:
+            log.debug("%s is the cache that was the default before the mint; "
+                      "not recording it for cleanup", name)
+            return
+        self._caches[key] = name
+        log.debug("unfinished mint for %s: recorded %s for cleanup",
+                  principal, name)
 
     def _default_status(self):
         """``(principal, reason)`` for the default cache, via the ticket source."""
@@ -606,12 +683,35 @@ class KerberosManager:
                     # put back, or it could not be read so a mint could not be
                     # checked at all; in both cases every further mint carries
                     # the same risk, so stop them all.
+                    if isinstance(exc, DefaultCacheDisplaced):
+                        # Raised after the mint ran: the displacing default
+                        # is this identity's cache, and ours to destroy.
+                        self._record_collection_cache(
+                            f"{cache_key}@collection", identity, None,
+                            lambda: self.tickets.collection_cache_for(identity))
                     self._disable_fallbacks(identity, exc)
                     self._service[identity] = None
                     return None
+                except TicketTimeout as exc:
+                    # The tool ran and may have minted before it hung; on
+                    # macOS into API:<uuid>, which only a lookup can name.
+                    self._record_collection_cache(
+                        f"{cache_key}@collection", identity, None,
+                        lambda: self.tickets.collection_cache_for(identity))
+                    log.warning("cannot use the %s service identity: %s",
+                                identity, exc)
                 except TicketSourceError as exc:
                     log.warning("cannot use the %s service identity: %s",
                                 identity, exc)
+                except BaseException:
+                    # Interrupted mid-mint. ticket() has already put the
+                    # default back; the service cache it may have made -- root
+                    # capable through root's .k5login -- must still be named
+                    # for cleanup() before the interrupt propagates.
+                    self._record_collection_cache(
+                        f"{cache_key}@collection", identity, None,
+                        lambda: self.tickets.collection_cache_for(identity))
+                    raise
                 else:
                     credential = Credential(
                         name=identity, login=identity, cache=ticket.cache,

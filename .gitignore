@@ -21,6 +21,11 @@ build/
 data/*.db
 data/*.db-journal
 logs/*.log
+# The run lock (#12) is kept on purpose after every run, and the old start
+# script left pid files behind; either, untracked, made phase 0 see a dirty
+# tree and stop self-updating for good (PR #32 review).
+logs/*.lock
+logs/*.pid
 core/*
 !core/.gitkeep
 config/.env

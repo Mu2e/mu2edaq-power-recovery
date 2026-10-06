@@ -100,7 +100,8 @@ def test_natural_key_orders_numerically():
 def test_subnets_differ_between_sites(topology):
     assert topology.subnet("mc2", "lab") == "131.225.245.0/24"
     assert topology.subnet("teststand", "lab") == "131.225.237.0/24"
-    assert topology.subnet("teststand", "ipmi") == "192.168.150.0/24"
+    # The teststand's BMCs are the upper half of MC-2's IPMI segment (DNS).
+    assert topology.subnet("teststand", "ipmi") == "192.168.157.128/25"
 
 
 # ---------------------------------------------------------------------------

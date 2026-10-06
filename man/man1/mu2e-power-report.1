@@ -1,4 +1,4 @@
-.TH MU2E-POWER-REPORT 1 "2026-09-18" "mu2edaq-power-recovery 0.1.0" "Mu2e DAQ Operations"
+.TH MU2E-POWER-REPORT 1 "2026-09-29" "mu2edaq-power-recovery 0.2.0" "Mu2e DAQ Operations"
 .SH NAME
 mu2e-power-report \- phase 4: the consolidated recovery report
 .SH SYNOPSIS
@@ -74,6 +74,30 @@ A failed post leaves the complete local report in place and does not change the
 exit status. Under
 .B \-\-simulate
 nothing is posted.
+.PP
+.B A simulated run stays simulated.
+Whether a run was a
+.B \-\-simulate
+rehearsal is stored with the run, and a stored rehearsal is never posted or
+published, whatever this invocation's options say: asking to
+.RB ( \-\-post\-ecl ,
+.BR \-\-publish ,
+.BR \-\-publish\-target ,
+or
+.I ecl.enabled
+/
+.I report.publish.enabled
+in the configuration) exits 2 naming the run, before anything is written.
+Without
+.BR \-\-run\-id
+the latest run is the target, so a rehearsal made after the real run must be
+stepped past with
+.BR "\-\-run\-id N" .
+A rehearsal regenerates locally as usual; its pages, and the run-history row,
+are marked
+.BR SIMULATED .
+Runs stored before the flag existed are recognised by the note every simulated
+run recorded.
 .SH OPTIONS
 Every option of
 .BR mu2e-power-recovery (1)
@@ -171,7 +195,7 @@ Print the option summary and exit.
 .TP
 .B \-\-version
 Print
-.I mu2edaq-power-recovery 0.1.0
+.I mu2edaq-power-recovery 0.2.0
 and exit.
 .TP
 .BI \-\-config " FILE"
@@ -221,6 +245,21 @@ failures or unreachable nodes (or no node was assessed at all).
 No run could be found to report on: the store is empty, or
 .B \-\-run\-id
 names a run it does not hold.
+.I run.dry_run: false
+in configuration does
+.I not
+exit 2 here: this command cannot issue a power command, so it always runs as
+a dry run, whatever the configuration,
+.B \-\-execute
+or
+.B MU2E_POWER_RECOVERY_ARM
+say (an info line in the log notes what was ignored). The live-run gate
+applies to invocations that include phase 2
+(see
+.BR mu2e-power-recovery (1),
+.BR "LIVE RUNS" ).
+A report-only run does not take the run lock, so it can be run while a
+recovery is in progress.
 .SH EXAMPLES
 .RS
 .EX

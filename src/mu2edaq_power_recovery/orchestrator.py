@@ -23,7 +23,7 @@ from .checks import (CheckContext, CheckResult, NEEDS_ROOT, Status,
 from .creds import KerberosError, KerberosManager, VaultCredentials, VaultError
 from .creds.bootstrap import credential_session
 from .state import RunStore
-from .topology import Node, Topology
+from .topology import Node, Topology, TopologyError
 from .transport import (CredentialBreaker, FakeTransport, IPMIClient,
                         LocalTransport, PowerState, SSHFactory,
                         healthy_node_rules)
@@ -99,9 +99,20 @@ class NodeAssessment:
             return f"all {applicable} checks passed{suffix}"
         bad = self.failures
         if bad:
-            return f"{len(bad)} of {applicable} checks failed: " + \
-                   ", ".join(r.check_id for r in bad[:4]) + \
-                   (" ..." if len(bad) > 4 else "")
+            # is_bad covers FAIL and UNKNOWN; say which. Live: mu2edaq13 read
+            # "3 of 17 checks failed" for three checks that could not look.
+            failed = [r for r in bad if r.status is Status.FAIL]
+            unknown = [r for r in bad if r.status is not Status.FAIL]
+            parts = []
+            if failed:
+                parts.append(f"{len(failed)} of {applicable} checks failed: "
+                             + ", ".join(r.check_id for r in failed[:4])
+                             + (" ..." if len(failed) > 4 else ""))
+            if unknown:
+                parts.append(f"{len(unknown)} could not be checked: "
+                             + ", ".join(r.check_id for r in unknown[:4])
+                             + (" ..." if len(unknown) > 4 else ""))
+            return "; ".join(parts)
         return (f"{len(self.warnings)} warning(s) of {applicable} checks"
                 + suffix)
 
@@ -135,8 +146,9 @@ class SimulatedSSHFactory:
         for pattern, response in (rules if rules is not None else healthy_node_rules()):
             self.base.expect(pattern, response)
 
-    def gateway_for(self, location: str) -> Optional[str]:
-        gateways = self.topology.gateways(location)
+    def gateway_for(self, location: str, role: str = "ssh") -> Optional[str]:
+        gateways = self.topology.ipmi_gateways(location) if role == "ipmi" \
+            else self.topology.gateways(location)
         return gateways[0] if gateways else None
 
     def for_host(self, host: str, jump: Optional[str] = None,
@@ -186,9 +198,12 @@ class Orchestrator:
         #: phases). Every ssh transport the factory builds caps its per-call
         #: timeout at the time this has left; see :meth:`budget`.
         self._deadline: Any = None
-        #: One BMC account serves every BMC, so one breaker serves every IPMI
-        #: client this run builds, whichever gateway it runs ipmitool on.
-        self.ipmi_breaker = CredentialBreaker()
+        #: location -> its CredentialBreaker, shared by every IPMI client of
+        #: that location whichever gateway it runs ipmitool on. Per location,
+        #: not per run: the BMC account is not the same everywhere (on
+        #: 2026-10-01 the teststand's BMCs refused the account MC-2's accept),
+        #: so a refusal at one site must not stop IPMI at another.
+        self.ipmi_breakers: Dict[str, CredentialBreaker] = {}
         self.ssh_factory: Any = None
         #: Per-node values carried between phases (SEL baselines, boot flags).
         self.baselines: Dict[str, Dict[str, Any]] = {}
@@ -216,6 +231,29 @@ class Orchestrator:
     @property
     def locations(self) -> List[str]:
         return list(self.settings.get("topology.locations", ["mc2"]))
+
+    def empty_location_notes(self) -> List[str]:
+        """One note per requested location that has no nodes configured.
+
+        Phases 1-3 carry these so a run over, say, ``--location mc1`` says
+        in its own report that it covered nothing there, instead of an
+        empty table that reads as "nothing wrong" (#25).
+        """
+        notes: List[str] = []
+        for location in self.locations:
+            try:
+                if self.topology.nodes(location):
+                    continue
+                info = self.topology.location_info(location)
+            except TopologyError:
+                continue
+            status = info.get("status")
+            notes.append(
+                f"no nodes configured for {location}"
+                + (f" (inventory status: {status})" if status else "")
+                + " -- nothing there was checked; see config/topology.yaml "
+                  "and mu2e-node-inventory --validate")
+        return notes
 
     def nodes(self, names: Optional[Sequence[str]] = None) -> List[Node]:
         """The nodes this run operates on."""
@@ -286,16 +324,17 @@ class Orchestrator:
             # phase-2 power path, which are the parts most worth rehearsing.
             # dry_run is forced on, so even the simulated client refuses to
             # pretend it switched anything.
-            # One per location, like a real run, all on the shared breaker.
+            # One per location, like a real run, each on its location's
+            # breaker.
             for location in self.locations:
-                gateway = self.ssh_factory.gateway_for(location)
+                gateway = self.ssh_factory.gateway_for(location, role="ipmi")
                 if not gateway:
                     continue
                 self.ipmi_clients[location] = IPMIClient(
                     gateway=self.ssh_factory.for_host(gateway, direct=True),
                     username="simulated", password="simulated",
                     dry_run=True, protected=self.topology.is_protected,
-                    breaker=self.ipmi_breaker)
+                    breaker=self.ipmi_breaker_for(location))
             self.ipmi = next(iter(self.ipmi_clients.values()), None)
             info["notes"].append("simulated run: no credentials acquired, no "
                                  "host contacted; all command output is scripted")
@@ -357,18 +396,22 @@ class Orchestrator:
         return info
 
     def _make_ipmi_clients(self, creds: Any) -> Dict[str, IPMIClient]:
-        """One IPMI client per location, each on a gateway of that location.
+        """One IPMI client per location, each on an IPMI gateway of that location.
+
+        The IPMI gateway is ``ipmi_gateways:`` when the location names one
+        (the teststand's BMCs are on the MC-2 segment), else ``gateways:``.
 
         The IPMI subnets are per site and not routable between them, so a BMC
         must be driven from its own location's gateway; one client for the
         whole run (the first gateway that answered anywhere) would send a
-        teststand BMC's commands through MC-2. Every client shares the run's
-        one :class:`CredentialBreaker` -- one BMC account serves every BMC --
-        and keeps the protected-host refusal.
+        teststand BMC's commands through MC-2. Each client takes its
+        location's :class:`CredentialBreaker` (:meth:`ipmi_breaker_for`) --
+        the BMC account differs between sites, so one site's refusal must not
+        stop another's IPMI -- and keeps the protected-host refusal.
         """
         clients: Dict[str, IPMIClient] = {}
         for location in self.locations:
-            gateway_host = self.ssh_factory.gateway_for(location)
+            gateway_host = self.ssh_factory.gateway_for(location, role="ipmi")
             if not gateway_host:
                 log.error("no gateway is reachable for %s; its BMCs cannot be "
                           "driven", location)
@@ -377,13 +420,27 @@ class Orchestrator:
                     f"unavailable there, so its power state cannot be read "
                     f"or changed")
                 continue
-            clients[location] = self._make_ipmi_client(creds, gateway_host)
+            clients[location] = self._make_ipmi_client(creds, gateway_host,
+                                                       location)
             log.info("IPMI commands for %s will be issued from %s",
                      location, gateway_host)
         return clients
 
-    def _make_ipmi_client(self, creds: Any, gateway_host: str) -> IPMIClient:
-        """An IPMI client that runs ipmitool on *gateway_host*."""
+    def ipmi_breaker_for(self, location: str) -> CredentialBreaker:
+        """The :class:`CredentialBreaker` shared by *location*'s IPMI clients.
+
+        Created on first use. Every client driving that location's BMCs must
+        take this one: a client with its own breaker would present a refused
+        credential again.
+        """
+        breaker = self.ipmi_breakers.get(location)
+        if breaker is None:
+            breaker = self.ipmi_breakers[location] = CredentialBreaker(location)
+        return breaker
+
+    def _make_ipmi_client(self, creds: Any, gateway_host: str,
+                          location: str) -> IPMIClient:
+        """An IPMI client that runs ipmitool on *gateway_host* for *location*."""
         gateway = self.ssh_factory.for_host(gateway_host, direct=True)
         return IPMIClient(
             gateway=gateway,
@@ -402,7 +459,7 @@ class Orchestrator:
             extra_args=self.settings.get("ipmi.extra_args", []),
             stop_on_auth_failure=bool(
                 self.settings.get("ipmi.stop_on_auth_failure", True)),
-            breaker=self.ipmi_breaker,
+            breaker=self.ipmi_breaker_for(location),
             reachability_precheck=bool(
                 self.settings.get("ipmi.reachability_precheck", True)),
         )

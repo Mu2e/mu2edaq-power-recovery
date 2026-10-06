@@ -10,7 +10,7 @@ write the tools, at an hour when they would rather not be.
 ```sh
 cd mu2edaq-power-recovery
 git pull && ./bootstrap.sh
-pytest                                          # 309 tests, should be all green
+pytest                                          # the full suite, should be all green
 mu2e-power-recovery --phase all --simulate      # full rehearsal, contacts nothing
 open html/index.html                            # check the report looks right
 ```
@@ -193,7 +193,10 @@ line or in the configuration arms a run by itself. An unattended run that
 cannot pass the flag sets `run.dry_run: false` and `run.label: <label>` in its
 configuration and `MU2E_POWER_RECOVERY_ARM=<label>` in its own environment
 (never in `config/.env`, which is refused). `run.dry_run: false` with neither
-exits 2 with instructions.
+exits 2 with instructions. That gate applies to invocations that include phase
+2; `mu2e-power-state`, `mu2e-power-netcheck` and `mu2e-power-report` cannot
+issue a power command and always run as a dry run, so a site that sets
+`run.dry_run: false` for the token path can still use them.
 
 It will work through the stages in order and stop at the first one that does
 not meet its requirement.
@@ -428,12 +431,15 @@ you are least able to notice.
 
 ## When the run stops issuing IPMI
 
-If a BMC *answers and rejects* the credentials, the run stops issuing IPMI
-altogether and reports one diagnosis naming the refused username. That is
-deliberate: all 45 BMCs share one credential set, so the first rejection settles
-the matter, and retrying it against the other 44 only advances lockout counters
-on every BMC in the building. (45 nodes of the 65 in the topology carry an
-`ipmi:` interface: 37 at MC-2, 8 at the teststand.)
+If a BMC *answers and rejects* the credentials, the run stops issuing IPMI to
+that location's BMCs and reports one diagnosis naming the refused username and
+the location. That is deliberate: a location's BMCs share one credential set,
+so the first rejection settles the matter there, and retrying it against the
+rest only advances lockout counters. (45 nodes of the 65 in the topology carry
+an `ipmi:` interface: 37 at MC-2, 8 at the teststand.) Locations are judged
+separately because their accounts differ: on 2026-10-01 the teststand's BMCs
+answered ping and refused the account MC-2's BMCs accepted. A teststand refusal
+leaves MC-2's IPMI running, and the other way round.
 
 ```sh
 mu2e-vault-ipmi --fields                              # what the secret holds now
@@ -451,19 +457,21 @@ The refusal shows as **UNKNOWN** on `power.status`, `power.sensors` and
 `power.sel` ("IPMI credentials refused"), not as FAIL "BMC does not answer",
 and phase 2 records `credentials_refused` for each node rather than
 `unreachable`. Phase 1's readiness block says phase 2 is not ready. Only one
-BMC was actually asked: until a credential has worked once, IPMI commands are
-issued one at a time.
+BMC per location was actually asked: until a credential has worked once at a
+location, IPMI commands to it are issued one at a time.
 
-Each of those unproven commands is preceded by one `ping -c 1 -W 1 <bmc>` from
-the gateway. A BMC that does not answer is reported **FAIL** "does not answer"
+Each of those unproven commands is preceded by `ping -c 3 -i 0.2 -W 1 <bmc>`
+from the gateway, and any one reply counts: right after an outage the gateway's
+ARP entry for the BMC is cold and the first echo is often lost. A BMC that
+answers none of the three is reported **FAIL** "does not answer"
 on `power.status` straight away, without ipmitool and without waiting its turn,
 and its `power.sensors` / `power.sel` are **UNKNOWN** ("not read: the BMC did
 not answer"). If the BMCs filter ICMP, every one will look dark: set
 `ipmi.reachability_precheck: false`.
 
 Two BMCs that *do* answer ping and then fail with `Unable to establish IPMI v2 /
-RMCP+ session`, before any BMC has accepted the credential, also stop the run's
-IPMI — the diagnosis says "likeliest cause is a wrong username". Check the
+RMCP+ session`, before any BMC of that location has accepted the credential,
+also stop that location's IPMI — the diagnosis says "likeliest cause is a wrong username". Check the
 username first (`mu2e-ipmi-tool --diagnose`, above), then the cipher suite.
 
 A BMC that simply does **not answer** is not treated this way, and says much the
@@ -510,6 +518,25 @@ mu2e-power-state --node mu2e-trk-03 -v
 On Windows the equivalents are `stop-mu2edaq-power-recovery.ps1 -Status`,
 `-Force` and `-Grace <seconds>` (default 30).
 
+**One hardware-facing run at a time.** Phases 1–3 run for real (not
+`--simulate`) take an exclusive lock on `logs/power-recovery.lock`
+(`run.lock_file`) before phase 0. A second such run exits 2 with
+`another recovery run holds the run lock ...: pid N on host H, started T,
+command: ...`. A rehearsal, `--list-*` and `mu2e-power-report` never take it,
+so they work while a recovery is in progress. There is no PID file to clean
+up: the kernel releases the lock however the run ends, and the file with its
+last record is left in place on purpose.
+
+```sh
+python -m mu2edaq_power_recovery.runlock status   # holder, or "not running (stale record: ...)"
+```
+
+The stop scripts signal only the pid that command reports *while the lock is
+held*, and only if that process's command line is still the driver's. A stale
+record naming a live process (a reused pid) is reported as "no recovery run is
+active" and nothing is signalled; a holder whose command line is not the
+driver's is refused with exit 1.
+
 **SIGTERM is a clean stop; SIGKILL is not.** The driver's SIGTERM handler
 raises the same KeyboardInterrupt as Ctrl-C. Mid-phase, the worker pool is shut
 down without waiting (`cancel_futures`): queued nodes and mesh sources are
@@ -550,7 +577,8 @@ Ctrl-C (SIGINT) takes the same clean path as SIGTERM.
   (`mu2e-node-inventory --protected` lists them.) Powering one *on* is allowed.
 - Any power command at all unless this invocation authorised it: `--execute`,
   or `MU2E_POWER_RECOVERY_ARM` equal to the configured `run.label` with
-  `run.dry_run: false`. `run.dry_run: false` alone is refused (exit 2), and the
+  `run.dry_run: false`. `run.dry_run: false` alone is refused (exit 2) for any
+  invocation that includes phase 2, and the
   token is refused in `config/.env`. A live run prints `LIVE RUN -- power
   commands WILL be issued (authorised by ...)`.
 - A power command to a node outside `--node`/`--location`, or to a
@@ -562,6 +590,11 @@ Ctrl-C (SIGINT) takes the same clean path as SIGTERM.
 - Publishing the report during a `--simulate` run: it is written locally and the
   publisher stops before touching the live web area. A rehearsal must not
   overwrite the real report.
+- Posting or publishing a stored rehearsal later. The run store records that a
+  run was simulated; `mu2e-power-report --post-ecl` (or `--publish`) on it exits
+  2, whatever the invocation's flags. With no `--run-id` the latest run is the
+  target, so after a rehearsal name the real run: `mu2e-power-report --run-id 12
+  --post-ecl`.
 - Continuing past a stage that did not meet its requirement, unless you pass
   `--continue-on-error`.
 - Destroying a credential cache the run did not create. Cleanup names each of

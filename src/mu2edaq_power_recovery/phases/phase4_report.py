@@ -139,9 +139,13 @@ def post(orch: Any, run_id: int, narrative: Dict[str, Any],
     Returns ``{"posted": bool, ...}`` and records the outcome as an event on
     *run_id*. A failure leaves the local report exactly as it was rendered.
     A simulated run posts nothing: the lazy Vault client would otherwise be
-    the one real network contact a rehearsal makes.
+    the one real network contact a rehearsal makes. That holds both for a
+    ``--simulate`` invocation and for a stored run that *was* one, however it
+    is regenerated: its results are scripted, not a dry run's.
     """
-    if getattr(orch, "simulate", False):
+    if getattr(orch, "simulate", False) or \
+            bool((narrative.get("run") or {}).get("simulated")) or \
+            orch.store.is_simulated(run_id):
         info = {"posted": False,
                 "reason": "simulated run: nothing was posted to the logbook"}
         orch.store.record_event(info["reason"], run_id=run_id)
@@ -180,8 +184,9 @@ def reconcile(export: Dict[str, Any]) -> Dict[str, Any]:
 
     Returns ``current`` (key -> check row plus its ``phase``), ``resolved``
     (failures a later result superseded with a good one), ``node_status``
-    (hostname -> status value: the roll-up of that node's *current* checks,
-    or UNKNOWN when its latest assessment could not reach it), ``node_class``,
+    (hostname -> status value: the roll-up of that node's *current* checks;
+    when its latest assessment could not reach it, the worse of UNKNOWN and
+    that roll-up, so a current FAIL stays FAIL), ``node_class``,
     ``network`` (the latest phase-3 verdict, or None) and ``status`` (the
     run's overall verdict).
     """
@@ -224,7 +229,12 @@ def reconcile(export: Dict[str, Any]) -> Dict[str, Any]:
     for host in sorted(set(latest_node) | set(by_host)):
         row = latest_node.get(host)
         if row is not None and _unreachable(row):
-            node_status[host] = Status.UNKNOWN.value
+            # Unreachable now says "we could not look"; it does not erase a
+            # failure that nothing has superseded.  Take the worse of the two
+            # (FAIL outranks UNKNOWN), so a node that failed a check and then
+            # stopped answering is still counted as failed.
+            node_status[host] = rollup(by_host.get(host, [])
+                                       + [Status.UNKNOWN]).value
         elif by_host.get(host):
             node_status[host] = rollup(by_host[host]).value
         else:
@@ -326,6 +336,7 @@ def build_narrative(export: Dict[str, Any]) -> Dict[str, Any]:
         "run": run,
         "run_status": run.get("status"),
         "dry_run": bool(run.get("dry_run")),
+        "simulated": bool(run.get("simulated")),
         "phases": [{"name": p.get("name"), "number": p.get("number"),
                     "status": p.get("status"), "summary": p.get("summary"),
                     "started_at": p.get("started_at"),

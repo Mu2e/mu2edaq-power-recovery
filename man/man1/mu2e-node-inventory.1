@@ -1,4 +1,4 @@
-.TH MU2E-NODE-INVENTORY 1 "2026-09-18" "mu2edaq-power-recovery 0.1.0" "Mu2e DAQ Operations"
+.TH MU2E-NODE-INVENTORY 1 "2026-09-29" "mu2edaq-power-recovery 0.2.0" "Mu2e DAQ Operations"
 .SH NAME
 mu2e-node-inventory \- print the Mu2e DAQ node inventory used by the recovery tools
 .SH SYNOPSIS
@@ -11,6 +11,7 @@ mu2e-node-inventory \- print the Mu2e DAQ node inventory used by the recovery to
 .IR NETWORK ]
 .RB [ \-\-hostnames ]
 .RB [ \-\-protected ]
+.RB [ \-\-validate ]
 .RB [ \-\-json ]
 .SH DESCRIPTION
 Prints the node inventory that
@@ -48,6 +49,30 @@ or a shell loop.
 .TP
 .B \-\-protected
 List only the hosts protected from destructive IPMI commands.
+.TP
+.B \-\-validate
+Check the inventory and the power sequence instead of listing nodes, across
+every location (not only
+.IR topology.locations ).
+Each finding is an
+.BR error ,
+a
+.B warning
+or an
+.BR info .
+Errors: the topology does not load, an invalid hostname (the same rule the
+loader applies), a subnet that is not a network, a power-sequence stage in an
+unknown location. Warnings: a location with no nodes (with its
+.IR status ", " owner " and " inventory_source
+metadata), a BMC with no lab host, a subnet shared or overlapping between
+locations, a gateway or protected host that is not in the inventory, a stage
+naming a node not in its location's inventory, inventory nodes that no stage
+covers. Info: a populated location with no stage at all. With
+.B \-\-json
+the result is one object
+.RI { topology ", " findings ", " counts ", " ok }.
+Validation is never run when the topology is loaded, so an incomplete
+inventory (MC-1) does not stop a run.
 .TP
 .B \-\-json
 Emit the full inventory as JSON, including each node's class, location,
@@ -100,10 +125,24 @@ Which hosts may never be powered off:
 mu2e-node-inventory \-\-protected
 .EE
 .RE
+.PP
+Gaps and inconsistencies, before and after editing the topology:
+.RS
+.EX
+mu2e-node-inventory \-\-validate
+.EE
+.RE
 .SH EXIT STATUS
 .TP
 .B 0
-The inventory was printed.
+The inventory was printed; with
+.BR \-\-validate ,
+there was no error finding (warnings allowed).
+.TP
+.B 1
+With
+.BR \-\-validate :
+at least one error finding.
 .TP
 .B 2
 The topology file is missing, malformed, or the location is unknown.

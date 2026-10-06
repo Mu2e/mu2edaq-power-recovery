@@ -53,6 +53,33 @@ def power_status(ctx: CheckContext) -> CheckResult:
     data = {"bmc": ctx.node.ipmi_host, "state": state.value}
     if state is PowerState.REFUSED:
         return _refused_result(ctx, "power.status", "power state", data, started)
+    reason = (getattr(ctx.ipmi, "unreachable_reason", {}) or {}).get(ctx.node.ipmi_host)
+    if state is PowerState.UNREACHABLE and reason == "unresolved":
+        # UNKNOWN: nothing was asked of any BMC. The inventory names a BMC
+        # that DNS does not know.
+        return result(ctx, "power.status", Status.UNKNOWN,
+                      f"BMC name {ctx.node.ipmi_host} does not resolve on the gateway",
+                      "fix the topology entry or DNS; this says nothing about the "
+                      "machine", data, started)
+    if state is PowerState.UNREACHABLE and reason == "no_session":
+        return result(ctx, "power.status", Status.UNKNOWN,
+                      f"BMC {ctx.node.ipmi_host} answers ping but will not open an "
+                      f"IPMI session",
+                      "the BMC has standby power; its account or cipher suite differs "
+                      "from the one this run uses (mu2e-ipmi-tool --diagnose finds "
+                      "the working combination, at the cost of failed logins)",
+                      data, started)
+    if state is PowerState.UNREACHABLE and reason in ("gateway", "timeout",
+                                                      "unclassified"):
+        # We could not look (PR #32 review): the gateway failed, the phase
+        # budget cut the call short, or there was no way to ping the BMC.
+        why = {"gateway": "the gateway could not run the command",
+               "timeout": "run.phase_timeout cut the call short",
+               "unclassified": "the gateway has no ping to tell a silent BMC "
+                               "from one that refuses the session"}[reason]
+        return result(ctx, "power.status", Status.UNKNOWN,
+                      f"power state of {ctx.node.ipmi_host} not read: {why}",
+                      "", data, started)
     if state is PowerState.UNREACHABLE:
         return result(ctx, "power.status", Status.FAIL,
                       f"BMC {ctx.node.ipmi_host} does not answer",

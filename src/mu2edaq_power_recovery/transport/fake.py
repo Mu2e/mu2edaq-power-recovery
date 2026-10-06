@@ -166,6 +166,23 @@ class FakeTransport(Transport):
         return [c["command"] for c in self.calls if host is None or c["host"] == host]
 
 
+def _su_login_response(command: str) -> ScriptedResponse:
+    """``su - <user> -c 'echo <marker> && pwd && id -un'`` for any user.
+
+    With the login-script noise a real account prints first (mu2eshift's
+    "Configuring Git ..." lines, seen live).
+    """
+    import re as _re
+    m = _re.search(r"\bsu\s+-\s+(\S+)", command)
+    user = m.group(1) if m else "mu2edaq"
+    marker = _re.search(r"echo (\S+) &&", command)
+    lines = ["Configuring Kerberos Ticket: Pass"]
+    if marker:
+        lines.append(marker.group(1))
+    lines += [f"/home/{user}", user]
+    return ScriptedResponse(stdout="\n".join(lines))
+
+
 def _mesh_script_response(command: str) -> ScriptedResponse:
     """Answer a phase-3 mesh probe script.
 
@@ -217,7 +234,7 @@ def healthy_node_rules() -> List[tuple]:
         (r"^true$", ScriptedResponse()),
         # Before the bare id rules: `su - user -c 'pwd && id -un'` contains
         # "id -un" in its -c argument and would otherwise match that instead.
-        (r"\bsu\s+-\s", ScriptedResponse(stdout="/home/mu2edaq\nmu2edaq")),
+        (r"\bsu\s+-\s", _su_login_response),
         (r"\bid -un\b", ScriptedResponse(stdout="root")),
         (r"\bid -u\b", ScriptedResponse(stdout="0")),
 
@@ -235,9 +252,15 @@ def healthy_node_rules() -> List[tuple]:
             "Filesystem                 Type  1024-blocks      Used Available Capacity Mounted on\n"
             "/dev/mapper/rhel-root      xfs      52403200  18321408  34081792      35% /\n"
             "/dev/sda1                  xfs       1038336    329216    709120      32% /boot\n"
-            "/dev/mapper/rhel-scratch   xfs     943718400 372834304 570884096      40% /scratch\n"
-            "mu2e-mgr-01:/home          nfs4   2147483648 429496730 1717986918     20% /home\n"
-            "mu2e-mgr-01:/daqlogs       nfs4   1073741824 107374182  966367642     10% /daqlogs"))),
+            "/dev/mapper/rhel-scratch   xfs     943718400 372834304 570884096      40% /scratch"))),
+        # 'df -l' never lists NFS (an earlier version of this sample did, and
+        # hid that disk.nfs_from_mgr could never see a network mount).
+        # /proc/mounts as on mu2e-dcs-01, 2026-10-01.
+        (r"cat /proc/mounts", ScriptedResponse(stdout=(
+            "/dev/mapper/os_vg-root / xfs rw,relatime,attr2,inode64 0 0\n"
+            "/dev/nvme0n1p3 /boot xfs rw,relatime 0 0\n"
+            "mu2e-mgr-01.fnal.gov:/home /home nfs4 rw,nosuid,nodev,relatime,vers=4.2 0 0\n"
+            "mu2e-mgr-01.fnal.gov:/daqlogs /daqlogs nfs4 rw,nosuid,nodev,relatime,vers=4.2 0 0"))),
         (r"\bmountpoint\b", ScriptedResponse()),
         (r"\bls\b.*/(scratch|mu2e|home|daqlogs)", ScriptedResponse(stdout="data\nlogs")),
         (r"ls /dev/mu2e", ScriptedResponse(stdout="/dev/mu2e0\n/dev/mu2e1")),

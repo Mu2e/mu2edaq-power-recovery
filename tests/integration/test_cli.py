@@ -212,16 +212,42 @@ def test_list_nodes_rejects_a_bad_name_cleanly(capsys):
     assert "Traceback" not in captured.err
 
 
+@pytest.mark.parametrize("phase", ["poweron", "all"])
 def test_config_live_without_authorisation_exits_2(tmp_path, capsys,
-                                                   no_credentials, monkeypatch):
+                                                   no_credentials, monkeypatch,
+                                                   phase):
+    # Any invocation that includes phase 2 is gated.
     monkeypatch.setenv("MU2E_POWER_RECOVERY_RUN_DRY_RUN", "false")
     monkeypatch.delenv("MU2E_POWER_RECOVERY_ARM", raising=False)
-    code = cli.main(["--no-self-update", "-q", "--phase", "assess",
+    code = cli.main(["--no-self-update", "-q", "--phase", phase,
                      "--database-url", f"sqlite:///{tmp_path / 'cli.db'}"])
     err = capsys.readouterr().err
     assert code == 2
     assert "--execute" in err and "MU2E_POWER_RECOVERY_ARM" in err
     assert _run_rows(tmp_path) == 0
+
+
+def test_config_live_does_not_refuse_a_read_only_driver(tmp_path, capsys,
+                                                       no_credentials,
+                                                       monkeypatch):
+    # A site that sets run.dry_run: false for the ARM-token path must still be
+    # able to regenerate a report (or assess, or check the network): those
+    # phases cannot issue a power command. Report-only contacts nothing, so
+    # it can run here end to end.
+    from mu2edaq_power_recovery.state import RunStore
+    store = RunStore(f"sqlite:///{tmp_path / 'cli.db'}")
+    store.start_run("seed", True, {}, {})
+    store.finish_run("complete")
+    store.close()
+    monkeypatch.setenv("MU2E_POWER_RECOVERY_RUN_DRY_RUN", "false")
+    monkeypatch.delenv("MU2E_POWER_RECOVERY_ARM", raising=False)
+    code = cli.main(["--no-self-update", "--phase", "report",
+                     "--output-dir", str(tmp_path / "html"),
+                     "--database-url", f"sqlite:///{tmp_path / 'cli.db'}"])
+    captured = capsys.readouterr()
+    assert code != 2, captured.err
+    assert "did not authorise live power commands" not in captured.err
+    assert "LIVE RUN" not in captured.out
 
 
 def test_scoped_poweron_rehearsal_powers_only_the_named_node(tmp_path, capsys):

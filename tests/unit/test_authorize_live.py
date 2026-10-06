@@ -133,6 +133,56 @@ def test_the_decision_is_recorded_as_a_settings_layer(tmp_path):
     assert "live-run authorisation" in last.source and "--execute" in last.source
 
 
+READ_ONLY = [["assess"], ["network"], ["report"]]
+
+
+@pytest.mark.parametrize("phases", READ_ONLY)
+@pytest.mark.parametrize("kwargs", [
+    {"yaml_text": "run:\n  dry_run: false\n"},
+    {"dotenv": "MU2E_POWER_RECOVERY_RUN_DRY_RUN=false\n"},
+    {"yaml_text": LIVE_YAML, "environ": {ARM: "wrong-label"}},
+    {"yaml_text": LIVE_YAML, "environ": {ARM: "outage-2026-09"}},
+    {"argv": ["--execute"]},
+])
+def test_a_read_only_invocation_is_a_dry_run_whatever_is_set(tmp_path, kwargs,
+                                                             phases, caplog):
+    # mu2e-power-state / -netcheck / -report cannot issue a power command, so
+    # there is nothing to authorise and nothing to refuse.
+    caplog.set_level("INFO")
+    settings, args, environ = make(tmp_path, **kwargs)
+    d = cli.authorize_live(settings, args, environ, phases=phases)
+    assert not d.live and "read-only" in d.source
+    assert settings.get("run.dry_run") is True
+    assert any("ignored" in r.getMessage() and r.levelname == "INFO"
+               for r in caplog.records)
+
+
+@pytest.mark.parametrize("phases", [["poweron"], cli.PHASE_ORDER])
+def test_the_gate_still_holds_for_any_invocation_with_power_on(tmp_path, phases):
+    settings, args, environ = make(tmp_path, yaml_text="run:\n  dry_run: false\n")
+    with pytest.raises(cli.LiveAuthorizationError):
+        cli.authorize_live(settings, args, environ, phases=phases)
+    settings, args, environ = make(tmp_path, yaml_text=LIVE_YAML,
+                                   environ={ARM: "wrong-label"})
+    with pytest.raises(cli.LiveAuthorizationError):
+        cli.authorize_live(settings, args, environ, phases=phases)
+    settings, args, environ = make(tmp_path, yaml_text=LIVE_YAML,
+                                   environ={ARM: "outage-2026-09"})
+    assert cli.authorize_live(settings, args, environ, phases=phases).live
+    settings, args, environ = make(tmp_path, argv=["--execute"])
+    assert cli.authorize_live(settings, args, environ, phases=phases).live
+    settings, args, environ = make(tmp_path, argv=["--execute", "--simulate"])
+    assert not cli.authorize_live(settings, args, environ, phases=phases).live
+
+
+def test_without_phases_the_gate_applies(tmp_path):
+    # phases=None is the conservative default: "may include power-on".
+    settings, args, environ = make(tmp_path, yaml_text="run:\n  dry_run: false\n",
+                                   argv=["--phase", "assess"])
+    with pytest.raises(cli.LiveAuthorizationError):
+        cli.authorize_live(settings, args, environ)
+
+
 def test_a_live_run_logs_a_warning(tmp_path, caplog):
     decide(tmp_path, yaml_text=LIVE_YAML, environ={ARM: "outage-2026-09"})
     assert any(r.levelname == "WARNING" and "LIVE run authorised" in r.getMessage()

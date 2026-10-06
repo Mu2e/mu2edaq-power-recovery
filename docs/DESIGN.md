@@ -193,7 +193,16 @@ follow that this project had to be rebuilt around:
   `TicketSource.ticket()` restores the default on any `BaseException` before
   re-raising (a failed restore is logged; it must not mask the interrupt), and
   `service_credential()` records the cache path for `cleanup()` before the
-  mint rather than after it.
+  mint rather than after it. `_kinit` does the same for the designated
+  principals (`except BaseException`: restore, then re-raise). On macOS a
+  path is not enough -- Heimdal put the ticket in `API:<uuid>`, whose name is
+  otherwise learned only on success -- so an interrupted `_kinit`, and an
+  interrupted or timed-out (`TicketTimeout`) service mint, look the principal
+  up in the collection and record the name it gives for `cleanup()` (PR #29
+  review). The lookup runs `klist -l` and may itself fail or be interrupted;
+  that is logged, never raised over the original exception. The cache of the
+  principal that was the default before the mint is never recorded: it was
+  the operator's before the run touched it.
 - **Mints are serialised.** Every worker builds a chain, so an unguarded
   check-then-mint let two threads mint one identity into one cache and
   interleave their read-before/restore of the default. Each mint is now one
@@ -254,9 +263,9 @@ genuinely needed, and the gateway-side wall-clock bound was widened so it cannot
 itself cut ipmitool's retries short. Diverging from a known-working invocation
 is a choice that has to earn itself.
 
-**A credential rejection is neither retried nor repeated.** All 45 BMCs share
-one credential set, so the first rejection settles the matter: the run stops
-issuing IPMI and reports one diagnosis naming the refused username and how to
+**A credential rejection is neither retried nor repeated.** The BMCs of a
+location share one credential set, so the first rejection settles the matter
+there: the run stops issuing IPMI to that location and reports one diagnosis naming the refused username and how to
 find the right one. Previously it retried the same rejected credentials three
 times per BMC, with four ipmitool retries inside each, and then did the same to
 the next BMC — a few hundred failed authentications against machines that count
@@ -266,7 +275,8 @@ deliberately **excluded**: a dark chassis says exactly that, and after an outage
 a dark chassis is the expected case. `ipmi.stop_on_auth_failure: false`
 overrides the whole behaviour.
 
-**The stop is a synchronised circuit breaker, shared by every IPMI client.**
+**The stop is a synchronised circuit breaker, one per location, shared by
+that location's IPMI clients.**
 Phase 1 assesses sixteen nodes at once, so an unsynchronised "refused?" flag let
 many workers pass the check and each present the bad credential to a different
 BMC before the first rejection landed. `CredentialBreaker` (in
@@ -278,8 +288,12 @@ never invoke ipmitool. Once proven, calls run concurrently.
 
 Serialising unproven calls would make a cluster whose BMCs are mostly dark cost
 one full ipmitool timeout per BMC, in sequence, so each unproven call is
-preceded by a **reachability pre-check** outside the gate: one
-`ping -c 1 -W 1 <bmc>` from the same gateway. No reply raises
+preceded by a **reachability pre-check** outside the gate:
+`ping -c 3 -i 0.2 -W 1 <bmc>` from the same gateway (BSD dialect
+`-c 3 -W 1000`), and any reply counts. Three echoes, not one: right after an
+outage the gateway's ARP entry for a BMC is cold and the first echo is often
+lost, and with a single echo that made a live BMC UNREACHABLE, so `ensure_on`
+never switched its chassis on (PR #27 review). No reply at all raises
 `IPMIUnreachable` (an `IPMIError`, so `PowerState.UNREACHABLE`) with no
 ipmitool invocation and no gate taken, so dark BMCs are assessed concurrently.
 Phase 1's `assess_node` then reports `power.sensors` and `power.sel` UNKNOWN
@@ -288,16 +302,23 @@ pre-check also gives "Unable to establish" a meaning it lacks on its own: from
 a BMC that has *just answered ping*, while no BMC has accepted the credential,
 it is most likely a wrong username (`_DIAGNOSES`). `ESTABLISH_FAILURE_LIMIT`
 (2) distinct such BMCs trip the breaker; one does not, because a single BMC
-wanting another cipher suite must not stop the run. RAKP and "unauthorized
+wanting another cipher suite must not stop its location. RAKP and "unauthorized
 name" still trip it on the first occurrence. `ipmi.reachability_precheck:
 false` (for BMCs that filter ICMP) restores the earlier behaviour: every
 unproven call goes to ipmitool, one at a time, and "Unable to establish" never
 trips. A gateway without `ping` (rc 126/127) skips the pre-check with a
 warning. The
-concurrency is a constant (1), not a setting. The object is shared rather than
-per client because the BMC account is shared: a client per location must stop
-with the others. A credential refusal surfaces as `PowerState.REFUSED` and the
-checks report it UNKNOWN — it is "we could not look", and it is kept apart from
+concurrency is a constant (1), not a setting. The object is shared by the
+clients of one location (`Orchestrator.ipmi_breaker_for`) because their BMCs
+share an account, and it is *not* shared between locations because theirs do
+not: on 2026-10-01 the teststand's BMCs (`mu2edaq-gateway-ipmi`,
+`mu2edaq04-ipmi`, `mu2edaq13-ipmi`) answered ping and refused the MC-2 account
+with "Unable to establish IPMI v2 / RMCP+ session" while MC-2's BMCs accepted
+it. With one run-wide breaker, two teststand BMCs probed before any MC-2 BMC
+proved the credential tripped the stop and blocked all MC-2 IPMI for the run
+(PR #27 review). The diagnosis names the location (`CredentialBreaker.scope`).
+A credential refusal surfaces as `PowerState.REFUSED` and the checks report it
+UNKNOWN — it is "we could not look", and it is kept apart from
 the protected-host refusal (`meta["reason"] == "protected"`), which is a
 deliberate decision of the tool.
 
@@ -409,6 +430,39 @@ Three deliberate conservatisms:
 - **It re-executes rather than pretending.** Python has already imported the
   modules that changed on disk, so continuing in-process would run the old code
   while claiming the new version.
+- **A failed required rebuild undoes the update (#21).** If the pull touched a
+  build input and `bootstrap.sh` fails, is missing or cannot start, re-executing
+  would run the new code against the old venv or native extension — turning a
+  working installation into a startup failure just before a recovery. The
+  checkout is reset to the full pre-update SHA (`--hard`, or `--keep` under
+  `allow_dirty`, which keeps local edits), nothing is re-executed, and the run
+  continues on the code it started with; a partly run bootstrap may still have
+  changed the venv, and the message says so. If the reset fails, the tree no
+  longer matches the process — which imports modules lazily from it — so the
+  run stops (exit 2). The `UpdateResult` goes into the run's provenance
+  (`version.selfupdate`).
+
+### The run lock
+
+A second concurrent run would drive the same BMCs from two directions. The
+start script's PID file could not prevent that safely: `exec` discards the
+shell's EXIT trap, so every normal run left the file behind, and a bare integer
+survives its process — after pid reuse `stop` would have signalled whatever now
+had that number (#12). The driver now holds an OS lock itself (`runlock.py`:
+`flock(LOCK_EX|LOCK_NB)` on POSIX, `msvcrt.locking` on Windows) from before
+phase 0 to the end of the run. Acquisition is atomic, so two simultaneous
+starts cannot both win, and the kernel drops the lock however the process ends,
+so nothing stale needs cleaning. The JSON record written into the file
+(`pid`, `started_at`, `cmdline`, `host`) is information, not authority:
+`runlock pid` prints it only while the lock is held, and the stop scripts
+re-check the process's command line before each signal. The file is never
+deleted — unlinking a lock file lets a second process lock the old inode while
+a third creates a new one. Only invocations that can reach hardware take it
+(phases 1–3, not `--simulate`); rehearsals, listings and report regeneration
+must stay usable during a real run. The lock is dropped immediately before the
+phase-0 `execve` and re-taken by the new process, which keeps the pid; the
+instant between is accepted rather than relying on descriptor inheritance
+across `exec`, which `msvcrt` cannot provide.
 
 ### Phase 1 — assess
 
@@ -473,8 +527,9 @@ run the stage's profile → evaluate `require:` (`all` / `majority` / `any`).
   `out_of_scope` without calling `ensure_on` — defence in depth against a plan
   bug.
 - **One IPMI client per location**, each on a gateway of its own location
-  (`Orchestrator.ipmi_for`); the IPMI subnets are per site. All share the
-  run's one `CredentialBreaker` and keep the protected-host check.
+  (`Orchestrator.ipmi_for`); the IPMI subnets are per site. Each takes its
+  location's `CredentialBreaker` (the BMC account differs between sites) and
+  keeps the protected-host check.
 - **Boot waits are concurrent.** Every node of a stage is waited for at once
   under one stage deadline, `now + min(boot_timeout, phase time left)`, with
   ssh attempts bounded by a semaphore of `ssh.max_sessions` and starts
@@ -577,15 +632,16 @@ still rendered, never posted or published. Then:
    directory first; a phase absent from the run has no page, no data file and
    no nav link (`present`). When `rid` is the newest run the same set is
    rendered at the top level — the latest view — and the top-level pages and
-   data of phases it lacks are removed. It returns a `Bundle` whose `paths`
-   are the bundle's HTML pages.
+   data of phases it lacks are removed. `report.keep_runs` then prunes old
+   bundles — never the one just rendered (it is about to be attached), and
+   never a newer one because an older run was regenerated. It returns a
+   `Bundle` whose `paths` are the bundle's HTML pages.
 3. `phase4_report.post(orch, rid, narrative, bundle.paths)` posts to the ECL.
    Vault is created lazily here (`make_vault`), never by
    `prepare_credentials` for this purpose; under `--simulate` nothing is
    posted. The outcome is an event on `rid` and goes into the bundle's
    `data/report.json`; a failure leaves the local report complete (#18).
-4. `Publisher.publish()` runs once, with the bundle final; `report.keep_runs`
-   prunes old bundles.
+4. `Publisher.publish()` runs once, with the bundle final.
 
 Report-only invocations (`--phase report`, optional `--run-id N`) validate
 the run before anything else touches credentials, `RunStore.attach(N)` it
@@ -713,7 +769,7 @@ needs an answer that does not involve reading four files.
 
 | Mechanism | What it stops |
 |---|---|
-| Live runs need per-invocation authorisation: `--execute`, or `MU2E_POWER_RECOVERY_ARM` = configured `run.label` with `run.dry_run: false`; config `dry_run: false` alone exits 2; the token is refused in `config/.env` (`cli.authorize_live`) | A power command armed by a persistent file, or issued by accident |
+| Live runs need per-invocation authorisation: `--execute`, or `MU2E_POWER_RECOVERY_ARM` = configured `run.label` with `run.dry_run: false`; config `dry_run: false` alone exits 2 for any invocation that includes phase 2 (read-only phases always run dry and are not refused); the token is refused in `config/.env` (`cli.authorize_live`) | A power command armed by a persistent file, or issued by accident |
 | `--simulate` overrides everything, including `--execute` and the token | A rehearsal that turns out not to be one |
 | Phase-2 plan (`plan_sequence`) made before credentials; unknown/reversed stage names and out-of-scope `--node` are errors | A typo or a scoped command widening a power-on |
 | `--node` predecessors verify-only; `_power_stage` refuses hosts outside `allowed_power` | Powering nodes the operator did not name |
@@ -729,6 +785,9 @@ needs an answer that does not involve reading four files.
 | Startup *warning* on the default credential cache (it does not stop the run) | A whole run attempted as `mu2eraw`, with nothing to say why |
 | A credential rejection stops IPMI for the run | Locking out 45 BMC accounts with one wrong password |
 | `Publisher` refuses to publish under `--simulate` | A rehearsal overwriting the live report |
+| `runs.simulated` stored with the run; regenerating a stored rehearsal with posting or publishing requested exits 2, and `phase4_report.post` / `write_report` re-check the stored flag | `--simulate` followed by `mu2e-power-report --post-ecl` filing scripted results as a real dry run |
+| Run lock held by the driver; stop scripts signal only a held lock's pid after checking its command line | Two runs interleaving power commands; a stale pid file killing an unrelated process |
+| A failed required rebuild rolls the checkout back and does not re-exec | New code started against an old environment just before a recovery |
 
 The protected-host refusal is not overridable by any flag. That is the one
 place where the tool declines to do what it is told, and it is deliberate:

@@ -28,10 +28,14 @@ from .. import console
 from ..cli import install_sigterm_handler
 from ..creds import KerberosError, VaultCredentials, VaultError
 from ..creds.bootstrap import credential_session
-from ..transport import IPMIClient, LocalTransport
+from ..transport import CredentialBreaker, IPMIClient, LocalTransport
 from ..transport.base import TransportError
 from ..transport.ipmi import DESTRUCTIVE_VERBS, STATE_CHANGING_VERBS
 from ._common import add_common_arguments, add_credential_arguments, bootstrap
+
+#: Output cap for this tool's own invocations, raised from the run's
+#: logging.max_capture_bytes so a full SEL listing arrives whole.
+TOOL_MAX_CAPTURE = 8 * 1024 * 1024
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -153,6 +157,20 @@ def run(argv: Optional[Sequence[str]], credentials: ExitStack) -> int:
             print("  aborted")
             return 3
 
+    # A real power command takes the recovery run lock, like phase 2 does:
+    # otherwise it can interleave with a run powering the same BMCs (#12,
+    # PR #32 review). Read-only commands and intent-only listings do not.
+    if changing and args.execute:
+        from ..runlock import DEFAULT_LOCK_FILE, LockError, RunLock
+        lock = RunLock(settings.resolve_path(
+            settings.get("run.lock_file") or DEFAULT_LOCK_FILE))
+        try:
+            lock.acquire()
+        except LockError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        credentials.callback(lock.release)
+
     # --- credentials and gateway -----------------------------------------
     local = LocalTransport(default_timeout=settings.get("ssh.command_timeout", 120))
     try:
@@ -165,12 +183,21 @@ def run(argv: Optional[Sequence[str]], credentials: ExitStack) -> int:
     # printing an invocation is no reason to prompt for a password. warm is
     # off because this is one session, not a worker pool -- a lazy mint under
     # the manager's lock is the same transaction.
+    # A full 'sel list' is the read this tool exists for (power.sel tells the
+    # operator to run it), and a BMC's log runs to hundreds of KiB: under the
+    # run's 64 KiB capture cap the middle was silently cut, splitting a row.
+    cap = max(int(settings.get("logging.max_capture_bytes", 65536)),
+              TOOL_MAX_CAPTURE)
+    settings.set("logging.max_capture_bytes", cap)
+    # Also the shared local transport, built before this: an ambient-ticket
+    # ssh runs through it, not through a runner sized by the setting.
+    local.max_capture = cap
     session = credentials.enter_context(credential_session(
         settings, topology, local, prepare=not args.show_command, warm=False))
     if session.warning and not args.quiet:
-        print(f"  note: {session.warning}\n")
+        print(f"  note: {session.warning}\n", file=sys.stderr)
     factory = session.factory
-    gateway_host = args.gateway or factory.gateway_for(location)
+    gateway_host = args.gateway or factory.gateway_for(location, role="ipmi")
     if not gateway_host:
         print(f"error: no gateway for {location} answered ssh; ipmitool cannot "
               f"be run", file=sys.stderr)
@@ -180,8 +207,9 @@ def run(argv: Optional[Sequence[str]], credentials: ExitStack) -> int:
         # The username is not a secret and is the first thing to check when a
         # BMC refuses the session, so say it rather than making the operator
         # go and look it up.
+        # stderr, so --json stdout is one parseable document.
         print(f"  running ipmitool on {gateway_host} as BMC user "
-              f"'{username}' (credentials from {creds.source})\n")
+              f"'{username}' (credentials from {creds.source})\n", file=sys.stderr)
 
     client = IPMIClient(
         gateway=factory.for_host(gateway_host, direct=True),
@@ -201,6 +229,9 @@ def run(argv: Optional[Sequence[str]], credentials: ExitStack) -> int:
         # -c/-l sweep being sent the same rejected credential.
         stop_on_auth_failure=bool(
             settings.get("ipmi.stop_on_auth_failure", True)),
+        # One location per invocation, so its own breaker is exactly the
+        # run's per-location one; scoped so the diagnosis names it.
+        breaker=CredentialBreaker(location),
         reachability_precheck=bool(
             settings.get("ipmi.reachability_precheck", True)),
     )
@@ -241,10 +272,15 @@ def run(argv: Optional[Sequence[str]], credentials: ExitStack) -> int:
                      first_line[:100]])
         results.append({"node": node.hostname, "bmc": node.ipmi_host,
                         "rc": result.rc, "output": result.output.strip(),
+                        "truncated": result.truncated,
                         "refused": result.meta.get("refused", False),
                         "dry_run": result.meta.get("dry_run", False),
                         "diagnosis": result.meta.get("diagnosis"),
                         "invocation": result.meta.get("invocation")})
+        if result.truncated:
+            print(f"  warning: output from {node.short} exceeded "
+                  f"{settings.get('logging.max_capture_bytes')} bytes and was cut "
+                  f"in the middle", file=sys.stderr)
         if not result.ok:
             failures += 1
 

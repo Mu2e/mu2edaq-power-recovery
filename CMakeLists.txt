@@ -20,7 +20,7 @@
 # depend on a toolchain being present on the machine driving it.
 
 cmake_minimum_required(VERSION 3.16)
-project(mu2edaq-power-recovery VERSION 0.1.0 LANGUAGES C CXX)
+project(mu2edaq-power-recovery VERSION 0.2.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

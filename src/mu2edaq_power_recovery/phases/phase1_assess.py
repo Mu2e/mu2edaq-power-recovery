@@ -40,12 +40,13 @@ def run(orch: Orchestrator, nodes: Optional[Sequence[Node]] = None,
     result = PhaseResult(name=PHASE_NAME, number=PHASE_NUMBER, title=PHASE_TITLE,
                          started_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
     targets = list(nodes if nodes is not None else orch.nodes())
+    if nodes is None:
+        result.notes.extend(orch.empty_location_notes())
     if not targets:
         result.status = Status.UNKNOWN
         result.summary = "no nodes are configured for the selected locations"
-        result.notes.append(
-            "check topology.locations, and note that the MC-1 inventory in "
-            "config/topology.yaml is still empty")
+        if not result.notes:
+            result.notes.append("check topology.locations and config/topology.yaml")
         return result
 
     orch.store.start_phase(PHASE_NAME, PHASE_NUMBER)

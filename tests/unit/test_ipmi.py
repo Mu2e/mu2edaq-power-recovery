@@ -518,8 +518,8 @@ def test_mixed_status_sensor_and_sel_requests_share_one_breaker():
 
 
 def test_one_breaker_serves_several_clients():
-    # One BMC account, whichever gateway ipmitool runs on: a later branch
-    # builds a client per location, and they must all stop together.
+    # One BMC account, whichever gateway ipmitool runs on: clients sharing a
+    # breaker (those of one location) must all stop together.
     breaker = CredentialBreaker()
     gw_a = CountingGateway(stderr=REJECTION, rc=1)
     gw_b = CountingGateway(stderr=REJECTION, rc=1)
@@ -531,6 +531,24 @@ def test_one_breaker_serves_several_clients():
 
     assert gw_a.invocations + gw_b.invocations == 1
     assert a.credentials_refused == b.credentials_refused is not None
+
+
+def test_separate_breakers_do_not_stop_each_other():
+    # The run gives each location its own breaker: on 2026-10-01 the
+    # teststand's BMCs refused the account MC-2's accepted.
+    teststand = IPMIClient(gateway=CountingGateway(stderr=UNESTABLISHED_TEXT,
+                                                   rc=1, delay=0.0),
+                           username="MU2E", password="x", retries=0,
+                           breaker=CredentialBreaker("teststand"))
+    mc2_gateway = CountingGateway(delay=0.0)
+    mc2 = IPMIClient(gateway=mc2_gateway, username="MU2E", password="x",
+                     retries=0, breaker=CredentialBreaker("mc2"))
+    teststand.power_status("mu2edaq04-ipmi")
+    assert teststand.power_status("mu2edaq13-ipmi") is PowerState.REFUSED
+    assert "BMCs at teststand" in teststand.credentials_refused
+    assert mc2.credentials_refused is None
+    assert mc2.power_status("mu2e-trk-01-ipmi") is PowerState.ON
+    assert mc2_gateway.invocations == 1
 
 
 def test_a_proven_credential_allows_concurrency():
@@ -662,10 +680,57 @@ def test_dark_bmcs_never_take_the_gate_and_are_checked_concurrently():
 
 def test_the_precheck_is_a_single_quoted_ping_from_the_gateway(gateway):
     gateway.expect_first(r"^ping ", ScriptedResponse(rc=1, stdout=(
-        "1 packets transmitted, 0 received, 100% packet loss, time 0ms")))
+        "3 packets transmitted, 0 received, 100% packet loss, time 405ms")))
     client = make_client(gateway)
     assert client.power_status("mu2e-trk-01-ipmi.fnal.gov") is PowerState.UNREACHABLE
-    assert gateway.commands() == ["ping -c 1 -W 1 -q mu2e-trk-01-ipmi.fnal.gov"]
+    assert gateway.commands() == [
+        "ping -c 3 -i 0.2 -W 1 -q mu2e-trk-01-ipmi.fnal.gov"]
+
+
+def test_the_precheck_ping_follows_the_gateways_dialect(gateway):
+    client = make_client(gateway)
+    gateway.platform = "darwin"
+    assert client._ping_command("bmc") == "ping -c 3 -W 1000 -q bmc"
+    gateway.platform = "win32"
+    assert client._ping_command("bmc") == "ping -n 3 -w 1000 bmc"
+
+
+#: iputils summary when the first echo is lost to a cold ARP entry.
+FIRST_ECHO_LOST = ("--- mu2e-trk-01-ipmi.fnal.gov ping statistics ---\n"
+                   "3 packets transmitted, 2 received, 33.3333% packet loss, "
+                   "time 402ms\n")
+
+
+def test_a_lost_first_echo_does_not_make_a_live_bmc_unreachable(gateway):
+    # Right after an outage the gateway's ARP entry for the BMC is cold and
+    # the first echo is lost. One echo used to be the whole pre-check, the BMC
+    # was UNREACHABLE, and ensure_on never switched its chassis on.
+    gateway.expect_first(r"^ping ", ScriptedResponse(rc=0, stdout=FIRST_ECHO_LOST))
+    gateway.expect_first(r"chassis power status",
+                         ScriptedResponse(stdout="Chassis Power is off"))
+    client = make_client(gateway, dry_run=False)
+    outcome = client.ensure_on("mu2e-trk-01-ipmi.fnal.gov")
+    assert gateway.ran("chassis power on"), outcome
+    assert client.unreachable_reason == {}
+
+
+def test_any_reply_counts_even_if_ping_exits_nonzero_on_partial_loss(gateway):
+    gateway.expect_first(r"^ping ", ScriptedResponse(rc=1, stdout=FIRST_ECHO_LOST))
+    client = make_client(gateway)
+    assert client.power_status("mu2e-trk-01-ipmi.fnal.gov") is PowerState.ON
+
+
+def test_the_failure_diagnosis_also_tolerates_a_lost_echo(gateway):
+    # _why_unreachable reuses the pre-check after an "Unable to establish":
+    # a BMC that answered two of three echoes is "no_session", not "dark".
+    gateway.expect_first(r"^ping ", ScriptedResponse(rc=1, stdout=FIRST_ECHO_LOST))
+    gateway.expect_first(r"chassis power status", ScriptedResponse(
+        stderr="Error: Unable to establish IPMI v2 / RMCP+ session", rc=1))
+    client = IPMIClient(gateway=gateway, username="MU2E", password="x",
+                        retries=0, reachability_precheck=True)
+    client.breaker.prove()
+    assert client.power_status("bmc-0") is PowerState.UNREACHABLE
+    assert client.unreachable_reason["bmc-0"] == "no_session"
 
 
 def test_two_live_bmcs_that_will_not_open_a_session_trip_the_breaker():
@@ -706,7 +771,10 @@ def test_unable_to_establish_after_a_proven_credential_does_not_count():
     for i in range(4):
         assert client.power_status(f"bmc-{i}") is PowerState.UNREACHABLE
     assert client.credentials_refused is None
-    assert gateway.pings == 0, "a proven credential needs no pre-check"
+    # No pre-check before any invocation; one diagnostic ping after each
+    # failure, to tell "answers but no session" from dark.
+    assert gateway.invocations == 4
+    assert gateway.pings == 4
 
 
 def test_with_the_precheck_off_nothing_is_pinged_and_nothing_trips():
@@ -738,7 +806,89 @@ def test_the_precheck_setting_reaches_the_run_client(settings):
         orch.prepare_credentials()
         client = orch._make_ipmi_client(IPMICredentials(username="u",
                                                         password="p"),
-                                        "mu2egateway01.fnal.gov")
+                                        "mu2egateway01.fnal.gov", "mc2")
         assert client.reachability_precheck is False
     finally:
         orch.close()
+
+
+#: ipmitool on mu2egateway01 for a topology BMC name with no DNS entry,
+#: captured live 2026-10-01.
+UNRESOLVED_STDERR = ("Address lookup for mu2edaq10-ipmi.fnal.gov failed\n"
+                     "Could not open socket!\n"
+                     "Error: Unable to establish IPMI v2 / RMCP+ session\n")
+
+
+def test_an_unresolvable_bmc_name_is_diagnosed_as_such_and_not_retried(gateway):
+    gateway.expect_first(r"chassis power status",
+                         ScriptedResponse(stderr=UNRESOLVED_STDERR, rc=1))
+    client = IPMIClient(gateway=gateway, username="MU2E", password="x", retries=2)
+    assert client.power_status("mu2edaq10-ipmi.fnal.gov") is PowerState.UNREACHABLE
+    attempts = [c for c in gateway.calls if "chassis power status" in c["command"]]
+    assert len(attempts) == 1
+    assert client.credentials_refused is None
+
+
+def test_an_unresolvable_name_never_counts_toward_the_credential_stop(gateway):
+    gateway.expect_first(r"chassis power status",
+                         ScriptedResponse(stderr=UNRESOLVED_STDERR, rc=1))
+    client = IPMIClient(gateway=gateway, username="MU2E", password="x", retries=0)
+    result = client._run("mu2edaq10-ipmi.fnal.gov", ["chassis", "power", "status"])
+    assert "does not resolve" in result.meta["diagnosis"]
+    assert "credential" not in result.meta["diagnosis"].split(".")[0]
+    assert not result.meta.get("credentials_refused")
+
+
+# ---------------------------------------------------------------------------
+# PR #30 review: a state-changing call is never cut short by the phase budget
+# ---------------------------------------------------------------------------
+
+class ExemptRecordingGateway(Transport):
+    """Records, per command, whether it ran exempt from the phase deadline."""
+
+    host = "mu2egateway01.fnal.gov"
+
+    def __init__(self, state="off"):
+        self.state, self.seen = state, []
+
+    def run(self, command, timeout=None, user=None, input_text=None, check=False):
+        from mu2edaq_power_recovery.transport.base import is_deadline_exempt
+        text = str(command)
+        self.seen.append((text, is_deadline_exempt()))
+        if "power on" in text:
+            self.state = "on"
+            return CommandResult(command=text, rc=0, stdout="Chassis Power Control: Up/On")
+        if text.startswith("ping "):
+            return CommandResult(command=text, rc=0, stdout="1 received")
+        return CommandResult(command=text, rc=0, stdout=f"Chassis Power is {self.state}")
+
+
+def test_power_on_and_its_confirmation_run_exempt_from_the_deadline():
+    gateway = ExemptRecordingGateway()
+    client = IPMIClient(gateway=gateway, username="MU2E", password="x", retries=0,
+                        dry_run=False)
+    outcome = client.ensure_on("mu2e-trk-01-ipmi.fnal.gov")
+    assert outcome["action"] == "power_on" and outcome["ok"]
+    exempt = {("power on" in c, "power status" in c): e for c, e in gateway.seen
+              if "chassis" in c}
+    assert exempt[(True, False)] is True                 # the power command
+    statuses = [e for c, e in gateway.seen if "power status" in c]
+    assert statuses == [False, True]   # read before: capped; confirm after: exempt
+
+
+def test_an_exempt_ssh_call_ignores_an_expired_budget():
+    from mu2edaq_power_recovery.transport.base import deadline_exempt
+    from mu2edaq_power_recovery.transport.ssh import SSHTransport
+
+    class Expired:
+        def expired(self):
+            return True
+
+        def remaining(self):
+            return 0.0
+
+    t = SSHTransport(host="h", deadline_source=lambda: Expired(), command_timeout=30)
+    with pytest.raises(Exception):
+        t._capped(30)
+    with deadline_exempt():
+        assert t._capped(30) == 30.0

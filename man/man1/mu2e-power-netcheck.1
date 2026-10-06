@@ -1,4 +1,4 @@
-.TH MU2E-POWER-NETCHECK 1 "2026-09-18" "mu2edaq-power-recovery 0.1.0" "Mu2e DAQ Operations"
+.TH MU2E-POWER-NETCHECK 1 "2026-09-29" "mu2edaq-power-recovery 0.2.0" "Mu2e DAQ Operations"
 .SH NAME
 mu2e-power-netcheck \- phase 3: inter-node connectivity across the DAQ networks
 .SH SYNOPSIS
@@ -60,8 +60,17 @@ or switch-port problem, the second suggests a one-way path, an ARP problem or a
 host firewall, and they need different responses.
 .PP
 FAIL and UNKNOWN are kept apart. A path is FAIL when the ping ran and got no
-reply; it is UNKNOWN when it was never tested \(em the source could not be
-logged into, the probe raised, or the output had no result for that target.
+reply, when the target name does not resolve on the source, or when the source
+has no route to it; it is UNKNOWN when it was never tested \(em the source
+could not be logged into, the probe raised, the output had no result for that
+target, or ping printed no statistics summary because it never ran
+.RI ( "ping: not found" ,
+.IR "Operation not permitted" ,
+a BusyBox ping rejecting
+.BR "\-M do" ).
+Such a path's detail quotes ping's first line. The same applies to the
+jumbo-frame probe: one that produced no summary leaves the path's MTU result
+unset rather than failed.
 A source that tested nothing is reported as an unreachable source, and its
 paths are left out of the isolated-node and unreachable-target analysis, so an
 SSH failure on one source is not presented as a broken switch. On the
@@ -102,9 +111,15 @@ which is fixed to
 .SS Phase 3 control
 .TP
 .B \-\-include\-failed
-Probe nodes that failed an earlier phase. By default they are skipped, because
-probing a node already known to be down costs a full timeout per pair and tells
-the operator nothing new.
+Probe nodes that failed an earlier phase. By default they are left out of
+the node-to-node networks
+.RB ( "origin: nodes" ),
+because probing a node already known to be down costs a full timeout per pair
+and tells the operator nothing new. They are never left out of an
+.B "origin: gateways"
+network: their BMCs are still probed from the gateways, since a BMC does not
+depend on the host OS and those are the BMCs the operator needs after an
+outage.
 .SS Run control
 .TP
 .BI \-\-label " TEXT"
@@ -176,7 +191,7 @@ Print the option summary and exit.
 .TP
 .B \-\-version
 Print
-.I mu2edaq-power-recovery 0.1.0
+.I mu2edaq-power-recovery 0.2.0
 and exit.
 .TP
 .BI \-\-config " FILE"
@@ -233,6 +248,22 @@ At least one path failed (FAIL), or at least one path could not be tested
 The probe could not start, or a
 .B \-\-node
 name is not a valid hostname.
+.I run.dry_run: false
+in configuration does
+.I not
+exit 2 here: this command cannot issue a power command, so it always runs as
+a dry run, whatever the configuration,
+.B \-\-execute
+or
+.B MU2E_POWER_RECOVERY_ARM
+say (an info line in the log notes what was ignored). The live-run gate
+applies to invocations that include phase 2
+(see
+.BR mu2e-power-recovery (1),
+.BR "LIVE RUNS" ).
+Another run holds the run lock
+.RI ( run.lock_file )
+also exits 2, naming the holder.
 .SH EXAMPLES
 .RS
 .EX

@@ -40,9 +40,10 @@ import logging
 import shlex
 import threading
 import time
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-from .base import Command, CommandResult, TimeoutExpired, Transport, TransportError, as_string
+from .base import (Command, CommandResult, TimeoutExpired, Transport, TransportError,
+                   as_string, is_deadline_exempt)
 from .local import LocalTransport
 
 log = logging.getLogger(__name__)
@@ -237,7 +238,7 @@ class SSHTransport(Transport):
         """
         wanted = float(timeout or self.command_timeout)
         deadline = self.deadline_source() if self.deadline_source else None
-        if deadline is None:
+        if deadline is None or is_deadline_exempt():
             return wanted
         if deadline.expired():
             raise TimeoutExpired(f"{self.host}: run.phase_timeout expired; "
@@ -420,7 +421,7 @@ class SSHFactory:
         #: the operator's ticket, then the Mu2e service identities that
         #: mu2edaq-kerberos can mint from Vault.
         self.kerberos = kerberos
-        self._gateway_cache: Dict[str, Optional[str]] = {}
+        self._gateway_cache: Dict[Tuple[str, str], Optional[str]] = {}
         #: Serialises gateway selection. Nodes are assessed a thread apiece,
         #: and every one of them asks for its location's gateway before its
         #: first command, so an unguarded cache miss means sixteen threads
@@ -439,8 +440,13 @@ class SSHFactory:
 
     # -- gateway selection -------------------------------------------------
 
-    def gateway_for(self, location: str) -> Optional[str]:
+    def gateway_for(self, location: str, role: str = "ssh") -> Optional[str]:
         """First responsive gateway for *location*, or None if none answer.
+
+        *role* ``ipmi`` chooses among :meth:`Topology.ipmi_gateways` -- the
+        hosts that can reach the location's BMCs -- instead of the ssh jump
+        hosts. An ``ssh.proxy`` override applies to the ssh role only when the
+        location names its own ``ipmi_gateways``.
 
         The result is cached for the life of the run: re-probing the gateways
         before every one of several hundred node commands would dominate the
@@ -451,23 +457,28 @@ class SSHFactory:
         for the answer. Without that, the whole worker pool arrives here at
         once on a cold cache and every thread probes the gateways for itself.
         """
+        explicit_ipmi = role == "ipmi" and \
+            (self.topology.location_info(location) or {}).get("ipmi_gateways")
         configured = self.settings.get("ssh.proxy", "auto")
-        if configured and configured not in ("auto", "none"):
-            return configured
-        if configured == "none":
-            return None
-        if location in self._gateway_cache:
-            return self._gateway_cache[location]
+        if not explicit_ipmi:
+            if configured and configured not in ("auto", "none"):
+                return configured
+            if configured == "none":
+                return None
+        key = (location, "ipmi" if explicit_ipmi else "ssh")
+        if key in self._gateway_cache:
+            return self._gateway_cache[key]
 
         with self._gateway_lock:
             # Re-check: another thread may have filled it while we queued.
-            if location in self._gateway_cache:
-                return self._gateway_cache[location]
-            return self._select_gateway(location)
+            if key in self._gateway_cache:
+                return self._gateway_cache[key]
+            return self._select_gateway(location, key[1])
 
-    def _select_gateway(self, location: str) -> Optional[str]:
-        """Probe *location*'s gateways and cache the first that answers."""
-        candidates = self.topology.gateways(location)
+    def _select_gateway(self, location: str, role: str = "ssh") -> Optional[str]:
+        """Probe *location*'s gateways for *role* and cache the first that answers."""
+        candidates = self.topology.ipmi_gateways(location) if role == "ipmi" \
+            else self.topology.gateways(location)
         # Pre-filter on TCP/22 before attempting a full SSH handshake.  A
         # gateway whose chassis is dark costs the whole ssh ConnectTimeout to
         # discover, and during an outage that is the likely case for at least
@@ -508,8 +519,9 @@ class SSHFactory:
                 log.warning("    (no credential chain configured; ssh used the "
                             "ambient ticket and its own default login)")
         if chosen is None:
-            log.error("no gateway answered for location %s", location)
-        self._gateway_cache[location] = chosen
+            log.error("no %sgateway answered for location %s",
+                      "IPMI " if role == "ipmi" else "", location)
+        self._gateway_cache[(location, role)] = chosen
         return chosen
 
     # -- transports --------------------------------------------------------

@@ -30,7 +30,8 @@ from .logsetup import configure as configure_logging
 from .orchestrator import Orchestrator
 from .phases import phase1_assess, phase2_poweron, phase3_network, phase4_report
 from .report import Publisher, ReportWriter
-from .selfupdate import SelfUpdater
+from .runlock import DEFAULT_LOCK_FILE, LockError, RunLock
+from .selfupdate import SelfUpdater, UpdateResult
 from .phases.phase2_poweron import SequenceSelectionError, plan_sequence
 from .settings import ARM_ENV, ConfigError, load as load_settings
 from .topology import TopologyError
@@ -69,7 +70,9 @@ live power commands
                                  run.dry_run: false in the configuration and a
                                  run.label equal to the token.
   run.dry_run: false on its own (YAML, config/.env or environment) does not
-  arm anything: it is refused with exit 2. --simulate always wins.
+  arm anything: an invocation that includes phase 2 (poweron, all) is refused
+  with exit 2. The read-only drivers (assess, network, report) cannot issue a
+  power command and always run as a dry run. --simulate always wins.
 
 scope in phase 2
   --location drops stages in other locations. --node cuts the stages holding
@@ -83,8 +86,15 @@ exit status
   1  a phase completed but one or more nodes failed their checks
   2  the run could not start (configuration, credentials, no gateway,
      live-run authorisation, stage or node selection, a --run-id that is
-     not in the store), or it stopped on an internal error
+     not in the store, another run holding the run lock, a failed update
+     that could not be rolled back), or it stopped on an internal error
   3  interrupted by the operator
+
+run lock
+  Phases 1-3 run for real (not --simulate) take an exclusive lock on
+  run.lock_file (logs/power-recovery.lock) before phase 0; a second such run
+  exits 2 naming the holder. --simulate, --list-* and report-only runs do not.
+  python -m mu2edaq_power_recovery.runlock status   shows the holder.
 """
 
 
@@ -270,12 +280,21 @@ def _dry_run_source(settings: Any) -> str:
 
 
 def authorize_live(settings: Any, args: argparse.Namespace,
-                   environ: Mapping[str, str]) -> Authorization:
+                   environ: Mapping[str, str],
+                   phases: Optional[Sequence[str]] = None) -> Authorization:
     """Decide whether this invocation may issue state-changing IPMI commands.
 
     Two independent conditions, one of which must be given *per invocation*:
 
     * ``--simulate``: never live, whatever else is set.
+    * *phases* given and without ``poweron`` (``mu2e-power-state``,
+      ``mu2e-power-netcheck``, ``mu2e-power-report``, or ``--phase`` assess,
+      network or report): a dry run, whatever the configuration, flag or
+      token says, with an info note when one of them asked for live mode.
+      No power command is reachable from those phases, so there is nothing to
+      authorise -- and refusing them would make every read-only driver exit 2
+      at a site that set ``run.dry_run: false`` to use the token path.
+      *phases* None means "may include power-on": the gate below applies.
     * ``--execute``: live. The shipped configuration is ``run.dry_run: true``
       and every documented example uses the bare flag, so the flag alone
       authorises; a stray ARM token beside it is ignored with a warning.
@@ -304,6 +323,16 @@ def authorize_live(settings: Any, args: argparse.Namespace,
 
     if args.simulate:
         decision = Authorization(False, "--simulate")
+    elif phases is not None and "poweron" not in phases:
+        decision = Authorization(False, "read-only invocation (no power-on "
+                                        "phase)")
+        asked = [what for what, on in (("--execute", args.execute),
+                                       (ARM_ENV, token is not None),
+                                       ("run.dry_run: false", config_live)) if on]
+        if asked:
+            log.info("%s ignored: this invocation (phase %s) cannot issue a "
+                     "power command, so it runs as a dry run",
+                     ", ".join(asked), ", ".join(phases))
     elif args.execute:
         if token is not None:
             log.warning("%s is set but ignored: --execute already authorises "
@@ -397,11 +426,18 @@ def _stderr_target() -> Any:
         return subprocess.DEVNULL
 
 
-def do_self_update(settings: Any, out: Any = None, as_json: bool = False) -> None:
+def do_self_update(settings: Any, out: Any = None, as_json: bool = False,
+                   lock: Optional[RunLock] = None) -> UpdateResult:
     """Run the update check and, if it changed anything, restart this process.
 
     Under --json the messages go to *out* (stderr) and so does the rebuild's
     own output, so stdout stays a single JSON document.
+
+    The run lock is released immediately before the re-exec; the new process
+    takes it again through the normal path (pid identity is preserved by
+    exec, and the record is rewritten). Returns the result, which the run
+    records in its provenance; a result with ``reset_failed`` set means the
+    caller must stop (exit 2).
     """
     out = out or sys.stdout
     updater = SelfUpdater(settings, stdout=_stderr_target() if as_json else None)
@@ -409,7 +445,10 @@ def do_self_update(settings: Any, out: Any = None, as_json: bool = False) -> Non
     for message in result.messages:
         print(f"  update: {message}", file=out)
     if result.needs_reexec:
+        if lock is not None:
+            lock.release()
         updater.reexec()   # never returns
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -458,7 +497,11 @@ def write_report(orch: Orchestrator, run_id: int, settings: Any,
         writer.record_ecl(bundle, ecl)
         _note_ecl(report_result, ecl)
 
-    publication = Publisher(settings, orch.local, simulate=orch.simulate).publish()
+    # The stored flag as well as this invocation's: a regenerated rehearsal
+    # is still a rehearsal (the driver refuses that combination earlier;
+    # this is the second line).
+    simulated = orch.simulate or bool(run.get("simulated"))
+    publication = Publisher(settings, orch.local, simulate=simulated).publish()
     return {"output_dir": str(writer.output_dir),
             "run_dir": str(bundle.directory),
             "pages": bundle.paths, "data": bundle.data,
@@ -699,13 +742,55 @@ def _main(args: argparse.Namespace, out: Any, data_out: Any,
     authorization: Optional[Authorization] = None
     if not args.list_nodes:
         try:
-            authorization = authorize_live(settings, args, os.environ)
+            authorization = authorize_live(settings, args, os.environ,
+                                           phases=phase_names)
         except LiveAuthorizationError as exc:
             return fail(str(exc))
 
+    # --- the run lock -----------------------------------------------------
+    # Only an invocation that can act on hardware takes it: phases 1-3 for
+    # real. A rehearsal, a listing or a report regeneration contacts nothing
+    # that another run could be driving, and must stay usable while a real
+    # run is in progress. Taken before phase 0, so two starts cannot both
+    # update the checkout either.
+    lock: Optional[RunLock] = None
+    if needs_run_lock(args, phase_names):
+        lock = RunLock(settings.resolve_path(
+            settings.get("run.lock_file") or DEFAULT_LOCK_FILE))
+        try:
+            lock.acquire()
+        except LockError as exc:
+            return fail(str(exc))
+    try:
+        return _run(args, settings, authorization, lock, phase_names,
+                    report_only, out, data_out, doc, fail)
+    finally:
+        if lock is not None:
+            lock.release()
+
+
+def needs_run_lock(args: argparse.Namespace, phase_names: Sequence[str]) -> bool:
+    """True for the invocations that can act on hardware (#12)."""
+    if args.simulate or args.list_nodes or args.list_checks:
+        return False
+    return any(name in ("assess", "poweron", "network") for name in phase_names)
+
+
+def _run(args: argparse.Namespace, settings: Any,
+         authorization: Optional[Authorization], lock: Optional[RunLock],
+         phase_names: Sequence[str], report_only: bool, out: Any,
+         data_out: Any, doc: Dict[str, Any], fail: Any) -> int:
+    """Everything after the lock: phase 0, then the run itself."""
     # --- phase 0 ----------------------------------------------------------
-    if not args.simulate:
-        do_self_update(settings, out, args.json)
+    update: Optional[UpdateResult] = None
+    # Only under the run lock: a report regeneration or listing that updated
+    # the checkout -- fast-forward, venv rebuild, possibly a reset -- would do
+    # it under a live --execute run still loading modules and templates from
+    # that tree (PR #32 review). Those invocations run the code they started.
+    if not args.simulate and lock is not None:
+        update = do_self_update(settings, out, args.json, lock=lock)
+        if update.reset_failed:
+            return fail(update.messages[-1])
 
     # --- banner -----------------------------------------------------------
     try:
@@ -741,6 +826,23 @@ def _main(args: argparse.Namespace, out: Any, data_out: Any,
                             f"'data/summary.json' for the run ids it holds")
             return fail(f"the run store ({orch.store.url}) holds no run to "
                         f"report on; run a phase first")
+        # A stored rehearsal is scripted output. Without this, '--phase all
+        # --simulate' followed by 'mu2e-power-report --post-ecl' posted it to
+        # the logbook as if it were a real dry run. The flag is on the run,
+        # so no option of this invocation can lift it.
+        if orch.store.is_simulated(target_run) and not args.simulate:
+            wants = [what for what, on in (
+                ("post it to the logbook (--post-ecl / ecl.enabled)",
+                 settings.get("ecl.enabled", False)),
+                ("publish it (--publish / report.publish.enabled)",
+                 settings.get("report.publish.enabled", False))) if on]
+            if wants:
+                orch.close()
+                return fail(f"run {target_run} was a simulated run (--simulate): "
+                            f"its results are scripted, so this tool will not "
+                            f"{' or '.join(wants)}. Regenerate it locally "
+                            f"without those options, or report on a real run "
+                            f"with --run-id N.")
 
     if report_only:
         print(f"  REPORT ONLY -- regenerating the report for run {target_run} "
@@ -799,7 +901,9 @@ def _main(args: argparse.Namespace, out: Any, data_out: Any,
             rid = orch.store.start_run(
                 label=settings.get("run.label") or default_label(),
                 dry_run=bool(settings.get("run.dry_run", True)),
-                version=orch.version.as_dict(),
+                simulated=bool(args.simulate),
+                version=dict(orch.version.as_dict(),
+                             selfupdate=update.as_dict() if update else None),
                 settings=settings.redacted(),
             )
             if authorization is not None and authorization.live:

@@ -1,4 +1,4 @@
-.TH MU2E-IPMI-TOOL 1 "2026-09-18" "mu2edaq-power-recovery 0.1.0" "Mu2e DAQ Operations"
+.TH MU2E-IPMI-TOOL 1 "2026-09-29" "mu2edaq-power-recovery 0.2.0" "Mu2e DAQ Operations"
 .SH NAME
 mu2e-ipmi-tool \- run an ipmitool command against Mu2e DAQ BMCs, from a gateway
 .SH SYNOPSIS
@@ -199,6 +199,16 @@ and
 .B \-\-yes
 do not override this. Powering any of them down would cut off access to the
 cluster being recovered, or stop the NFS server the rest of it mounts from.
+.PP
+A state-changing command issued with
+.B \-\-execute
+takes the recovery run lock
+.RI ( run.lock_file ,
+see
+.BR mu2e-power-recovery (1))
+for its duration, and exits 2 naming the holder if a recovery run already has
+it, so it cannot interleave power commands with phase 2. Reads and intent-only
+listings do not take it.
 .SH EXAMPLES
 Work out why a BMC refuses the session:
 .RS
@@ -286,8 +296,9 @@ the cipher suite \(em some BMCs need
 .I ipmi.cipher_suite: 17
 rather than 3.
 .PP
-A rejected credential is neither retried nor repeated. Every BMC shares one
-credential set, so the first rejection settles the matter for the whole run:
+A rejected credential is neither retried nor repeated. The BMCs of a location
+share one credential set, so the first rejection settles the matter for that
+location:
 .BR mu2e-power-on (1)
 stops issuing IPMI and reports a single diagnosis naming the refused username,
 rather than walking the same wrong credential through all forty-five chassis
