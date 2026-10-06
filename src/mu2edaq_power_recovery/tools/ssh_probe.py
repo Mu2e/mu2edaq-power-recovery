@@ -15,6 +15,7 @@ from typing import List, Optional, Sequence
 
 from .. import console
 from ..creds import KerberosManager
+from ..topology import TopologyError
 from ..transport import LocalTransport, SSHFactory
 from ..transport.base import TransportError
 from ._common import add_common_arguments, bootstrap
@@ -62,7 +63,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     locations = [args.location] if args.location else \
         settings.get("topology.locations", topology.locations)
     if args.nodes:
-        nodes = topology.resolve(args.nodes, locations)
+        try:
+            nodes = topology.resolve(args.nodes, locations)
+        except TopologyError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
     elif args.node_class:
         wanted = {c.lower() for c in args.node_class}
         nodes = [n for n in topology.all_nodes(locations)

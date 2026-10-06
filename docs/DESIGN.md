@@ -417,12 +417,41 @@ Phases 1 and 2 prove each node is reachable *from a gateway*. This proves the
 nodes reach *each other*, which a switch that came back with a missing VLAN or
 the wrong MTU will fail while every node still looks healthy alone.
 
-- **Full mesh on the data network**, sampled against anchors on the lab and
-  IPMI networks. A full mesh is O(N²); on the network the DAQ actually uses,
+- **Full mesh on the data network**, sampled against anchors on the lab
+  network. A full mesh is O(N²); on the network the DAQ actually uses,
   and which is small, that is affordable, and elsewhere it is not worth it.
+  Each `mesh.networks` entry names its `origin` (`nodes` or `gateways`) and
+  its `targets` (`all` or `anchors`, defaulting from `full_mesh`); `anchors`
+  may be a flat list or keyed by location.
+- **The IPMI network is probed from the gateways** (`origin: gateways,
+  targets: all`). A node's `ipmi` entry is its BMC, on a private subnet the
+  host OS has no route to — the reason `ipmitool` runs on a gateway — so
+  probing it from node OSes would fail on a healthy network (#19). Each of a
+  location's gateways, over a direct session, pings every BMC of the probed
+  nodes there, and the edge names the gateway as source. What it proves:
+  every BMC answers ICMP from the hosts that will drive it.
+- **An untested path is UNKNOWN, not FAIL** (#20). `MeshEdge.tested` is false
+  when the source could not be reached, the probe raised, or the output lacks
+  the target's BEGIN/END markers. A network is FAIL only on a tested failure,
+  else UNKNOWN if any path is untested. Isolation analysis uses tested edges
+  only; sources that tested nothing are reported as unreachable sources.
+  For `origin: gateways` the UNKNOWN test is per *target*
+  (`MeshResult.uncovered_targets()`): a location has two gateways precisely so
+  that one can be dark, and a BMC the partner reached is tested. The dark
+  gateway stays in `unreachable_sources` and `MeshResult.notes` says its
+  targets were covered. A location with BMC targets but no gateway gets
+  untested edges from the pseudo-source `(no gateway: <loc>)` (kept in
+  `pseudo_sources`, not reported as an unreachable host) and a note, so it can
+  never read as OK.
+- **Hostnames are validated and quoted** (#9). `topology.valid_hostname()` —
+  DNS labels or an IP literal, no leading `-`, no whitespace or
+  metacharacters — is applied to every expanded topology name at load and to
+  every `--node` name in `resolve()`; the probe script shell-quotes each target
+  and marker as well (valid names are unchanged, so markers parse), and ssh
+  argv ends option parsing with `--` before the destination.
 - **One SSH session per source**, not per pair. The shipped topology has 49
   nodes on the data network, so the mesh is 49x48 = 2352 ordered pairs — a
-  simulated run reports `data: 2352/2352 paths ok`. As 2352 SSH sessions that
+  simulated run reports `data: 2352/2352 tested paths ok`. As 2352 SSH sessions that
   would take longer than the rest of the recovery; as 49 sessions, one per
   source, it is affordable. The probe script brackets each target's output with
   markers and the results are split back apart.

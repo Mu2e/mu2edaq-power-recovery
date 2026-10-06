@@ -60,6 +60,33 @@ def test_pages_carry_the_node_data(orch, phase_result, settings):
     assert "Initial state" in text
 
 
+def test_network_page_separates_untested_from_failed_paths(orch, settings):
+    from mu2edaq_power_recovery.phases import phase3_network
+    from mu2edaq_power_recovery.transport import ScriptedResponse
+
+    dead = orch.topology.gateways("mc2")[0]
+    orch.ssh_factory.base.expect_first(
+        r"===BEGIN ", ScriptedResponse(raises="ssh: connect: No route to host"),
+        host=dead)
+    result = phase3_network.run(orch, orch.topology.resolve(
+        ["mu2e-dl-01", "mu2e-dl-02"], ["mc2"]))
+    # The other gateway tested every BMC, so the IPMI verdict stands on its
+    # probes; the dead one is still named, and its own edges are UNKNOWN.
+    assert result.status is Status.OK
+    assert result.data["unreachable_sources"] == [dead]
+    assert any("UNKNOWN, not failed" in n for n in result.notes)
+    assert any("the result stands on those probes" in n for n in result.notes)
+    assert "untested (1 source(s) unreachable)" in result.summary
+
+    writer = ReportWriter(settings, orch.topology)
+    text = writer.write_phase(result, orch.store.get_run(),
+                              orch.version.as_dict()).read_text()
+    assert "paths untested (unknown)" in text
+    assert "Probe source unreachable" in text
+    assert "from the gateways to every" in text
+    assert "source unreachable: " in text
+
+
 def test_json_companions_are_written_and_parse(orch, phase_result, settings):
     writer = ReportWriter(settings, orch.topology)
     path = writer.write_data("assess", phase_result.as_dict())

@@ -135,23 +135,102 @@ Phase 3 settings.
 .I networks
 Each entry gives a network
 .IR name ,
-whether to probe a
-.I full_mesh
-or sample against anchors, and whether to run an
+its probe
+.IR origin ,
+its
+.IR targets ,
+and whether to run an
 .IR mtu_probe .
-The data network is full-mesh with an MTU probe; the lab and IPMI networks are
-sampled, which is O(N) rather than O(N^2).
+.RS
+.TP
+.I origin
+.B nodes
+(the default): every node on the network is a probe source, reached as any
+other node is (through its location's gateway), and never probes itself.
+.BR gateways :
+the sources are each location's
+.I gateways
+from
+.BR mu2edaq-topology.yaml (5),
+contacted directly, and each probes every target in its own location
+(including its own BMC). A gateway that cannot be reached makes its edges
+UNKNOWN, not failed.
+.TP
+.I targets
+.B all
+(every node on the network) or
+.B anchors
+(the
+.I anchors
+below).
+Unset, it is
+.B all
+when
+.I full_mesh
+is true and
+.B anchors
+when it is false, which is how entries written before the key existed behave.
+.TP
+.I full_mesh
+Sets the default for
+.I targets
+and the "full mesh" label in the report; nothing else.
+.RE
+.IP
+The data network is a full mesh with an MTU probe; the lab network is sampled
+against anchors, which is O(N) rather than O(N^2). The IPMI network is
+.BR "origin: gateways, targets: all" :
+a node's
+.I ipmi
+entry names its BMC, a separate interface on a private subnet the host OS has
+no route to \(em the same reason
+.B ipmitool
+runs on a gateway \(em so probing BMCs from node operating systems would fail
+on a healthy network. What the IPMI check proves is that every BMC of the
+probed nodes answers ICMP from the gateways that will drive it.
 .TP
 .I anchors
 Representative targets used when
-.I full_mesh
-is false. An anchor that is not in this run's node set \(em because
+.I targets
+is
+.BR anchors .
+Either a flat list, the same for every location, or a mapping from location to
+list:
+.RS
+.EX
+anchors:
+  mc2:       [mu2e-mgr-01.fnal.gov, mu2e-dl-01.fnal.gov]
+  teststand: [mu2edaq07.fnal.gov]
+.EE
+.RE
+.IP
+With the mapping form each node probes only its own location's anchors. An
+anchor that is not in this run's node set \(em because
 .B \-\-node
 or
 .B \-\-location
 narrowed it \(em would leave the probe aiming at nothing, so when none of them
-is present the first three nodes on the network are used instead. The network
-still gets tested; the report names what was actually probed.
+is present the first three nodes on the network (per location, for the
+mapping form) are used instead. The network still gets tested; the report
+names what was actually probed.
+.TP
+.I "(results)"
+Each path is OK, WARN (packet loss or a failed jumbo frame), FAIL (the ping
+completed and got no reply) or UNKNOWN (the path was never tested: its source
+could not be reached, the probe raised, or the output had no result for that
+target). A network is FAIL only on a tested failure; otherwise UNKNOWN if any
+path is untested. For
+.B origin: gateways
+coverage is per target instead: a BMC counts as tested if any gateway of its
+location completed a probe to it, so one dark gateway whose partner tested
+every BMC leaves the verdict on the partner's results (OK or FAIL), with the
+dark gateway listed as an unreachable source and a note. A location with
+targets but no gateway yields one UNKNOWN path per target, from the
+pseudo-source
+.IR "(no gateway: <location>)" ,
+never a silent OK. Isolated nodes and unreachable targets are derived from
+tested paths only, and sources that tested nothing are listed separately as
+unreachable sources.
 .TP
 .I mtu_payload_bytes
 ICMP payload for the jumbo-frame probe. 8972 plus an 8-byte ICMP header plus a

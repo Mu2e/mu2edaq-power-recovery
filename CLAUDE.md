@@ -111,7 +111,8 @@ of `-P`.
 
 `topology.yaml` (inventory, subnets, classes, `protected:`),
 `power-sequence.yaml` (phase-2 stages), `checks.yaml` (thresholds, expected
-mounts and services, check profiles, the phase-3 mesh).
+mounts and services, check profiles, the phase-3 mesh with per-network
+`origin: nodes|gateways` and `targets: all|anchors`).
 
 Precedence is fixed: **command line > environment > `config/.env` > YAML >
 built-in defaults**. Any key is settable as `MU2E_POWER_RECOVERY_<DOTTED_PATH>`
@@ -220,6 +221,12 @@ could fire for two nodes or for neither.
   need different responses. A refused IPMI credential is UNKNOWN
   (`PowerState.REFUSED`, ensure_on action `credentials_refused`), never FAIL
   "BMC does not answer", and never the protected-host refusal.
+  In phase 3 that is `MeshEdge.tested`: a source
+  that could not be reached, a probe that raised, or output missing a
+  target's markers is UNKNOWN and stays out of the isolation analysis.
+  With `origin: gateways` coverage is per target (`uncovered_targets()`): a
+  dark gateway whose partner tested every BMC does not make the network
+  UNKNOWN, and a location with BMCs but no gateway is UNKNOWN, never OK.
 - **One `CredentialBreaker` per BMC account, shared by every `IPMIClient`.**
   Pass the orchestrator's `ipmi_breaker` to any client you build; a client with
   its own breaker would present a refused credential again. While unproven it
@@ -233,6 +240,14 @@ could fire for two nodes or for neither.
   `assess_node` reports `power.sensors`/`power.sel` UNKNOWN without a call.
 - **SEL comparisons go by record id.** `parse_sel_list` / `diff_sel` in
   `checks/parsers.py`; never compare the tail's length or the BMC's timestamps.
+- **Every hostname goes through `topology.valid_hostname()`** — at topology
+  load and in `Topology.resolve()` — and is still `shlex.quote`d wherever it
+  is put into shell source (`_ping_command`, the mesh script). Any new
+  validator reuses that function rather than a copy. ssh argv ends options
+  with `--` before the destination; new options go before it.
+- **The IPMI network is probed from gateways** (`origin: gateways` in
+  `checks.yaml`'s mesh section). A node's `ipmi` entry is its BMC, which the
+  node's own OS cannot route to; never make node OSes the sources for it.
 - Parsers live in `checks/parsers.py` with their own tests, against real
   command output rather than invented samples.
 

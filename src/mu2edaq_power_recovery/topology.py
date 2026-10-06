@@ -18,6 +18,7 @@ What this module adds on top of the upstream expansion:
 """
 from __future__ import annotations
 
+import ipaddress
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -32,6 +33,76 @@ DEFAULT_DOMAIN = "fnal.gov"
 class TopologyError(ValueError):
     """The topology file is missing, malformed, or was queried for something
     it does not define."""
+
+
+# ---------------------------------------------------------------------------
+# Hostname validation
+# ---------------------------------------------------------------------------
+
+#: One DNS label: letters, digits and hyphens, 1-63 characters, neither
+#: starting nor ending with a hyphen (RFC 1123).
+_LABEL = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\Z")
+#: The only characters an IP literal may contain.  Checked before handing the
+#: string to ipaddress, so an IPv6 zone id ("fe80::1%eth0") -- whose text is
+#: not constrained -- is refused rather than passed through.
+_IP_CHARS = re.compile(r"^[0-9A-Fa-f:.]+\Z")
+
+
+def valid_hostname(name: Any) -> bool:
+    """True when *name* is a DNS hostname or an IPv4/IPv6 literal.
+
+    This is the boundary between configuration or command-line text and the
+    shell scripts phase 3 builds: a name that passes contains only
+    ``[A-Za-z0-9.-:]``, never starts with ``-`` (so it cannot be read as an
+    option by ping or ssh), and never contains whitespace, quotes or any shell
+    metacharacter.  The callers still shell-quote -- validation and quoting
+    are independent defences -- but a valid name comes out of ``shlex.quote``
+    unchanged, which the mesh markers rely on.
+
+    Accepted: ``mu2e-trk-01.fnal.gov``, ``mu2e-trk-01``, ``mu2edaq07``,
+    ``131.225.245.10``, ``fe80::1``, ``::1``, and an FQDN with a trailing dot.
+
+    The one function every hostname check uses -- load-time topology
+    validation, ``Topology.resolve()`` for command-line names, and any later
+    validator -- so the rule cannot drift between them.
+    """
+    if not isinstance(name, str) or not name or len(name) > 253:
+        return False
+    if _IP_CHARS.match(name) and ":" in name:
+        try:
+            ipaddress.IPv6Address(name)
+            return True
+        except ValueError:
+            return False
+    if _IP_CHARS.match(name) and re.match(r"^[0-9.]+\Z", name):
+        # All digits and dots: an IPv4 literal or nothing.  "1.2.3" would
+        # otherwise pass as three numeric DNS labels.
+        try:
+            ipaddress.IPv4Address(name)
+            return True
+        except ValueError:
+            return False
+    labels = name[:-1].split(".") if name.endswith(".") else name.split(".")
+    return all(_LABEL.match(label) for label in labels)
+
+
+def _is_ip_literal(name: str) -> bool:
+    try:
+        ipaddress.ip_address(name)
+        return True
+    except ValueError:
+        return False
+
+
+def require_hostname(name: Any, where: str) -> str:
+    """Return *name* if :func:`valid_hostname` accepts it, else raise."""
+    if not valid_hostname(name):
+        raise TopologyError(
+            f"invalid hostname {name!r} in {where}: a hostname must be DNS "
+            f"labels (letters, digits, '-', not starting or ending with '-') "
+            f"separated by '.', or an IPv4/IPv6 address; whitespace, quotes and "
+            f"shell metacharacters are not allowed")
+    return name
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +258,24 @@ class Topology:
                 self._aliases[alias] = name
                 self._aliases[alias.replace("-", "")] = name
         self._node_cache: Dict[str, Dict[str, Node]] = {}
+        self._validate_hostnames()
+
+    def _validate_hostnames(self) -> None:
+        """Reject any expanded name that is not a hostname, at load.
+
+        Every name here ends up as an ssh target or inside a phase-3 ping
+        script, so a stray space or metacharacter in the inventory is refused
+        once, with the location and network it came from, rather than
+        surfacing as a baffling probe failure (or a command) mid-recovery.
+        """
+        for host in self._protected:
+            require_hostname(host, "protected:")
+        for loc, info in self._locations.items():
+            for gw in (info or {}).get("gateways", []) or []:
+                require_hostname(gw, f"locations.{loc}.gateways")
+            for network, entries in ((info or {}).get("networks", {}) or {}).items():
+                for host in expand_entries(entries, self.domain, self.default_prefix):
+                    require_hostname(host, f"locations.{loc}.networks.{network}")
 
     # -- construction -----------------------------------------------------
 
@@ -354,12 +443,18 @@ class Topology:
         location 'unknown' -- an operator naming a host explicitly on the
         command line should get it probed, not silently dropped, even if the
         inventory has not caught up with the machine room.
+
+        Every name must pass :func:`valid_hostname` first, or TopologyError is
+        raised: these come from ``--node`` and end up as ssh destinations and
+        inside phase-3 shell scripts.  An IP literal is used as given.
         """
         out: List[Node] = []
         for name in names:
+            require_hostname(name, "the requested node list")
             found = self.node(name, locations)
             if found is None:
-                host = name if "." in name else f"{name}.{self.domain}"
+                literal = _is_ip_literal(name)
+                host = name if ("." in name or literal) else f"{name}.{self.domain}"
                 found = Node(
                     hostname=host,
                     location="unknown",
