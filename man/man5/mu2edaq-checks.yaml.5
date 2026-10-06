@@ -236,9 +236,12 @@ names what was actually probed.
 .TP
 .I "(results)"
 Each path is OK, WARN (packet loss or a failed jumbo frame), FAIL (the ping
-completed and got no reply) or UNKNOWN (the path was never tested: its source
-could not be reached, the probe raised, or the output had no result for that
-target). A network is FAIL only on a tested failure; otherwise UNKNOWN if any
+completed and got no reply, the name does not resolve, or the source has no
+route to it) or UNKNOWN (the path was never tested: its source could not be
+reached, the probe raised, the output had no result for that target, or ping
+printed no statistics summary because it could not run \(em not installed,
+not permitted, or rejecting an option). A jumbo-frame probe with no summary
+leaves the MTU result unset, not failed. A network is FAIL only on a tested failure; otherwise UNKNOWN if any
 path is untested. For
 .B origin: gateways
 coverage is per target instead: a BMC counts as tested if any gateway of its

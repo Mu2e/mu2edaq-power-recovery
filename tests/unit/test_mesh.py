@@ -562,3 +562,79 @@ def test_a_shared_ipmi_gateway_is_one_source(topology, checks_config, monkeypatc
     nodes = _nodes(topology, "mu2e-dl-01") + topology.resolve(["mu2edaq07"], ["teststand"])
     (res,) = _probe(RoutingFactory(topology), checks_config, [IPMI]).run_all(nodes)
     assert sorted(res.sources) == sorted(topology.gateways("mc2"))
+
+
+# ---------------------------------------------------------------------------
+# PR #28 review -- a ping that never ran is UNKNOWN, not FAIL
+# ---------------------------------------------------------------------------
+
+
+def _probe_with(checks_config, block, mtu_block=None, targets=("a", "b")):
+    """Run _probe_source with every target answering *block* (and *mtu_block*)."""
+    def reply(command):
+        parts = []
+        for target in re.findall(r"===BEGIN (\S+)===", command):
+            parts += [f"===BEGIN {target}===", block]
+            if mtu_block is not None:
+                parts += [f"---MTU {target}---", mtu_block]
+            parts.append(f"===END {target}===")
+        return ScriptedResponse(stdout="\n".join(parts))
+    transport = FakeTransport("src")
+    transport.expect("===BEGIN ", reply)
+    probe = MeshProbe(None, checks_config)
+    edges = probe._probe_source("src", transport, list(targets), "data",
+                                mtu_block is not None)
+    return MeshResult(network="data", full_mesh=True, edges=edges)
+
+
+def test_ping_not_found_is_untested_not_failed(checks_config):
+    """Reviewer's stub: with `ping` missing every source was 'isolated'."""
+    res = _probe_with(checks_config, "sh: ping: not found")
+    assert all(e.status is Status.UNKNOWN for e in res.edges)
+    assert res.failures == [] and res.isolated_nodes() == []
+    assert res.status is Status.UNKNOWN
+    assert all("sh: ping: not found" in e.detail for e in res.edges)
+
+
+def test_ping_not_permitted_is_untested_not_failed(checks_config):
+    res = _probe_with(checks_config, "ping: socket: Operation not permitted")
+    assert res.status is Status.UNKNOWN
+    assert res.failures == []
+    assert "Operation not permitted" in res.edges[0].detail
+
+
+def test_an_unresolvable_name_is_still_a_tested_failure(checks_config):
+    """Not ping failing to run: an inventory error the operator must see."""
+    res = _probe_with(checks_config, "ping: a: Name or service not known",
+                      targets=("a",))
+    (edge,) = res.edges
+    assert edge.tested and edge.status is Status.FAIL
+    assert res.unresolved_targets() == ["a"]
+
+
+def test_no_route_is_still_a_tested_failure(checks_config):
+    res = _probe_with(checks_config, UNROUTABLE)
+    assert res.status is Status.FAIL
+    assert all(e.tested for e in res.edges)
+
+
+def test_real_packet_loss_is_still_a_failure(checks_config):
+    res = _probe_with(checks_config, LOST)
+    assert res.status is Status.FAIL
+    assert res.isolated_nodes() == ["src"]
+    assert res.unresolved_targets() == []
+
+
+def test_an_mtu_probe_that_never_ran_leaves_mtu_unset(checks_config):
+    """BusyBox ping rejects -M do: nothing was learned about the MTU."""
+    res = _probe_with(checks_config, OK,
+                      mtu_block="ping: unrecognized option: M")
+    assert all(e.status is Status.OK and e.mtu_ok is None for e in res.edges)
+    assert res.mtu_failures == []
+
+
+def test_an_mtu_probe_that_ran_and_lost_is_an_mtu_failure(checks_config):
+    lost_jumbo = "1 packets transmitted, 0 received, 100% packet loss, time 0ms"
+    res = _probe_with(checks_config, OK, mtu_block=lost_jumbo)
+    assert all(e.mtu_ok is False for e in res.edges)
+    assert res.status is Status.WARN

@@ -338,6 +338,25 @@ def test_mesh_edges_come_back_in_a_stable_order(orch):
     assert edges == sorted(edges)
 
 
+def test_failed_nodes_leave_the_node_mesh_but_their_bmcs_are_probed(orch):
+    """PR #28 review: a BMC is independent of the host OS, and the BMCs of the
+    nodes that did not come back are the ones the operator needs next."""
+    dead = "mu2e-dl-02.fnal.gov"
+    orch.store.start_phase("assess", 1)
+    orch.store.record_node(dead, "mc2", "readout", "fail", "did not boot")
+    orch.store.record_node("mu2e-dl-01.fnal.gov", "mc2", "readout", "ok")
+    orch.store.finish_phase("complete")
+    result = phase3_network.run(orch, _nodes(orch, "mu2e-dl-01", "mu2e-dl-02",
+                                             "mu2e-cfo-01"))
+    by_net = {n["network"]: n for n in result.data["networks"]}
+    for net in ("data", "lab"):
+        assert dead not in by_net[net]["sources"]
+        assert dead not in by_net[net]["targets"]
+    assert dead in by_net["ipmi"]["targets"]
+    assert "mu2e-dl-02-ipmi.fnal.gov" in {e["target"] for e in by_net["ipmi"]["edges"]}
+    assert any("BMCs are still probed" in n for n in result.notes)
+
+
 # ---------------------------------------------------------------------------
 # phase 4
 # ---------------------------------------------------------------------------

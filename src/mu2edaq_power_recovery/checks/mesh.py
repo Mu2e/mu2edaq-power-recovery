@@ -21,9 +21,12 @@ targets: all``: it proves every BMC answers ICMP from the hosts that will
 later drive it.
 
 An edge carries ``tested``.  A source that could not be reached, a probe that
-raised, or output without the target's BEGIN/END markers means the path was
-never looked at: that edge is UNKNOWN, not FAIL, and is excluded from the
-isolation analysis.  A completed ping with no replies is FAIL.
+raised, output without the target's BEGIN/END markers, or a block in which
+ping never produced its statistics summary (ping missing, not permitted, or
+rejecting an option) means the path was never looked at: that edge is
+UNKNOWN, not FAIL, and is excluded from the isolation analysis.  A completed
+ping with no replies is FAIL, and so is a name that does not resolve or a
+source with no route to it -- those are answers about the path.
 
 With ``origin: gateways`` coverage is decided per *target*: a BMC is tested if
 any gateway of its location completed a probe to it.  One dark gateway whose
@@ -40,7 +43,7 @@ import logging
 import shlex
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Collection, Dict, List, Optional, Sequence, Tuple
 
 from ..transport.base import TransportError
 from .base import Status
@@ -54,14 +57,27 @@ log = logging.getLogger(__name__)
 #: BSD/macOS).
 _NXDOMAIN = ("Name or service not known", "unknown host", "cannot resolve")
 
+#: Messages ping prints *instead of* a statistics summary that are still an
+#: answer about the path: the name does not resolve, or the source's routing
+#: table has nothing for it.  Any other block without a summary means ping
+#: itself never ran -- ``sh: ping: not found``, ``Operation not permitted``
+#: without cap_net_raw, BusyBox rejecting ``-M do`` -- and the script's
+#: ``|| true`` hides that exit status, so the block is all there is to go on.
+_PATH_ANSWERS = _NXDOMAIN + ("Network is unreachable", "No route to host")
+
+#: The same for the jumbo-frame probe: a local or path MTU refusal is the
+#: answer the probe exists to get.
+_MTU_ANSWERS = _PATH_ANSWERS + ("Message too long", "message too long",
+                                "Frag needed")
+
 
 @dataclass
 class MeshEdge:
     """One source -> target probe on one network.
 
     ``tested`` is False when the probe never ran to completion for this pair
-    -- the source was unreachable, the probe raised, or the output lacked this
-    target's markers.  Such an edge says nothing about the path and is
+    -- the source was unreachable, the probe raised, the output lacked this
+    target's markers, or ping itself never ran (no statistics summary).  Such an edge says nothing about the path and is
     UNKNOWN; only a tested edge can be FAIL.
     """
 
@@ -392,9 +408,20 @@ class MeshProbe:
                 continue
             ping_block, mtu_block = blocks
             stats = parse_ping(ping_block)
+            if not stats.transmitted and not _answered(ping_block, _PATH_ANSWERS):
+                # ping never ran here; nothing was learned about the path.
+                edges.append(_untested(
+                    source, name, network,
+                    "ping produced no result on the source: "
+                    + _first_line(ping_block)))
+                continue
             mtu_ok: Optional[bool] = None
             if mtu_probe and mtu_block:
-                mtu_ok = parse_ping(mtu_block).alive
+                mtu_stats = parse_ping(mtu_block)
+                # The same rule for the jumbo probe: BusyBox rejecting -M do
+                # says nothing about the path's MTU, so mtu_ok stays None.
+                if mtu_stats.transmitted or _answered(mtu_block, _MTU_ANSWERS):
+                    mtu_ok = mtu_stats.alive
             edges.append(MeshEdge(
                 source=source, target=name, network=network,
                 ok=stats.alive, loss_pct=stats.loss_pct,
@@ -579,21 +606,45 @@ class MeshProbe:
                     f"{len(uncovered)} of its {len(mine)} target(s) were tested "
                     f"by no other gateway -- those are UNKNOWN")
 
-    def run_all(self, nodes: Sequence[Any], deadline: Any = None) -> List[MeshResult]:
-        """Probe every network listed in checks.yaml's mesh section."""
+    def run_all(self, nodes: Sequence[Any], deadline: Any = None,
+                exclude: Collection[str] = ()) -> List[MeshResult]:
+        """Probe every network listed in checks.yaml's mesh section.
+
+        *exclude* names hosts (phase 3: those that failed an earlier phase)
+        left out of ``origin: nodes`` networks only.  An ``origin: gateways``
+        network still probes every node's BMC: a BMC does not depend on the
+        host OS, and the BMCs of the nodes that did not come back are the
+        ones the operator needs next.
+        """
+        excluded = set(exclude)
+        kept = [n for n in nodes if n.hostname not in excluded]
         results: List[MeshResult] = []
         for entry in self.config.get("networks", []) or []:
+            origin = str(entry.get("origin", "nodes"))
             results.append(self.run(
-                nodes,
+                nodes if origin == "gateways" else kept,
                 network=entry["name"],
                 full_mesh=bool(entry.get("full_mesh", True)),
                 mtu_probe=bool(entry.get("mtu_probe", False)),
-                origin=str(entry.get("origin", "nodes")),
+                origin=origin,
                 cross_location=bool(entry.get("cross_location", False)),
                 targets=entry.get("targets"),
                 deadline=deadline,
             ))
         return results
+
+
+def _answered(block: str, markers: Sequence[str]) -> bool:
+    """True if a ping block with no summary still carries an answer in *markers*."""
+    return any(m in block for m in markers)
+
+
+def _first_line(block: str) -> str:
+    """The first non-blank line of *block* -- ping's own reason it did not run."""
+    for line in block.splitlines():
+        if line.strip():
+            return line.strip()[:200]
+    return "(empty)"
 
 
 def _locations_of(nodes: Sequence[Any]) -> List[str]:
