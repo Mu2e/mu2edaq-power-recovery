@@ -48,6 +48,23 @@ def _json(path):
     return json.loads(Path(path).read_text())
 
 
+def _no_credentials_from_here(monkeypatch):
+    from mu2edaq_power_recovery.orchestrator import Orchestrator
+    monkeypatch.setattr(Orchestrator, "prepare_credentials",
+                        lambda self: pytest.fail("prepare_credentials called"))
+
+
+def _as_real_runs(tmp_path):
+    """Mark the stored runs as not simulated.
+
+    The suite can only create runs with --simulate (a real one would contact
+    the cluster), and a simulated run is never posted or published. Tests of
+    the posting path seed with a rehearsal and then clear the flag, which
+    stands in for a real dry run stored by an earlier invocation.
+    """
+    _db(tmp_path, "update runs set simulated = 0")
+
+
 @pytest.fixture
 def no_credentials(monkeypatch):
     from mu2edaq_power_recovery.orchestrator import Orchestrator
@@ -383,6 +400,7 @@ def test_report_only_post_attaches_the_run_bundle(tmp_path, ecl_stub, monkeypatc
     module, posted = ecl_stub
     assert run_cli(tmp_path, "--phase", "assess", "--node", "mu2e-trk-01") == 0
     assert run_cli(tmp_path, "--phase", "network", "--node", "mu2e-dl-01") in (0, 1)
+    _as_real_runs(tmp_path)
 
     from mu2edaq_power_recovery.orchestrator import Orchestrator
     monkeypatch.setattr(Orchestrator, "prepare_credentials",
@@ -407,6 +425,7 @@ def test_a_failed_post_leaves_the_complete_local_report(tmp_path, ecl_stub):
     module, _posted = ecl_stub
     module.fail = True
     assert run_cli(tmp_path, "--phase", "assess", "--node", "mu2e-trk-01") == 0
+    _as_real_runs(tmp_path)
     assert run_cli(tmp_path, "--phase", "report", "--post-ecl",
                    simulate=False) == 0
     bundle = tmp_path / "html" / "runs" / "1"
@@ -425,6 +444,60 @@ def test_a_simulated_run_never_posts(tmp_path, ecl_stub):
     assert posted == []
     report = _json(tmp_path / "html" / "runs" / "1" / "data" / "report.json")
     assert "simulated" in report["ecl"]["reason"]
+
+
+@pytest.mark.parametrize("flags", [["--post-ecl"], ["--publish"],
+                                   ["--publish-target", "/nowhere"],
+                                   ["--run-id", "1", "--post-ecl"]])
+def test_a_stored_simulated_run_is_never_posted_or_published_later(
+        tmp_path, ecl_stub, capsys, monkeypatch, flags):
+    # '--phase all --simulate' then a non-simulated 'mu2e-power-report
+    # --post-ecl' used to post the rehearsal as if it were a real dry run.
+    _module, posted = ecl_stub
+    assert run_cli(tmp_path, "--phase", "all", "--node", "mu2e-trk-01",
+                   "--node", "mu2e-trk-02") == 0
+    assert _db(tmp_path, "select simulated from runs") == [(1,)]
+    _no_credentials_from_here(monkeypatch)
+    reports_before = _db(tmp_path, "select count(*) from phases "
+                                   "where name = 'report'")
+    capsys.readouterr()
+    code = run_cli(tmp_path, "--phase", "report", *flags, simulate=False)
+    err = capsys.readouterr().err
+    assert code == 2
+    assert "run 1 was a simulated run" in err
+    assert posted == []
+    assert not (tmp_path / "nowhere").exists()
+    # Refused before anything was recorded against the run.
+    assert _db(tmp_path, "select count(*) from phases where name = 'report'") \
+        == reports_before
+
+
+def test_a_stored_simulated_run_still_regenerates_locally(tmp_path, ecl_stub,
+                                                          monkeypatch):
+    _module, posted = ecl_stub
+    assert run_cli(tmp_path, "--phase", "all", "--node", "mu2e-trk-01",
+                   "--node", "mu2e-trk-02") == 0
+    _no_credentials_from_here(monkeypatch)
+    assert run_cli(tmp_path, "--phase", "report", simulate=False) == 0
+    assert posted == []
+    bundle = tmp_path / "html" / "runs" / "1"
+    assert "SIMULATED" in (bundle / "index.html").read_text()
+    assert "SIMULATED RUN" in (bundle / "detail.html").read_text()
+    assert "simulated" in (tmp_path / "html" / "runs.html").read_text()
+    assert _json(bundle / "data" / "run-export.json")["run"]["simulated"] == 1
+
+
+def test_post_refuses_a_stored_simulated_run_directly(tmp_path, ecl_stub):
+    # The second line behind the driver's refusal: phase4_report.post()
+    # itself reads the stored flag, whatever the orchestrator says.
+    _module, posted = ecl_stub
+    store = RunStore(f"sqlite:///{tmp_path / 'p.db'}")
+    rid = store.start_run("t", True, {}, {}, simulated=True)
+    orch = types.SimpleNamespace(simulate=False, store=store, settings=None)
+    info = phase4_report.post(orch, rid, {"run": {}})
+    store.close()
+    assert info["posted"] is False and "simulated" in info["reason"]
+    assert posted == []
 
 
 # ---------------------------------------------------------------------------

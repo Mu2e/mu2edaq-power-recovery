@@ -476,7 +476,11 @@ def write_report(orch: Orchestrator, run_id: int, settings: Any,
         writer.record_ecl(bundle, ecl)
         _note_ecl(report_result, ecl)
 
-    publication = Publisher(settings, orch.local, simulate=orch.simulate).publish()
+    # The stored flag as well as this invocation's: a regenerated rehearsal
+    # is still a rehearsal (the driver refuses that combination earlier;
+    # this is the second line).
+    simulated = orch.simulate or bool(run.get("simulated"))
+    publication = Publisher(settings, orch.local, simulate=simulated).publish()
     return {"output_dir": str(writer.output_dir),
             "run_dir": str(bundle.directory),
             "pages": bundle.paths, "data": bundle.data,
@@ -800,6 +804,23 @@ def _run(args: argparse.Namespace, settings: Any,
                             f"'data/summary.json' for the run ids it holds")
             return fail(f"the run store ({orch.store.url}) holds no run to "
                         f"report on; run a phase first")
+        # A stored rehearsal is scripted output. Without this, '--phase all
+        # --simulate' followed by 'mu2e-power-report --post-ecl' posted it to
+        # the logbook as if it were a real dry run. The flag is on the run,
+        # so no option of this invocation can lift it.
+        if orch.store.is_simulated(target_run) and not args.simulate:
+            wants = [what for what, on in (
+                ("post it to the logbook (--post-ecl / ecl.enabled)",
+                 settings.get("ecl.enabled", False)),
+                ("publish it (--publish / report.publish.enabled)",
+                 settings.get("report.publish.enabled", False))) if on]
+            if wants:
+                orch.close()
+                return fail(f"run {target_run} was a simulated run (--simulate): "
+                            f"its results are scripted, so this tool will not "
+                            f"{' or '.join(wants)}. Regenerate it locally "
+                            f"without those options, or report on a real run "
+                            f"with --run-id N.")
 
     if report_only:
         print(f"  REPORT ONLY -- regenerating the report for run {target_run} "
@@ -858,6 +879,7 @@ def _run(args: argparse.Namespace, settings: Any,
             rid = orch.store.start_run(
                 label=settings.get("run.label") or default_label(),
                 dry_run=bool(settings.get("run.dry_run", True)),
+                simulated=bool(args.simulate),
                 version=dict(orch.version.as_dict(),
                              selfupdate=update.as_dict() if update else None),
                 settings=settings.redacted(),

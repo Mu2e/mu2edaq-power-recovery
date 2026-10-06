@@ -784,6 +784,7 @@ needs an answer that does not involve reading four files.
 | Startup *warning* on the default credential cache (it does not stop the run) | A whole run attempted as `mu2eraw`, with nothing to say why |
 | A credential rejection stops IPMI for the run | Locking out 45 BMC accounts with one wrong password |
 | `Publisher` refuses to publish under `--simulate` | A rehearsal overwriting the live report |
+| `runs.simulated` stored with the run; regenerating a stored rehearsal with posting or publishing requested exits 2, and `phase4_report.post` / `write_report` re-check the stored flag | `--simulate` followed by `mu2e-power-report --post-ecl` filing scripted results as a real dry run |
 | Run lock held by the driver; stop scripts signal only a held lock's pid after checking its command line | Two runs interleaving power commands; a stale pid file killing an unrelated process |
 | A failed required rebuild rolls the checkout back and does not re-exec | New code started against an old environment just before a recovery |
 

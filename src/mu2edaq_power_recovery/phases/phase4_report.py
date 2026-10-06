@@ -139,9 +139,13 @@ def post(orch: Any, run_id: int, narrative: Dict[str, Any],
     Returns ``{"posted": bool, ...}`` and records the outcome as an event on
     *run_id*. A failure leaves the local report exactly as it was rendered.
     A simulated run posts nothing: the lazy Vault client would otherwise be
-    the one real network contact a rehearsal makes.
+    the one real network contact a rehearsal makes. That holds both for a
+    ``--simulate`` invocation and for a stored run that *was* one, however it
+    is regenerated: its results are scripted, not a dry run's.
     """
-    if getattr(orch, "simulate", False):
+    if getattr(orch, "simulate", False) or \
+            bool((narrative.get("run") or {}).get("simulated")) or \
+            orch.store.is_simulated(run_id):
         info = {"posted": False,
                 "reason": "simulated run: nothing was posted to the logbook"}
         orch.store.record_event(info["reason"], run_id=run_id)
@@ -332,6 +336,7 @@ def build_narrative(export: Dict[str, Any]) -> Dict[str, Any]:
         "run": run,
         "run_status": run.get("status"),
         "dry_run": bool(run.get("dry_run")),
+        "simulated": bool(run.get("simulated")),
         "phases": [{"name": p.get("name"), "number": p.get("number"),
                     "status": p.get("status"), "summary": p.get("summary"),
                     "started_at": p.get("started_at"),

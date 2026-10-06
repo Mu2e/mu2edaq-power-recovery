@@ -586,6 +586,11 @@ Ctrl-C (SIGINT) takes the same clean path as SIGTERM.
 - Publishing the report during a `--simulate` run: it is written locally and the
   publisher stops before touching the live web area. A rehearsal must not
   overwrite the real report.
+- Posting or publishing a stored rehearsal later. The run store records that a
+  run was simulated; `mu2e-power-report --post-ecl` (or `--publish`) on it exits
+  2, whatever the invocation's flags. With no `--run-id` the latest run is the
+  target, so after a rehearsal name the real run: `mu2e-power-report --run-id 12
+  --post-ecl`.
 - Continuing past a stage that did not meet its requirement, unless you pass
   `--continue-on-error`.
 - Destroying a credential cache the run did not create. Cleanup names each of

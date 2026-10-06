@@ -176,6 +176,11 @@ to copy the report anywhere, reporting
 The publisher needs a refusal of its own because it copies with the filesystem
 rather than through a transport, so scripting the transports does not reach it.
 .IP \(bu 2
+A simulated run is marked as one in the run store, and a later
+.B mu2e-power-report
+refuses (exit 2) to post it to the logbook or publish it, whatever its own
+options, so scripted results can never be filed as a real dry run.
+.IP \(bu 2
 The first IPMI credential rejection stops IPMI to that location for the rest of
 the run. The BMCs of a location share one credential set, so the first refusal
 settles the matter there (other locations are judged separately), and
