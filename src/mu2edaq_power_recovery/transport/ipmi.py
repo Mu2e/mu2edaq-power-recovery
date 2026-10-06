@@ -656,8 +656,13 @@ class IPMIClient:
             try:
                 if self._precheck(bmc_host):
                     return "no_session"
+                # No ping on the gateway (rc 126/127): nothing to tell by.
+                return "unclassified"
+            except IPMIUnreachable:
+                return "dark"
             except IPMIError:
-                pass
+                # The gateway itself failed the ping: the BMC was not judged.
+                return "gateway"
         return "dark"
 
     def sensors(self, bmc_host: str) -> List[SensorReading]:

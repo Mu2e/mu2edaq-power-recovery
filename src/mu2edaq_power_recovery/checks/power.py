@@ -69,6 +69,17 @@ def power_status(ctx: CheckContext) -> CheckResult:
                       "from the one this run uses (mu2e-ipmi-tool --diagnose finds "
                       "the working combination, at the cost of failed logins)",
                       data, started)
+    if state is PowerState.UNREACHABLE and reason in ("gateway", "timeout",
+                                                      "unclassified"):
+        # We could not look (PR #32 review): the gateway failed, the phase
+        # budget cut the call short, or there was no way to ping the BMC.
+        why = {"gateway": "the gateway could not run the command",
+               "timeout": "run.phase_timeout cut the call short",
+               "unclassified": "the gateway has no ping to tell a silent BMC "
+                               "from one that refuses the session"}[reason]
+        return result(ctx, "power.status", Status.UNKNOWN,
+                      f"power state of {ctx.node.ipmi_host} not read: {why}",
+                      "", data, started)
     if state is PowerState.UNREACHABLE:
         return result(ctx, "power.status", Status.FAIL,
                       f"BMC {ctx.node.ipmi_host} does not answer",

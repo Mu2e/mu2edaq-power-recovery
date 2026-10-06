@@ -554,3 +554,14 @@ def test_kernel_taint_ignores_only_the_configured_flags(make_context, fake_trans
     assert result.status is status
     if letters:
         assert f"tainted {letters} " in result.summary
+
+
+@pytest.mark.parametrize("reason", ["gateway", "timeout", "unclassified"])
+def test_a_bmc_that_was_not_judged_is_unknown(make_context, fake_transport, reason):
+    from mu2edaq_power_recovery.transport.ipmi import PowerState
+    """PR #32 review: these read as FAIL 'does not answer'."""
+    ipmi = _ipmi(fake_transport)
+    ipmi.power_status = lambda host: (ipmi.unreachable_reason.__setitem__(host, reason)
+                                      or PowerState.UNREACHABLE)
+    result = run_check("power.status", make_context(ipmi=ipmi))
+    assert result.status is Status.UNKNOWN and "not read" in result.summary
