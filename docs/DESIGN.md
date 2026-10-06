@@ -161,6 +161,46 @@ follow that this project had to be rebuilt around:
   that *times out* runs the check and restore too — the command had run, so it
   could have moved the default and then hung, which is the shape of the original
   incident — and a clobber is reported in preference to the timeout.
+- **The guard is a precondition, and its failures are typed.** A mint needs a
+  readable default principal *before* it runs; without one a displacement can
+  be neither detected nor undone, so `TicketSource.ticket()` raises
+  `DefaultCacheUnverifiable` (klist missing / no default cache / unparsable)
+  without running `get-kerberos-ticket`. A failed restore raises
+  `DefaultCacheDisplaced(before, after)`. `KerberosManager` catches the common
+  base, `DefaultCacheGuardError`, by type — it used to test the message for
+  `"default credential cache"`, which a rewording would have silently
+  defeated — and abandons the service identities for the run, recording why
+  as a phase note and an `error` event. The run carries on under the
+  operator's credential, which is the one that matters.
+- **One exception: a run that uses no default cache.** On a fresh macOS login
+  where `--principal` and `--root-principal` were minted by `_kinit` into
+  private FILE: caches, the collection has no default at all, and refusing
+  every service mint for "no default cache" disabled the fallbacks for nothing.
+  When both primary roles are private caches of this run
+  (`KerberosManager._primaries_private()`; root with no root principal runs on
+  the ambient cache, so it does not qualify) *and* klist reports specifically
+  no default (`NoDefaultCache`, a `str` subclass so the decision is on type),
+  the mint proceeds. Afterwards a default that has appeared naming the minted
+  identity is destroyed by name (`destroy_default`, `kdestroy -c`), and
+  `DefaultCacheDisplaced(None, after)` is raised if it cannot be. An ambient
+  primary, or an unparsable/missing klist, is still refused. `_kinit`
+  (`_guard_kinit`) is deliberately looser: on `NoDefaultCache` (a fresh login)
+  it proceeds, because what it mints is the operator's own designated
+  principal and that becoming the default is not a displacement; it refuses,
+  before the password prompt, only a default that exists but cannot be read.
+- **An interrupted mint is still guarded.** SIGTERM is raised as
+  KeyboardInterrupt, which can arrive while `get-kerberos-ticket` runs.
+  `TicketSource.ticket()` restores the default on any `BaseException` before
+  re-raising (a failed restore is logged; it must not mask the interrupt), and
+  `service_credential()` records the cache path for `cleanup()` before the
+  mint rather than after it.
+- **Mints are serialised.** Every worker builds a chain, so an unguarded
+  check-then-mint let two threads mint one identity into one cache and
+  interleave their read-before/restore of the default. Each mint is now one
+  transaction under an `RLock` (double-checked, published last), and
+  `warm_fallbacks()` mints each fallback before the worker pool exists. The
+  diagnostics open credentials through the same `credential_session()`, so
+  what they test is what the run does.
 
 Two guards follow from this, and both are about the *next* run rather than this
 one. Before connecting to anything, a run reads the default cache and, when it
@@ -168,7 +208,8 @@ holds a service identity rather than a personal principal, logs a warning and
 prints the `kswitch`/`kdestroy` line that fixes it: otherwise sixty logins fail
 as `mu2eraw` with nothing in the ssh error to explain why.
 
-**This guard warns; it does not stop the run.** `Orchestrator.prepare()` calls
+**This guard warns; it does not stop the run.** `credential_session()` (used by
+`Orchestrator.prepare_credentials()`) calls
 `KerberosManager.ambient_warning()`, logs whatever comes back and appends it to
 the run's notes, then continues into `prepare()`, the SSH factory and every
 phase. The design intent was to halt, and halting is arguably right — an

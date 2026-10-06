@@ -184,12 +184,44 @@ default cache's principal before every mint and restore the pointer after it,
 and the service chain is abandoned outright if a restore actually fails, rather
 than leaving the operator's shell pointing at a service identity.
 .IP
-The guard is best-effort, not a precondition. When the default cache reports no
-principal at all the guard cannot be taken, and the mint proceeds
-.I unguarded
-\(em a debug line says so, and the restore afterwards is skipped because there
-is no principal to restore. That is the one case where a mint can displace a
-default this tool will not put back.
+The guard is a precondition. When the default cache cannot be read before a
+mint \(em
+.B klist
+is missing, there is no default cache, or its output names no principal
+\(em the mint is refused before
+.B get-kerberos-ticket
+runs, because a displacement could then be neither detected nor undone. Either
+guard failure (unreadable before, or displaced and not restorable after)
+abandons the service identities for the rest of the run: the run continues on
+the operator credential alone, and the reason and what to do about it
+.RB ( kinit ", or " "kswitch \-p" )
+are recorded as a phase note and as an
+.B error
+event in the run store. The decision is made on the error's type, not its
+wording.
+.IP
+One exception: when both
+.B \-\-principal
+and
+.B \-\-root\-principal
+are designated, the run uses only its own private caches and no default cache
+at all, so a mint may proceed when klist reports that there is simply no
+default (a fresh macOS login, for example). If the mint leaves its service
+identity as the new default, that cache is destroyed by name; if it cannot be,
+the service identities are abandoned as above. A missing or unparsable klist is
+still refused. Acquiring the designated principals themselves is allowed when there is no
+default at all (the operator's own principal becoming the default is not a
+displacement); a default that exists but cannot be read is refused before the
+password prompt \(em run
+.B klist
+to see why.
+.IP
+Minting is serialised. The service identities are minted once each, before any
+worker thread starts, and every mint \(em including
+.BR kinit (1)
+of a designated principal \(em runs as one locked read/mint/restore
+transaction, so two workers can neither mint the same identity twice nor
+interleave their restores of the default cache.
 .IP
 A Heimdal cache has a
 .I name

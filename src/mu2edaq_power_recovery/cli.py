@@ -361,6 +361,10 @@ def run_phases(orch: Orchestrator, args: argparse.Namespace,
         else:  # pragma: no cover - argparse restricts this
             continue
 
+        # Service identities abandoned mid-phase (a default-cache guard
+        # failure) belong in this phase's notes and the run's events, whichever
+        # phase it happened in -- phase 3 does not copy orch.notes itself.
+        orch.surface_credential_failure(result.notes)
         results.append(result)
         print(console.phase_banner(result))
         if result.assessments:

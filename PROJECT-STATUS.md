@@ -127,7 +127,8 @@ Every requirement from `Project-Description.md`, and where it is met.
 | `unit/test_ipmi_tool.py` | 8 | `mu2e-ipmi-tool` target selection: no un-filtering, skipped-node reasons, exit 2 before Vault, confirmation lists hostnames |
 | `unit/test_state.py` | 8 | Round-trip, refusal auditing, append-not-overwrite |
 | `unit/test_vault.py` | 11 | KV path resolution, folder-vs-secret, synonyms, file fallback |
-| `unit/test_credentials.py` | 68 | Primary-first chains, root fallback, ssh-failure classification, KRB5CCNAME, collection caches, host keys, cleanup, password prompting |
+| `unit/test_credentials.py` | 86 | Primary-first chains, root fallback, ssh-failure classification, KRB5CCNAME, collection caches, host keys, cleanup, password prompting; typed default-cache guard errors, the guard's precondition, barrier-forced concurrent mints |
+| `unit/test_credential_bootstrap.py` | 16 | The shared credential bootstrap: login/ticket pairs attempted by `mu2e-ssh-probe` and `mu2e-ipmi-tool`, show-only mints nothing, cleanup on success/exception/interrupt, the disabled-fallbacks note and event |
 | `unit/test_network_guard.py` | 2 | The suite's "contacts nothing" claim is enforced, not just asserted |
 | `unit/test_docs.py` | 3 | `tools/generate-docs.py --check`: the man pages still match the code, and `--check` writes nothing |
 | `unit/test_sweep.py` | 8 | Both backends, identical semantics |
@@ -165,6 +166,10 @@ JSON files, and is wired into `ctest` as `simulated-run`.
 | Waiters get the shared diagnosis without invoking ipmitool | `test_waiting_callers_get_the_shared_diagnosis_without_invoking_ipmitool` |
 | A BMC-less selection contacts neither Vault nor a gateway | `test_a_lone_bmc_less_node_contacts_nothing_and_exits_2` |
 | Re-running a phase does not erase earlier evidence | `test_rerunning_a_phase_appends_rather_than_overwrites` |
+| A default-cache guard failure stops every further mint, whatever its wording | `test_a_guard_failure_disables_service_identities_for_the_run` |
+| No mint runs when the default cache cannot be read first | `test_an_unreadable_default_refuses_before_any_mint` |
+| Concurrent cold chains mint each identity exactly once | `test_concurrent_cold_chains_mint_each_identity_exactly_once` |
+| A show-only diagnostic acquires and mints nothing | `test_show_only_mints_nothing_and_says_so` |
 
 ---
 
@@ -466,8 +471,15 @@ by how much an operator would care.
   `run_phases`/`_make_ipmi_client` (require `args.execute` *and* `not
   run.dry_run`), but it would break any operator who arms a run from the config
   file today, so it is the author's call. **Highest-value item in this group.**
-- **Nothing installs a SIGTERM handler, so `stop-…-recovery.sh` is not a clean
-  stop.** No module under `src/` imports `signal`; `cli.py:483` catches only
+- ~~**Nothing installs a SIGTERM handler, so `stop-…-recovery.sh` is not a clean
+  stop.**~~ **Fixed (fix/credentials).** `cli.install_sigterm_handler()` raises
+  KeyboardInterrupt, and `assess_nodes` / `MeshProbe.run` replace their `with
+  ThreadPoolExecutor` (whose `__exit__` waited for every queued node) with
+  `shutdown(wait=False, cancel_futures=True)` on any BaseException before
+  re-raising, so the interruption is recorded and `cleanup()` runs at once;
+  queued nodes are never started (tested with a real SIGTERM to the main
+  thread). Running workers still finish their current command before the
+  interpreter exits. Original finding: No module under `src/` imports `signal`; `cli.py:483` catches only
   `KeyboardInterrupt` (SIGINT). Under the default disposition SIGTERM kills the
   process, so `record_event("run interrupted by the operator")`,
   `finish_run("interrupted")` and the `finally: orch.close()` never run. The run
@@ -492,16 +504,29 @@ by how much an operator would care.
   sequence, readout included, with no error and no note. For a flag whose
   purpose is to bound what gets powered on, this should arguably be an error.
   Documented as a caveat in `man 1 mu2e-power-on` and the runbook for now.
-- **`mu2e-ipmi-tool` reaches the gateway with the ambient ticket only.**
-  `ipmi_tool.py:126` builds `SSHFactory(settings, topology, local=local)` with no
+- ~~**`mu2e-ipmi-tool` reaches the gateway with the ambient ticket only.**~~
+  **Fixed (#14, fix/credentials).** Both diagnostics and
+  `Orchestrator.prepare_credentials` now open credentials through
+  `creds/bootstrap.py:credential_session`, which runs `ambient_warning()`,
+  `prepare()`, the fallback warm-up and builds the `SSHFactory` with the
+  manager, and destroys the private caches in a `finally`. `--show-command`
+  acquires nothing. Tests assert the login/ticket pair of every attempt.
+  Original finding: `ipmi_tool.py:126` builds `SSHFactory(settings, topology, local=local)` with no
   `KerberosManager`, so `credentials_for` returns `[]` and `SSHTransport.run`
   falls to `chain = [None]`; it never calls `ambient_warning()` either. This is
   the same defect §6.4 records as fixed for `mu2e-ssh-probe`, still present here:
   the helper can fail against a gateway a real run would open with a service
   identity, or succeed under a displaced default cache. Its man page and the
   runbook now say the tool does not test the run's SSH access.
-- **`mu2e-ssh-probe` builds the chain's credential *list* but not its
-  tickets.** It never calls `KerberosManager.prepare()`, so `operator_credential()`
+- ~~**`mu2e-ssh-probe` builds the chain's credential *list* but not its
+  tickets.**~~ **Fixed (#15, fix/credentials).** `--run` prepares the
+  designated principals through the shared bootstrap, so ssh gets the private
+  `KRB5CCNAME` the description names; show-only acquires and mints nothing and
+  marks every unacquired credential `would try (not acquired)` instead of
+  `[ambient cache]`; `--principal`/`--root-principal` exist on both helpers
+  (`tools/_common.py`). A related mismatch was fixed on the way: with
+  `root_principal == principal`, root sessions named that principal but were
+  given the ambient cache. Original finding: It never calls `KerberosManager.prepare()`, so `operator_credential()`
   returns a `Credential` whose `cache` is `None` — the ambient cache — while its
   `principal` comes from `kerberos.principal`. Since `docs/INSTALL.md` recommends
   setting that principal in `config/.env`, this divergence is the normal case,
@@ -591,8 +616,21 @@ by how much an operator would care.
   `counts` (tested/ok/failed/unknown/unreachable_sources) and
   `unreachable_sources`, which the phase summary, notes and `network.html`
   show.
-- **The displacement guard around a mint is best-effort, not a precondition.**
-  `ticketsource.py:256-259` reads `before = self.default_principal()` and, when
+- ~~**The displacement guard around a mint is best-effort, not a precondition.**~~
+  **Fixed (#23, fix/credentials).** `TicketSource.ticket()` now raises
+  `DefaultCacheUnverifiable` *before* `get-kerberos-ticket` runs when
+  `default_principal_status()` cannot name the default principal, with a reason
+  distinguishing klist missing / no default cache / unparsable output. The run
+  continues on the operator credential and the note says to `kinit`. On Linux
+  with no ambient cache at all this now disables the fallbacks where it used to
+  mint unguarded; that is intended -- unless both `--principal` and
+  `--root-principal` are designated: then the run uses no default cache, a
+  mint from `NoDefaultCache` (klist ran, no default; typed, not a message)
+  proceeds, and a default it leaves naming the identity is destroyed by name,
+  or `DefaultCacheDisplaced(None, after)`. This fixes the fresh-macOS-login
+  case where the fallbacks were disabled for nothing. `_kinit` proceeds on a
+  fresh login (it mints the operator's own principal) and refuses, before the
+  prompt, only a default that exists but cannot be read. Original finding: `ticketsource.py:256-259` reads `before = self.default_principal()` and, when
   that returns `None`, logs a debug line and mints anyway;
   `_restore_default_if_displaced` then returns immediately at `:327-328` because
   `before` is falsy. So a mint with no readable default principal runs
@@ -600,15 +638,44 @@ by how much an operator would care.
   whose guard cannot be taken is refused"), and the case the guard exists for.
   The page now describes the real behaviour.
 
-- **Abandoning the service identities for a whole run is decided by a
-  substring.** `KerberosManager.service_credential` (`kerberos.py:425`) tests
+- ~~**Abandoning the service identities for a whole run is decided by a
+  substring.**~~ **Fixed (#17, fix/credentials).** `DefaultCacheGuardError`
+  (subclasses `DefaultCacheDisplaced(before, after)` and
+  `DefaultCacheUnverifiable(reason)`) is caught by type; the resulting
+  `KerberosManager.fallbacks_disabled` records kind, identity and operator
+  guidance, and the orchestrator surfaces it as a phase note and an `error`
+  event in the run store. Tests reword the message and check both directions.
+  Original finding: `KerberosManager.service_credential` (`kerberos.py:425`) tests
   `"default credential cache" in str(exc)` to tell an unrecoverable
   displacement from an ordinary "no keytab for this identity". Reword the
   message in `ticketsource.py` and the first silently downgrades to the second,
   and the run carries on minting under a displaced default — the exact failure
   the check exists to stop. Carrying the decision on the exception *type* would
   fix it. Left alone because the wording is fresh and the author may want a view
-  on the shape. **This is the highest-value item in this section.**
+  on the shape.
+- ~~**Service tickets were minted lazily from worker threads with no lock.**~~
+  **Fixed (#7, fix/credentials).** `service_credential()` checked
+  `self._service` and then minted, unguarded, from up to `ssh.max_sessions`
+  threads, so two workers could mint the same identity into the same cache and
+  interleave their default-cache restores. Now: an `RLock` serialises every
+  mint (service and `_kinit`) as one read/mint/lookup/restore transaction with a
+  double-checked fast path, results are published to `_service` last,
+  `note_success`/`order_chain` share a separate small lock, `cleanup()` takes
+  the mint lock and refuses later mints, and `warm_fallbacks()` mints every
+  fallback once before workers start (only with `use_service_keytabs` on; never
+  under `--simulate` or a show-only diagnostic). A barrier test forces twelve
+  simultaneous cold `chain()` calls and fails without the lock.
+  `available_identities()` memoises the `vault-client identities` discovery
+  per manager (it ran once per `chain()`, i.e. per node); the
+  `use_service_keytabs` switch is still read live. An interrupted
+  mint is covered too: `TicketSource.ticket()` restores the default on any
+  `BaseException` (KeyboardInterrupt from Ctrl-C or the SIGTERM handler)
+  before re-raising -- a failed restore is logged, never allowed to replace
+  the interrupt -- and `service_credential()` records the cache path in the
+  cleanup set *before* the mint, so `cleanup()` destroys a half-written cache
+  (and tolerates one that was never created). Not covered: a ticket an
+  interrupted mint put into the macOS API: collection has no name we know, so
+  only the pre-recorded FILE: path is destroyed.
 - **Phase 2 waits for nodes one at a time.** `_wait_for_nodes` walks the stage's
   nodes in sequence, so a node that never comes back costs the whole
   `boot_timeout` (600 s by default) before the next one is even tried. The

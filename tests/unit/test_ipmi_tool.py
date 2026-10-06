@@ -23,7 +23,7 @@ class _Creds:
 
 @pytest.fixture
 def contacted(monkeypatch):
-    """Stub Vault and the ssh factory; record whether either was built."""
+    """Stub Vault and the credential session; record whether either was built."""
     seen = {"vault": 0, "factory": 0}
     gateway = FakeTransport("mu2egateway01.fnal.gov")
     for pattern, response in healthy_node_rules():
@@ -46,8 +46,17 @@ def contacted(monkeypatch):
         def for_host(self, host, **kwargs):
             return gateway
 
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    @contextmanager
+    def session(*args, **kwargs):
+        # The factory now comes from creds.bootstrap.credential_session (#14);
+        # building it there is what "contacting" means for these tests.
+        yield SimpleNamespace(factory=Factory(), warning=None, notes=[])
+
     monkeypatch.setattr(ipmi_tool, "VaultCredentials", Vault)
-    monkeypatch.setattr(ipmi_tool, "SSHFactory", Factory)
+    monkeypatch.setattr(ipmi_tool, "credential_session", session)
     seen["gateway"] = gateway
     return seen
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import time
+from contextlib import ExitStack
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -20,6 +21,7 @@ import yaml
 from .checks import (CheckContext, CheckResult, NEEDS_ROOT, Status,
                      profile_checks, profile_for_node, rollup, run_check)
 from .creds import KerberosError, KerberosManager, VaultCredentials, VaultError
+from .creds.bootstrap import credential_session
 from .state import RunStore
 from .topology import Node, Topology
 from .transport import (CredentialBreaker, FakeTransport, IPMIClient,
@@ -161,6 +163,11 @@ class Orchestrator:
         self.baselines: Dict[str, Dict[str, Any]] = {}
         self._have_root: bool = True
         self.notes: List[str] = []
+        #: Holds the credential session open; close() unwinds it, which is
+        #: what destroys the run's private Kerberos caches.
+        self._credentials = ExitStack()
+        #: Whether the fallbacks-disabled event has reached the run store.
+        self._fallback_event_recorded = False
 
     # -- configuration -----------------------------------------------------
 
@@ -225,23 +232,18 @@ class Orchestrator:
             self.notes.extend(info["notes"])
             return info
 
-        self.kerberos = KerberosManager(self.settings, local=self.local)
-
-        # Before anything is attempted: is the ticket we are about to use
-        # actually the operator's? On macOS the credential cache is a
-        # collection, and a service identity minted into it can become the
-        # default -- after which every login runs as that identity and is
-        # refused, with nothing in the ssh error to say why.
-        warning = self.kerberos.ambient_warning()
-        if warning:
-            log.warning("%s", warning)
-            info["notes"].append(warning)
-
+        # The same bootstrap the diagnostics use (creds/bootstrap.py): the
+        # ambient-cache warning, the designated principals, the service
+        # fallbacks minted before any worker starts, and the ssh factory.
+        # Held open until close(), which destroys the private caches.
         try:
-            tickets = self.kerberos.prepare()
-            info["kerberos"] = {k: v.as_dict() for k, v in tickets.items()}
+            session = self._credentials.enter_context(credential_session(
+                self.settings, self.topology, self.local))
         except KerberosError as exc:
             raise SystemExit(f"error: {exc}")
+        self.kerberos = session.kerberos
+        info["kerberos"] = {k: v.as_dict() for k, v in session.tickets.items()}
+        info["notes"].extend(session.notes)
 
         # Say plainly which login/ticket pair the run will lead with -- it is
         # the pair that decides everything downstream.
@@ -250,7 +252,9 @@ class Orchestrator:
         info["primary_credential"] = primary.as_dict()
 
         identities = self.kerberos.available_identities()
-        if identities:
+        if self.kerberos.fallbacks_disabled is not None:
+            info["fallbacks_disabled"] = self.kerberos.fallbacks_disabled.as_dict()
+        elif identities:
             info["service_identities"] = identities
             log.info("service identities available as fallbacks: %s",
                      ", ".join(identities))
@@ -264,12 +268,7 @@ class Orchestrator:
                 "ambient ticket and will be reported as failures if it is not "
                 "root-capable")
 
-        # The factory needs the Kerberos manager: it is what supplies the
-        # credential chain, and -- more basically -- what puts KRB5CCNAME into
-        # the ssh environment, without which a designated principal is minted
-        # into a private cache that ssh never looks at.
-        self.ssh_factory = SSHFactory(self.settings, self.topology,
-                                      local=self.local, kerberos=self.kerberos)
+        self.ssh_factory = session.factory
 
         # BMC credentials.  A failure here is not fatal for phase 1 -- the
         # OS-level checks still work -- so it degrades to "no IPMI" with a note
@@ -321,6 +320,31 @@ class Orchestrator:
             reachability_precheck=bool(
                 self.settings.get("ipmi.reachability_precheck", True)),
         )
+
+    def surface_credential_failure(self, notes: Optional[List[str]] = None
+                                   ) -> Optional[str]:
+        """Carry a disabled-fallbacks state into the notes and the run store.
+
+        The decision is made deep in a worker thread, by
+        KerberosManager.service_credential(); an operator reading the report
+        has to see it. Idempotent: the note appears once in :attr:`notes`
+        (which phases 1 and 2 copy into their results), once in *notes* when
+        given (a phase's own list), and once in the store as an error event --
+        recorded as soon as there is a run to record it against.
+        """
+        state = self.kerberos.fallbacks_disabled if self.kerberos else None
+        if state is None:
+            return None
+        note = state.note()
+        if note not in self.notes:
+            self.notes.append(note)
+        if notes is not None and note not in notes:
+            notes.append(note)
+        if not self._fallback_event_recorded and \
+                getattr(self.store, "run_id", None) is not None:
+            self.store.record_event(note, level="error")
+            self._fallback_event_recorded = True
+        return note
 
     # -- check execution ---------------------------------------------------
 
@@ -441,7 +465,11 @@ class Orchestrator:
         workers = max(1, min(workers, len(nodes) or 1))
         out: List[NodeAssessment] = []
         log.info("assessing %d node(s) with %d worker(s)", len(nodes), workers)
-        with ThreadPoolExecutor(max_workers=workers) as pool:
+        # Not a `with` block: its __exit__ waits for every queued node, so a
+        # Ctrl-C or SIGTERM (raised here as KeyboardInterrupt) would sit
+        # through the rest of the phase before cleanup could run.
+        pool = ThreadPoolExecutor(max_workers=workers)
+        try:
             futures = {pool.submit(self.assess_node, n, profile, baseline, only): n
                        for n in nodes}
             for future in as_completed(futures):
@@ -458,6 +486,14 @@ class Orchestrator:
                 out.append(assessment)
                 if progress:
                     progress(assessment)
+        except BaseException:
+            # Queued nodes are never started; nodes already running finish
+            # their current command in the background.
+            shutdown_now(pool)
+            raise
+        pool.shutdown(wait=True)
+        # Before the caller copies self.notes into its phase result.
+        self.surface_credential_failure()
         out.sort(key=lambda a: (a.node.location, a.node.node_class, a.node.hostname))
         return out
 
@@ -476,9 +512,22 @@ class Orchestrator:
                       "networks": a.node.networks})
 
     def close(self) -> None:
-        if self.kerberos:
-            self.kerberos.cleanup()
+        # Unwinds credential_session(), whose finally runs
+        # KerberosManager.cleanup().
+        self._credentials.close()
         self.store.close()
+
+
+def shutdown_now(pool: ThreadPoolExecutor) -> None:
+    """Stop *pool* without waiting: cancel what is queued, leave what runs.
+
+    For an interrupt (KeyboardInterrupt from Ctrl-C or the SIGTERM handler):
+    the caller re-raises, and its ``finally`` -- Orchestrator.close(), which
+    destroys the private Kerberos caches -- runs now rather than after every
+    queued node has been assessed. ``cancel_futures`` is Python 3.9+.
+    """
+    log.warning("interrupted: cancelling queued work")
+    pool.shutdown(wait=False, cancel_futures=True)
 
 
 # ---------------------------------------------------------------------------

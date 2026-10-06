@@ -434,3 +434,43 @@ def test_a_gatewayless_location_does_not_hide_behind_a_healthy_one(
     assert res.status is Status.UNKNOWN
     assert res.uncovered_targets() == [ts[0].networks["ipmi"]]
 
+
+
+@pytest.mark.skipif(not hasattr(__import__("signal"), "pthread_kill"),
+                    reason="POSIX only")
+def test_sigterm_mid_mesh_cancels_the_queued_sources(topology, checks_config):
+    import signal
+    import threading
+
+    from mu2edaq_power_recovery.cli import install_sigterm_handler
+
+    nodes = _nodes(topology, "mu2e-dl-01", "mu2e-dl-02", "mu2e-dl-03",
+                   "mu2e-dl-04")
+    started, running, release = [], threading.Event(), threading.Event()
+    factory = RoutingFactory(topology)
+
+    def slow(node, user=None, root=False):
+        started.append(node.hostname)
+        running.set()
+        release.wait(10)
+        return factory._make(node.hostname, False)
+
+    factory.for_node = slow
+    probe = MeshProbe(factory, dict(checks_config, mesh=dict(
+        checks_config["mesh"], networks=[{"name": "data"}])), max_workers=1,
+        topology=topology)
+
+    def fire():
+        if running.wait(10):
+            signal.pthread_kill(threading.main_thread().ident, signal.SIGTERM)
+
+    previous = signal.getsignal(signal.SIGTERM)
+    install_sigterm_handler()
+    threading.Thread(target=fire, daemon=True).start()
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            probe.run_all(nodes)
+    finally:
+        release.set()
+        signal.signal(signal.SIGTERM, previous)
+    assert len(started) == 1, "a queued mesh source was started"
