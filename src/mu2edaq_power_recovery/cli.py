@@ -757,7 +757,11 @@ def _run(args: argparse.Namespace, settings: Any,
     """Everything after the lock: phase 0, then the run itself."""
     # --- phase 0 ----------------------------------------------------------
     update: Optional[UpdateResult] = None
-    if not args.simulate:
+    # Only under the run lock: a report regeneration or listing that updated
+    # the checkout -- fast-forward, venv rebuild, possibly a reset -- would do
+    # it under a live --execute run still loading modules and templates from
+    # that tree (PR #32 review). Those invocations run the code they started.
+    if not args.simulate and lock is not None:
         update = do_self_update(settings, out, args.json, lock=lock)
         if update.reset_failed:
             return fail(update.messages[-1])

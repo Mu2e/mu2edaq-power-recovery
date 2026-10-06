@@ -199,6 +199,16 @@ and
 .B \-\-yes
 do not override this. Powering any of them down would cut off access to the
 cluster being recovered, or stop the NFS server the rest of it mounts from.
+.PP
+A state-changing command issued with
+.B \-\-execute
+takes the recovery run lock
+.RI ( run.lock_file ,
+see
+.BR mu2e-power-recovery (1))
+for its duration, and exits 2 naming the holder if a recovery run already has
+it, so it cannot interleave power commands with phase 2. Reads and intent-only
+listings do not take it.
 .SH EXAMPLES
 Work out why a BMC refuses the session:
 .RS

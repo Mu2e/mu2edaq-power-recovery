@@ -157,6 +157,20 @@ def run(argv: Optional[Sequence[str]], credentials: ExitStack) -> int:
             print("  aborted")
             return 3
 
+    # A real power command takes the recovery run lock, like phase 2 does:
+    # otherwise it can interleave with a run powering the same BMCs (#12,
+    # PR #32 review). Read-only commands and intent-only listings do not.
+    if changing and args.execute:
+        from ..runlock import DEFAULT_LOCK_FILE, LockError, RunLock
+        lock = RunLock(settings.resolve_path(
+            settings.get("run.lock_file") or DEFAULT_LOCK_FILE))
+        try:
+            lock.acquire()
+        except LockError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        credentials.callback(lock.release)
+
     # --- credentials and gateway -----------------------------------------
     local = LocalTransport(default_timeout=settings.get("ssh.command_timeout", 120))
     try:

@@ -304,3 +304,25 @@ def test_stop_terminates_the_driver_holding_the_lock(tmp_path, stub_venv):
         assert holder.returncode != 0      # SIGTERM
     finally:
         stop(holder)
+
+
+def test_the_lock_file_is_ignored_by_git():
+    """PR #32 review: untracked, it made phase 0 see a dirty tree forever."""
+    import subprocess
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[2]
+    for name in ("logs/power-recovery.lock", "logs/start.pid"):
+        res = subprocess.run(["git", "-C", str(root), "check-ignore", "-q", name])
+        assert res.returncode == 0, f"{name} is not ignored"
+
+
+def test_phase_0_runs_only_under_the_lock(monkeypatch, tmp_path):
+    """A report regeneration must not update a checkout a live run uses."""
+    from mu2edaq_power_recovery import cli
+    calls = []
+    monkeypatch.setattr(cli, "do_self_update",
+                        lambda *a, **k: calls.append(k.get("lock")) or None)
+    monkeypatch.setenv("MU2E_POWER_RECOVERY_DATABASE_PATH", str(tmp_path / "r.db"))
+    monkeypatch.setenv("MU2E_POWER_RECOVERY_REPORT_OUTPUT_DIR", str(tmp_path / "out"))
+    cli.main_report(["--no-report"])
+    assert calls == [], "phase 0 ran without the run lock"

@@ -515,6 +515,10 @@ and report-only runs do not take it. The kernel releases the lock however the
 process ends; the file, with the last holder's JSON record, is left in place
 and believed only while the lock is held. The lock is released immediately
 before the phase-0 re-exec and taken again by the new process.
+Phase 0 itself runs only under the lock: an invocation that does not take it
+\(em a report regeneration, a listing \(em never updates the checkout, which a
+live run may be executing from. The lock file is ignored by git, so it never
+makes the checkout look modified to phase 0.
 .PP
 .RS
 .EX
