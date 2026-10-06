@@ -169,7 +169,13 @@ diagnosis naming the username that was refused. Only an RAKP failure or an
 counts.
 .I "Unable to establish IPMI v2 / RMCP+ session"
 deliberately does not: that is what a dark chassis says, and after an outage a
-dark chassis is the expected case. Set
+dark chassis is the expected case. Until one BMC has accepted the credential
+IPMI commands are issued one at a time, so this holds under concurrent
+assessment as well; each is preceded by a ping of the BMC from the gateway, so a
+dark BMC neither waits its turn nor gets an ipmitool invocation, and two BMCs
+that answer the ping but cannot open a session also count as a refusal
+.RI ( ipmi.reachability_precheck ).
+Set
 .I ipmi.stop_on_auth_failure
 false to carry on regardless.
 .SH REPORTS

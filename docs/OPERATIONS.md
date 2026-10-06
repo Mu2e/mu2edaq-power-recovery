@@ -386,8 +386,28 @@ username; `vault.ipmi_user_field` / `vault.ipmi_password_field` fix a renamed
 field. To carry on regardless — for instance when you believe only one BMC is
 misconfigured — set `ipmi.stop_on_auth_failure: false`.
 
+The refusal shows as **UNKNOWN** on `power.status`, `power.sensors` and
+`power.sel` ("IPMI credentials refused"), not as FAIL "BMC does not answer",
+and phase 2 records `credentials_refused` for each node rather than
+`unreachable`. Phase 1's readiness block says phase 2 is not ready. Only one
+BMC was actually asked: until a credential has worked once, IPMI commands are
+issued one at a time.
+
+Each of those unproven commands is preceded by one `ping -c 1 -W 1 <bmc>` from
+the gateway. A BMC that does not answer is reported **FAIL** "does not answer"
+on `power.status` straight away, without ipmitool and without waiting its turn,
+and its `power.sensors` / `power.sel` are **UNKNOWN** ("not read: the BMC did
+not answer"). If the BMCs filter ICMP, every one will look dark: set
+`ipmi.reachability_precheck: false`.
+
+Two BMCs that *do* answer ping and then fail with `Unable to establish IPMI v2 /
+RMCP+ session`, before any BMC has accepted the credential, also stop the run's
+IPMI — the diagnosis says "likeliest cause is a wrong username". Check the
+username first (`mu2e-ipmi-tool --diagnose`, above), then the cipher suite.
+
 A BMC that simply does **not answer** is not treated this way, and says much the
-same thing (`Unable to establish IPMI v2 / RMCP+ session`). After an outage a
+same thing (`Unable to establish IPMI v2 / RMCP+ session`) — the ping pre-check
+is what tells the two apart. After an outage a
 chassis with no standby power is the expected case, not a credential problem.
 
 ---

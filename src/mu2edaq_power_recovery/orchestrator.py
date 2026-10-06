@@ -22,7 +22,8 @@ from .checks import (CheckContext, CheckResult, NEEDS_ROOT, Status,
 from .creds import KerberosError, KerberosManager, VaultCredentials, VaultError
 from .state import RunStore
 from .topology import Node, Topology
-from .transport import (FakeTransport, IPMIClient, LocalTransport, SSHFactory,
+from .transport import (CredentialBreaker, FakeTransport, IPMIClient,
+                        LocalTransport, PowerState, SSHFactory,
                         healthy_node_rules)
 from .version import VersionInfo, collect as collect_version
 
@@ -152,6 +153,9 @@ class Orchestrator:
         self.kerberos: Optional[KerberosManager] = None
         self.vault: Optional[VaultCredentials] = None
         self.ipmi: Optional[IPMIClient] = None
+        #: One BMC account serves every BMC, so one breaker serves every IPMI
+        #: client this run builds, whichever gateway it runs ipmitool on.
+        self.ipmi_breaker = CredentialBreaker()
         self.ssh_factory: Any = None
         #: Per-node values carried between phases (SEL baselines, boot flags).
         self.baselines: Dict[str, Dict[str, Any]] = {}
@@ -214,7 +218,8 @@ class Orchestrator:
             self.ipmi = IPMIClient(
                 gateway=self.ssh_factory.for_host("simulated-gateway"),
                 username="simulated", password="simulated",
-                dry_run=True, protected=self.topology.is_protected)
+                dry_run=True, protected=self.topology.is_protected,
+                breaker=self.ipmi_breaker)
             info["notes"].append("simulated run: no credentials acquired, no "
                                  "host contacted; all command output is scripted")
             self.notes.extend(info["notes"])
@@ -312,6 +317,9 @@ class Orchestrator:
             extra_args=self.settings.get("ipmi.extra_args", []),
             stop_on_auth_failure=bool(
                 self.settings.get("ipmi.stop_on_auth_failure", True)),
+            breaker=self.ipmi_breaker,
+            reachability_precheck=bool(
+                self.settings.get("ipmi.reachability_precheck", True)),
         )
 
     # -- check execution ---------------------------------------------------
@@ -355,7 +363,24 @@ class Orchestrator:
         assessment = NodeAssessment(node=node)
 
         reachable = True
+        #: Set when power.status found the BMC dark or the credential refused:
+        #: power.sensors and power.sel would ask the same BMC the same
+        #: question and learn nothing new, so they are UNKNOWN without a call.
+        bmc_unread: Optional[CheckResult] = None
         for check_id in ids:
+            if bmc_unread is not None and check_id in ("power.sensors",
+                                                       "power.sel"):
+                state = bmc_unread.data.get("state")
+                why = ("the BMC did not answer" if state == "unreachable"
+                       else "the IPMI credential was refused")
+                assessment.results.append(CheckResult(
+                    node=node.hostname, check_id=check_id, status=Status.UNKNOWN,
+                    summary=f"not read: {why} (power.status)",
+                    detail="skipped after power.status could not read the BMC; "
+                           "asking it again would cost another IPMI timeout "
+                           "and learn nothing",
+                    data={"bmc": node.ipmi_host, "state": state}))
+                continue
             if not reachable and check_id not in ("ping.lab", "power.status",
                                                   "power.sensors", "power.sel"):
                 assessment.results.append(CheckResult(
@@ -369,11 +394,16 @@ class Orchestrator:
             assessment.results.append(res)
             if check_id == "power.status":
                 assessment.power_state = res.data.get("state")
-                # Phase 2 compares against the event-log length seen here.
+                if res.data.get("state") in (PowerState.UNREACHABLE.value,
+                                             PowerState.REFUSED.value):
+                    bmc_unread = res
                 self.baselines.setdefault(node.hostname, {})
-            if check_id == "power.sel" and res.data.get("count") is not None:
-                self.baselines.setdefault(node.hostname, {})["sel_count"] = \
-                    res.data["count"]
+            if check_id == "power.sel" and res.data.get("records") is not None:
+                # The first successful read is the survey every later phase
+                # compares against, so it is kept, not overwritten. A failed
+                # read carries no 'records' and records no baseline.
+                self.baselines.setdefault(node.hostname, {}).setdefault(
+                    "sel", res.data["records"])
             if check_id == "ssh.login" and res.status is Status.FAIL:
                 # Every remaining check needs an ssh session, so once the login
                 # is refused the rest can only fail the same way -- twelve more

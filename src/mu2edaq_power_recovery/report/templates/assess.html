@@ -29,6 +29,10 @@
       <span class="font-mono text-xs">{{ phase.data.ready_for_phase2.bmc_silent|join(', ') }}</span>
       &mdash; these chassis cannot be powered on remotely.</li>
     {% endif %}
+    {% if phase.data.ready_for_phase2.credentials_refused %}
+    <li>IPMI credentials <strong>refused</strong> &mdash; no further IPMI command
+      was issued: {{ phase.data.ready_for_phase2.credentials_refused }}</li>
+    {% endif %}
   </ul>
 </section>
 {% endif %}

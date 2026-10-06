@@ -225,6 +225,53 @@ deliberately **excluded**: a dark chassis says exactly that, and after an outage
 a dark chassis is the expected case. `ipmi.stop_on_auth_failure: false`
 overrides the whole behaviour.
 
+**The stop is a synchronised circuit breaker, shared by every IPMI client.**
+Phase 1 assesses sixteen nodes at once, so an unsynchronised "refused?" flag let
+many workers pass the check and each present the bad credential to a different
+BMC before the first rejection landed. `CredentialBreaker` (in
+`transport/ipmi.py`) holds a lock, a gate admitting one invocation while the
+credential is unproven, a `proven` event set by the first success, and the
+refusal message. The flag is re-read after the gate is acquired and before
+every retry; waiters raise `IPMICredentialsRefused` with the shared message and
+never invoke ipmitool. Once proven, calls run concurrently.
+
+Serialising unproven calls would make a cluster whose BMCs are mostly dark cost
+one full ipmitool timeout per BMC, in sequence, so each unproven call is
+preceded by a **reachability pre-check** outside the gate: one
+`ping -c 1 -W 1 <bmc>` from the same gateway. No reply raises
+`IPMIUnreachable` (an `IPMIError`, so `PowerState.UNREACHABLE`) with no
+ipmitool invocation and no gate taken, so dark BMCs are assessed concurrently.
+Phase 1's `assess_node` then reports `power.sensors` and `power.sel` UNKNOWN
+without asking a BMC whose `power.status` was UNREACHABLE or REFUSED. The
+pre-check also gives "Unable to establish" a meaning it lacks on its own: from
+a BMC that has *just answered ping*, while no BMC has accepted the credential,
+it is most likely a wrong username (`_DIAGNOSES`). `ESTABLISH_FAILURE_LIMIT`
+(2) distinct such BMCs trip the breaker; one does not, because a single BMC
+wanting another cipher suite must not stop the run. RAKP and "unauthorized
+name" still trip it on the first occurrence. `ipmi.reachability_precheck:
+false` (for BMCs that filter ICMP) restores the earlier behaviour: every
+unproven call goes to ipmitool, one at a time, and "Unable to establish" never
+trips. A gateway without `ping` (rc 126/127) skips the pre-check with a
+warning. The
+concurrency is a constant (1), not a setting. The object is shared rather than
+per client because the BMC account is shared: a client per location must stop
+with the others. A credential refusal surfaces as `PowerState.REFUSED` and the
+checks report it UNKNOWN — it is "we could not look", and it is kept apart from
+the protected-host refusal (`meta["reason"] == "protected"`), which is a
+deliberate decision of the tool.
+
+**SEL baselines are record identities, not a count.** `sel list last 20`
+returns twenty rows from any log that is full, so a length comparison between
+phase 1 and phase 2 saw nothing once rotation began. `power.sel` now keeps the
+survey as `{record_id: fingerprint}` (sensor, event, direction; the record id is
+the first hex column) and reports a record as new when its id is absent or its
+event changed under the same id. A reused id or a new "Log area
+reset/cleared" record means the log was cleared since the survey (WARN). A full
+tail in which every row is new may have lost more off its front; that is noted.
+Timestamps are never compared: the BMC clock is what an outage resets. A failed
+read returns `None`, reports UNKNOWN, and records no baseline. The baseline
+lives in the orchestrator for the life of the process only.
+
 ## 3. Checks as data
 
 A check is a function `(CheckContext) -> CheckResult` registered under a dotted

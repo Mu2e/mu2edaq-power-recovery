@@ -251,7 +251,20 @@ ICMP reachability on the lab network, probed from the gateway.
 .TP
 .B power.sel
 No new critical entries in the BMC event log since the baseline taken in
-phase 1.
+phase 1. The baseline is the first successful reading of the last 20 records,
+kept as record id and event (sensor, event, direction) \(em never position and
+never timestamp, because a full log rotates every position and an outage resets
+the BMC clock. A record is new when its id is absent from the baseline or its
+event changed under the same id. A reused id or a new
+.I "Log area reset/cleared"
+record gives
+.B warn
+.IR "SEL cleared since survey" ;
+a reading in which all 20 rows are new notes that more may have scrolled out.
+A log that could not be read is
+.B unknown
+and sets no baseline; so is a refused IPMI credential, which is never reported
+as a BMC that does not answer.
 .TP
 .B power.sensors
 No IPMI sensor is in a critical state.

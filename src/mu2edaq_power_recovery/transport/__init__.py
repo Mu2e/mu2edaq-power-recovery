@@ -12,12 +12,14 @@ check suite runnable with no cluster attached.
 from .base import CommandResult, Transport, TransportError, TimeoutExpired
 from .local import LocalTransport
 from .ssh import SSHTransport, SSHError, SSHFactory
-from .ipmi import IPMIClient, IPMIError, PowerState
+from .ipmi import (CredentialBreaker, IPMIClient, IPMICredentialsRefused,
+                   IPMIError, IPMIUnreachable, PowerState)
 from .fake import FakeTransport, ScriptedResponse, healthy_node_rules
 
 __all__ = [
     "CommandResult", "Transport", "TransportError", "TimeoutExpired",
     "LocalTransport", "SSHTransport", "SSHError", "SSHFactory",
-    "IPMIClient", "IPMIError", "PowerState",
+    "CredentialBreaker", "IPMIClient", "IPMICredentialsRefused", "IPMIError",
+    "IPMIUnreachable", "PowerState",
     "FakeTransport", "ScriptedResponse", "healthy_node_rules",
 ]

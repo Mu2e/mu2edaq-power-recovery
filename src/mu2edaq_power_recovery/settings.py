@@ -107,6 +107,10 @@ DEFAULTS: Dict[str, Any] = {
         # rejects it will be rejected by all of them. Stop rather than send
         # the same bad username to another sixty-four controllers.
         "stop_on_auth_failure": True,
+        # Ping each BMC from the gateway before an unproven ipmitool call, so
+        # a dark BMC neither takes the credential gate nor costs an ipmitool
+        # timeout. Turn off for BMCs that filter ICMP.
+        "reachability_precheck": True,
     },
     "kerberos": {
         "principal": None,

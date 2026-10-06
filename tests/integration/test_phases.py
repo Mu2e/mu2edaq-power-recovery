@@ -94,7 +94,88 @@ def test_assess_reports_phase2_readiness(orch):
 
 def test_assess_records_a_sel_baseline_for_later_phases(orch):
     phase1_assess.run(orch, _nodes(orch, "mu2e-trk-01"))
-    assert "sel_count" in orch.baselines["mu2e-trk-01.fnal.gov"]
+    # The simulated log is empty: an empty baseline, which is not "none".
+    assert orch.baselines["mu2e-trk-01.fnal.gov"]["sel"] == {}
+
+
+def _sel_rows(first, last, event="Power Supply AC lost"):
+    return "\n".join(f"{i:4x} | 09/18/2026 | 14:{i % 60:02d}:00 | "
+                     f"Power Supply #0x51 | {event} | Asserted"
+                     for i in range(first, last + 1))
+
+
+def test_a_rotated_full_sel_still_shows_the_new_critical_event(orch):
+    """Both readings are twenty rows long; only the record ids tell them apart."""
+    node = _nodes(orch, "mu2e-trk-01")[0]
+    base = orch.ssh_factory.base
+    base.expect_first(r"sel list", ScriptedResponse(stdout=_sel_rows(0x41, 0x54),
+                                                    once=True))
+    phase1_assess.run(orch, [node])
+    assert len(orch.baselines[node.hostname]["sel"]) == 20
+
+    rotated = _sel_rows(0x42, 0x54) + ("\n  55 | 09/18/2026 | 15:10:02 | "
+                                       "Processor #0x04 | IERR | Asserted"
+                                       " | Critical")
+    base.expect_first(r"sel list", ScriptedResponse(stdout=rotated, once=True))
+    res = orch.assess_node(node, only=["power.sel"]).results[0]
+    assert res.status is Status.FAIL
+    assert "1 new critical event" in res.summary
+    # The survey stays the baseline; the later reading does not replace it.
+    assert "55" not in orch.baselines[node.hostname]["sel"]
+
+
+def test_a_failed_sel_read_records_no_baseline(orch):
+    node = _nodes(orch, "mu2e-trk-01")[0]
+    orch.ssh_factory.base.expect_first(r"sel list", ScriptedResponse(
+        stderr="Error: timed out", rc=1))
+    phase1_assess.run(orch, [node])
+    assert "sel" not in orch.baselines.get(node.hostname, {})
+
+
+def test_sensors_and_sel_are_not_asked_after_a_dark_bmc(orch):
+    node = _nodes(orch, "mu2e-trk-01")[0]
+    orch.ssh_factory.base.expect_first(
+        r"^ping -c 1 -W 1 -q " + node.ipmi_host.replace(".", r"\."),
+        ScriptedResponse(rc=1, stdout="1 packets transmitted, 0 received"))
+    result = phase1_assess.run(orch, [node])
+    by_id = {r.check_id: r for r in result.assessments[0].results}
+    assert by_id["power.status"].status is Status.FAIL      # it is dark
+    for check_id in ("power.sensors", "power.sel"):
+        assert by_id[check_id].status is Status.UNKNOWN     # we did not look
+        assert "power.status" in by_id[check_id].summary
+    asked = [c["command"] for c in orch.ssh_factory.base.calls
+             if node.ipmi_host in c["command"]]
+    # One pre-check ping; no ipmitool at all.
+    assert len(asked) == 1 and asked[0].startswith("ping ")
+
+
+def test_sensors_and_sel_are_not_asked_after_a_refused_credential(orch):
+    node = _nodes(orch, "mu2e-trk-01")[0]
+    orch.ssh_factory.base.expect_first(r"ipmitool", ScriptedResponse(
+        stderr="RAKP 2 HMAC is invalid", rc=1))
+    result = phase1_assess.run(orch, [node])
+    by_id = {r.check_id: r for r in result.assessments[0].results}
+    assert by_id["power.status"].status is Status.UNKNOWN
+    assert by_id["power.sensors"].status is Status.UNKNOWN
+    assert by_id["power.sel"].status is Status.UNKNOWN
+    assert "credential was refused" in by_id["power.sel"].summary
+
+
+def test_a_refused_credential_is_unknown_and_blocks_phase2(orch):
+    orch.ssh_factory.base.expect_first(r"ipmitool", ScriptedResponse(
+        stderr="RAKP 2 message indicates an error : unauthorized name", rc=1))
+    result = phase1_assess.run(orch, _nodes(orch, "mu2e-trk-01", "mu2e-trk-02"))
+    power = [r for a in result.assessments for r in a.results
+             if r.check_id.startswith("power.")]
+    assert power and all(r.status is Status.UNKNOWN for r in power)
+    assert not any("does not answer" in r.summary for r in power)
+    readiness = result.data["ready_for_phase2"]
+    assert readiness["ready"] is False
+    assert "rejected the IPMI credentials" in readiness["credentials_refused"]
+    assert any("IPMI credentials refused" in n for n in result.notes)
+    # One BMC was asked, once; everything else was stopped by the breaker.
+    asked = [c for c in orch.ssh_factory.base.calls if "ipmitool" in c["command"]]
+    assert len(asked) == 1
 
 
 def test_an_unreachable_node_is_unknown_not_failed(orch):

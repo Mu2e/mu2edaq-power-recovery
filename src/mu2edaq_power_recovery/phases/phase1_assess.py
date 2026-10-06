@@ -103,9 +103,14 @@ def run(orch: Orchestrator, nodes: Optional[Sequence[Node]] = None,
                         if a.status is Status.UNKNOWN],
         "powered_off": [a.node.hostname for a in result.assessments
                         if a.power_state == "off"],
-        "ready_for_phase2": _ready_for_phase2(result.assessments),
+        "ready_for_phase2": _ready_for_phase2(
+            result.assessments,
+            getattr(orch.ipmi, "credentials_refused", None)),
     }
     result.notes.extend(orch.notes)
+    refused = result.data["ready_for_phase2"]["credentials_refused"]
+    if refused:
+        result.notes.append(f"IPMI credentials refused: {refused}")
 
     orch.record(result.assessments)
     orch.store.finish_phase(
@@ -125,12 +130,15 @@ def _power_summary(assessments: Sequence[NodeAssessment]) -> Dict[str, int]:
     return counts
 
 
-def _ready_for_phase2(assessments: Sequence[NodeAssessment]) -> Dict[str, Any]:
+def _ready_for_phase2(assessments: Sequence[NodeAssessment],
+                      credentials_refused: Optional[str] = None) -> Dict[str, Any]:
     """Whether phase 2 has what it needs: a usable gateway and BMC answers.
 
     Surfacing this from phase 1 is the point of running phase 1 separately --
     the operator finds out that the BMC network is unreachable before they
-    commit to a power-on sequence, not halfway through one.
+    commit to a power-on sequence, not halfway through one. A refused BMC
+    credential makes phase 2 impossible whatever else answered, because the
+    breaker stops every further IPMI command of the run.
     """
     gateways = [a for a in assessments if a.node.node_class == "gateway"]
     gateway_ok = any(a.status is not Status.UNKNOWN and
@@ -145,5 +153,8 @@ def _ready_for_phase2(assessments: Sequence[NodeAssessment]) -> Dict[str, Any]:
         "gateway_usable": gateway_ok,
         "bmc_answered": bmc_answered,
         "bmc_silent": bmc_silent,
-        "ready": bool(gateway_ok and bmc_answered),
+        "bmc_refused": [a.node.hostname for a in assessments
+                        if a.power_state == "refused"],
+        "credentials_refused": credentials_refused,
+        "ready": bool(gateway_ok and bmc_answered and not credentials_refused),
     }
