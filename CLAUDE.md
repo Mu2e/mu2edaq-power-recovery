@@ -258,7 +258,13 @@ could fire for two nodes or for neither.
   each mint and restore it after -- on *any* exit from the mint, including
   KeyboardInterrupt (`TicketSource.ticket()`'s `except BaseException`). A
   service cache is put in `_caches` before the mint so an interrupted one is
-  still destroyed. `cleanup()` names each cache to `kdestroy -c`, tolerates
+  still destroyed; and because on macOS the ticket is in `API:<uuid>`, not at
+  that path, an interrupted `_kinit` and an interrupted or timed-out
+  (`TicketTimeout`) service mint also look the principal up in the
+  collection and record that name (`_record_collection_cache`, key
+  `<role>@collection`). That bookkeeping never masks the exception in flight,
+  and never records the cache of the principal that was the default before
+  the mint. `cleanup()` names each cache to `kdestroy -c`, tolerates
   one that was never created, and refuses any file cache outside the run's
   own temporary directory.
 - **A readable default is a precondition for a service mint.**

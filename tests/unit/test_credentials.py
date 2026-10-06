@@ -234,6 +234,9 @@ class FakeTicketSource:
     def collection():
         return {}
 
+    def collection_cache_for(self, identity):
+        return TicketSource.collection_cache_for(self, identity)
+
     def restore_default(self, principal):
         return True
 
@@ -977,8 +980,10 @@ def test_a_timed_out_mint_still_restores_the_default_pointer(settings, tmp_path,
                         staticmethod(lambda: (state["default"], None)))
     monkeypatch.setattr(ts_module.TicketSource, "restore_default", fake_restore)
 
-    with pytest.raises(TicketSourceError, match="timed out"):
+    with pytest.raises(TicketSourceError, match="timed out") as raised:
         source.ticket("mu2edaq", tmp_path / "cache")
+    # Its own type: the caller records a possible API: cache on it.
+    assert isinstance(raised.value, ts_module.TicketTimeout)
     assert state["restored"], "the pointer must be put back even on a timeout"
     assert state["default"] == "anorman@FNAL.GOV"
 
@@ -1301,6 +1306,212 @@ def test_cleanup_tolerates_a_cache_the_mint_never_created(manager, monkeypatch):
     monkeypatch.setattr(local_module.LocalTransport, "run", missing)
     manager.cleanup()          # must not raise
     assert not manager.cache_for("svc-mu2edaq").exists()
+
+
+# ---------------------------------------------------------------------------
+# unfinished mints on macOS: the ticket is only in the API: collection
+# (PR #29 review)
+# ---------------------------------------------------------------------------
+
+
+class _MacCollection:
+    """The operator's Heimdal collection, as klist -l / kswitch would see it.
+
+    A mint (kinit or get-kerberos-ticket) ignores the FILE: name it was given,
+    puts the ticket in a new API: cache, and makes that the default -- the
+    behaviour these tests model.
+    """
+
+    def __init__(self):
+        self.default = "anorman@FNAL.GOV"
+        self.caches = {"anorman@FNAL.GOV": "API:OPERATOR"}
+        self.restored = []
+
+    def mint(self, principal, name):
+        self.caches[principal] = name
+        self.default = principal
+
+    def install(self, tickets):
+        tickets.default_principal = lambda: self.default
+        tickets.collection = lambda: dict(self.caches)
+
+        def restore(principal):
+            self.restored.append(principal)
+            self.default = principal
+            return True
+
+        tickets.restore_default = restore
+
+
+def _kdestroys(manager, monkeypatch):
+    from mu2edaq_power_recovery.transport import local as local_module
+
+    calls = []
+
+    def fake_run(self, command, timeout=None, user=None, input_text=None,
+                 check=False):
+        calls.append(list(command))
+        return CommandResult(command=" ".join(command), rc=0)
+
+    monkeypatch.setattr(local_module.LocalTransport, "run", fake_run)
+    manager.cleanup()
+    return [c[2] for c in calls if c[:2] == ["kdestroy", "-c"]]
+
+
+def _interrupted_kinit(manager, monkeypatch, collection, principal, role,
+                       exc=KeyboardInterrupt):
+    import getpass as getpass_module
+
+    from mu2edaq_power_recovery.transport import local as local_module
+
+    def kinit_then_interrupt(self, command, timeout=None, user=None,
+                             input_text=None, check=False):
+        collection.mint(principal, "API:MINTED")
+        raise exc()
+
+    monkeypatch.setattr(getpass_module, "getpass", lambda prompt="": "pw")
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(local_module.LocalTransport, "run",
+                        kinit_then_interrupt)
+    manager._caches[role] = manager.cache_for(principal)
+    manager._kinit(principal, manager.cache_for(principal), role)
+
+
+def test_an_interrupted_kinit_restores_the_default_and_records_its_api_cache(
+        manager, monkeypatch):
+    """Ctrl-C or SIGTERM while kinit runs for --root-principal.
+
+    Heimdal has already put the root ticket in API:<uuid> and made it the
+    default; _caches['root'] still holds the FILE: path. Without the lookup the
+    operator's root ticket outlives the run as their default.
+    """
+    mac = _MacCollection()
+    mac.install(manager.tickets)
+    with pytest.raises(KeyboardInterrupt):
+        _interrupted_kinit(manager, monkeypatch, mac,
+                           "anorman/root@FNAL.GOV", "root")
+    assert mac.restored == ["anorman@FNAL.GOV"]
+    assert mac.default == "anorman@FNAL.GOV"
+    assert manager._caches["root@collection"] == "API:MINTED"
+
+    destroyed = _kdestroys(manager, monkeypatch)
+    assert "API:MINTED" in destroyed
+    assert "API:OPERATOR" not in destroyed, "the operator's cache is not ours"
+
+
+def test_a_timed_out_kinit_is_settled_the_same_way(manager, monkeypatch):
+    from mu2edaq_power_recovery.transport.base import TransportError
+
+    mac = _MacCollection()
+    mac.install(manager.tickets)
+    with pytest.raises(TransportError):
+        _interrupted_kinit(manager, monkeypatch, mac, "anorman/root@FNAL.GOV",
+                           "root", exc=lambda: TransportError("timed out"))
+    assert mac.default == "anorman@FNAL.GOV"
+    assert manager._caches["root@collection"] == "API:MINTED"
+
+
+def test_a_failing_lookup_does_not_mask_the_interrupted_kinit(manager,
+                                                              monkeypatch):
+    """The lookup runs klist -l, which can itself fail or be interrupted."""
+    from mu2edaq_power_recovery.transport.base import TransportError
+
+    mac = _MacCollection()
+    mac.install(manager.tickets)
+
+    def interrupted_lookup():
+        raise KeyboardInterrupt          # a second Ctrl-C, during klist -l
+
+    def failed_restore(principal):
+        raise RuntimeError("kswitch exploded")
+
+    manager.tickets.collection = interrupted_lookup
+    manager.tickets.restore_default = failed_restore
+    with pytest.raises(TransportError, match="original"):
+        _interrupted_kinit(manager, monkeypatch, mac, "anorman/root@FNAL.GOV",
+                           "root", exc=lambda: TransportError("original"))
+    assert "root@collection" not in manager._caches
+
+
+def test_an_interrupted_kinit_of_the_default_principal_records_nothing(
+        manager, monkeypatch):
+    """Renewing the operator's own principal refreshes their own cache.
+
+    That cache was the default before the run touched it; cleanup() must not
+    destroy it.
+    """
+    mac = _MacCollection()
+    mac.install(manager.tickets)
+    with pytest.raises(KeyboardInterrupt):
+        _interrupted_kinit(manager, monkeypatch, mac, "anorman@FNAL.GOV",
+                           "general")
+    assert "general@collection" not in manager._caches
+    assert "API:MINTED" not in _kdestroys(manager, monkeypatch)
+
+
+class _MacMinting(FakeTicketSource):
+    """A ticket source whose mint lands in API: and then fails as told."""
+
+    def __init__(self, mac, failure):
+        super().__init__(["mu2edaq"])
+        self.mac = mac
+        self.failure = failure
+
+    def collection(self):
+        return dict(self.mac.caches)
+
+    def ticket(self, identity, cache, timeout=120, **kwargs):
+        self.mac.caches[f"{identity}/mu2e@FNAL.GOV"] = "API:SERVICE"
+        # ticket() itself restores the default before raising; only the
+        # cache is left behind.
+        raise self.failure
+
+
+@pytest.mark.parametrize("failure", [
+    KeyboardInterrupt(),
+    pytest.param("timeout", id="timeout"),
+])
+def test_an_unfinished_service_mint_records_its_api_cache(manager, monkeypatch,
+                                                          failure):
+    from mu2edaq_power_recovery.creds.ticketsource import TicketTimeout
+
+    mac = _MacCollection()
+    if failure == "timeout":
+        failure = TicketTimeout("get-kerberos-ticket timed out after 120s")
+    manager.tickets = _MacMinting(mac, failure)
+    if isinstance(failure, KeyboardInterrupt):
+        with pytest.raises(KeyboardInterrupt):
+            manager.service_credential("mu2edaq")
+    else:
+        assert manager.service_credential("mu2edaq") is None
+    assert manager._caches["svc-mu2edaq@collection"] == "API:SERVICE"
+
+    destroyed = _kdestroys(manager, monkeypatch)
+    assert "API:SERVICE" in destroyed
+    assert f"FILE:{manager.cache_for('svc-mu2edaq')}" in destroyed
+    assert "API:OPERATOR" not in destroyed
+
+
+def test_an_ordinary_service_failure_leaves_the_collection_alone(manager):
+    """No keytab: nothing was minted, so a cache found now is not this run's."""
+    mac = _MacCollection()
+    manager.tickets = _MacMinting(mac, TicketSourceError("no keytab"))
+    assert manager.service_credential("mu2edaq") is None
+    assert "svc-mu2edaq@collection" not in manager._caches
+
+
+def test_a_failing_lookup_does_not_mask_an_interrupted_service_mint(manager):
+    mac = _MacCollection()
+    source = _MacMinting(mac, KeyboardInterrupt())
+
+    def broken():
+        raise RuntimeError("klist -l exploded")
+
+    source.collection = broken
+    manager.tickets = source
+    with pytest.raises(KeyboardInterrupt):
+        manager.service_credential("mu2edaq")
+    assert "svc-mu2edaq@collection" not in manager._caches
 
 
 # ---------------------------------------------------------------------------

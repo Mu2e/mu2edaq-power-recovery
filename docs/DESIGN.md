@@ -193,7 +193,16 @@ follow that this project had to be rebuilt around:
   `TicketSource.ticket()` restores the default on any `BaseException` before
   re-raising (a failed restore is logged; it must not mask the interrupt), and
   `service_credential()` records the cache path for `cleanup()` before the
-  mint rather than after it.
+  mint rather than after it. `_kinit` does the same for the designated
+  principals (`except BaseException`: restore, then re-raise). On macOS a
+  path is not enough -- Heimdal put the ticket in `API:<uuid>`, whose name is
+  otherwise learned only on success -- so an interrupted `_kinit`, and an
+  interrupted or timed-out (`TicketTimeout`) service mint, look the principal
+  up in the collection and record the name it gives for `cleanup()` (PR #29
+  review). The lookup runs `klist -l` and may itself fail or be interrupted;
+  that is logged, never raised over the original exception. The cache of the
+  principal that was the default before the mint is never recorded: it was
+  the operator's before the run touched it.
 - **Mints are serialised.** Every worker builds a chain, so an unguarded
   check-then-mint let two threads mint one identity into one cache and
   interleave their read-before/restore of the default. Each mint is now one
