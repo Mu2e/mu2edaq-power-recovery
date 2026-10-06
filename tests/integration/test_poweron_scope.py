@@ -392,3 +392,204 @@ def test_an_ipmi_error_on_one_node_does_not_abandon_the_stage(orch, monkeypatch)
     assert out[nodes[0].hostname]["action"] == "failed"
     assert "IPMI error" in out[nodes[0].hostname]["detail"]
     assert all(out[n.hostname]["ok"] for n in nodes[1:])
+
+
+# ---------------------------------------------------------------------------
+# PR #30 review: a budget cut-off is UNKNOWN, never "a dependency is down"
+# ---------------------------------------------------------------------------
+
+
+class Waitable:
+    """A scripted node transport with a boot wait kept on the fake clock.
+
+    Like SSHTransport.wait_for_ssh: the wait ends at ``min(now + budget,
+    deadline.expires_at)``, and a node given no time is not tried. Hosts in
+    *silent* never answer and use up the whole wait (and :class:`WaitFactory`
+    makes every command to them fail).
+    """
+
+    def __init__(self, inner, silent):
+        self._inner = inner
+        self._silent = silent
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def alive(self, timeout=None):
+        return self._inner.host not in self._silent
+
+    def wait_for_ssh(self, budget, deadline=None, clock=None, sleep=None,
+                     gate=None, **kwargs):
+        end = clock() + float(budget)
+        if deadline is not None:
+            end = min(end, float(deadline.expires_at))
+        if self._inner.host in self._silent:
+            sleep(max(0.0, end - clock()))
+            return False
+        return clock() < end
+
+
+class WaitFactory:
+    def __init__(self, base, silent=()):
+        self._base = base
+        self._silent = set(silent)
+        for host in self._silent:
+            base.base.expect_first(r".", ScriptedResponse(
+                raises="ssh: connect to host port 22: Connection timed out"),
+                host=host)
+
+    def __getattr__(self, name):
+        return getattr(self._base, name)
+
+    def for_node(self, node, user=None, root=False):
+        return Waitable(self._base.for_node(node, user=user, root=root), self._silent)
+
+
+def slow_read(clock, bmc, seconds=10_000, cut_short=False, off=()):
+    """chassis power status: *bmc*'s first read costs *seconds*; with
+    *cut_short* it then dies as a budget-capped ssh call does. *off* BMCs
+    read 'off'."""
+    from mu2edaq_power_recovery.transport import TimeoutExpired
+    slow = [True]
+
+    def respond(command):
+        if f"-H {bmc} " in command and slow:
+            slow.clear()
+            clock.sleep(seconds)
+            if cut_short:
+                raise TimeoutExpired("gateway: ssh timed out at the "
+                                     "phase_timeout cap")
+        if any(f"-H {b} " in command for b in off):
+            return ScriptedResponse(stdout="Chassis Power is off")
+        return ScriptedResponse(stdout="Chassis Power is on")
+    return respond
+
+
+@pytest.mark.parametrize("cut_short", [False, True],
+                         ids=["read-completed", "read-cut-short"])
+def test_budget_expiring_in_a_predecessor_is_unknown_not_blocked(orch, clock,
+                                                                 cut_short):
+    """The budget runs out in predecessor 'dcs': it was not looked at, so it
+    is UNKNOWN and timed out -- not 'did not answer ssh', not FAIL -- and the
+    run stops before the target with nothing powered."""
+    arm(orch)
+    orch.settings.set("run.phase_timeout", 100)
+    orch.ssh_factory = WaitFactory(orch.ssh_factory)
+    orch.ssh_factory.base.expect_first(
+        r"chassis power status",
+        slow_read(clock, "mu2e-dcs-01-ipmi.fnal.gov", cut_short=cut_short,
+                  off=("mu2e-trk-01-ipmi.fnal.gov",)))
+    result = phase2_poweron.run(orch, plan=plan(orch, ["mu2e-trk-01"]))
+
+    assert power_on_targets(orch) == []               # nothing, anywhere
+    assert not [a for a in orch.store.get_actions() if a["outcome"] == "power_on"]
+    stages = {s["name"]: s for s in result.data["stages"]}
+    dcs = stages["dcs"]
+    assert dcs["status"] == "unknown" and dcs["timed_out"] is True
+    assert not dcs["blocked"]
+    assert dcs["power"]["mu2e-dcs-02.fnal.gov"]["action"] == "not_run"
+    assert dcs["power"]["mu2e-dcs-01.fnal.gov"]["action"] == \
+        ("not_run" if cut_short else "verify")
+    assert sorted(dcs["not_reached"]) == ["mu2e-dcs-01.fnal.gov",
+                                          "mu2e-dcs-02.fnal.gov"]
+    assert TIMEOUT_SUMMARY in dcs["summary"]
+    for name in ("cfo", "readout"):
+        assert stages[name]["status"] == "unknown"
+        assert stages[name]["summary"] == TIMEOUT_SUMMARY
+    assert result.data["blocked_at"] is None
+    assert result.data["timed_out"] is True
+    assert result.status is Status.UNKNOWN            # not FAIL: nothing looked at
+    notes = " ".join(result.notes)
+    assert "did not answer ssh" not in notes
+    assert not any(n.startswith("stopped before") for n in result.notes)
+    assert "Resume with --from dcs" in notes
+    assert orch.store.get_phases()[-1]["status"] == "timed_out"
+
+
+def test_budget_expiring_in_a_target_stage_is_timed_out(orch, clock):
+    """The budget runs out during the target's boot wait: timed_out, the
+    resume note, UNKNOWN -- not 'aborted' and not FAIL."""
+    arm(orch)
+    orch.settings.set("run.phase_timeout", 1000)
+    # trk-01 is off (switched on) and never answers within the time left.
+    orch.ssh_factory = WaitFactory(orch.ssh_factory, silent={"mu2e-trk-01.fnal.gov"})
+    # 'cfo' uses 700 s, so readout's wait is capped at 300 s by the phase,
+    # well short of its 600 s boot_timeout.
+    orch.ssh_factory.base.expect_first(
+        r"chassis power status",
+        slow_read(clock, "mu2e-cfo-01-ipmi.fnal.gov", seconds=700,
+                  off=("mu2e-trk-01-ipmi.fnal.gov",)))
+    result = phase2_poweron.run(orch, plan=plan(orch, ["mu2e-trk-01", "mu2e-trk-02"]))
+
+    # Powered before the budget ran out, as a live run would have.
+    assert [b for b, _ in power_on_targets(orch)] == ["mu2e-trk-01-ipmi.fnal.gov"]
+    readout = {s["name"]: s for s in result.data["stages"]}["readout"]
+    assert readout["timed_out"] is True and readout["status"] == "unknown"
+    assert "mu2e-trk-01.fnal.gov" in readout["not_reached"]
+    assert "never answered ssh" not in readout["summary"]
+    assert result.data["timed_out"] is True
+    assert result.data["aborted_at"] is None
+    assert result.status is Status.UNKNOWN
+    assert any("Resume with --from readout" in n for n in result.notes)
+    assert orch.store.get_phases()[-1]["status"] == "timed_out"
+
+
+def test_a_target_read_cut_short_by_the_budget_is_not_unreachable(orch, clock):
+    """ensure_on's status read dies with the budget: not 'BMC did not
+    answer', and no power command follows."""
+    arm(orch)
+    orch.settings.set("run.phase_timeout", 100)
+    orch.ssh_factory = WaitFactory(orch.ssh_factory)
+    orch.ssh_factory.base.expect_first(
+        r"chassis power status",
+        slow_read(clock, "mu2e-trk-01-ipmi.fnal.gov", cut_short=True,
+                  off=("mu2e-trk-01-ipmi.fnal.gov", "mu2e-trk-02-ipmi.fnal.gov")))
+    result = phase2_poweron.run(orch, plan=plan(orch, ["mu2e-trk-01", "mu2e-trk-02"]))
+
+    assert power_on_targets(orch) == []
+    readout = {s["name"]: s for s in result.data["stages"]}["readout"]
+    assert {v["action"] for v in readout["power"].values()} == {"not_run"}
+    assert all(v["detail"] == TIMEOUT_SUMMARY for v in readout["power"].values())
+    outcomes = {a["outcome"] for a in orch.store.get_actions()}
+    assert "unreachable" not in outcomes and "power_on" not in outcomes
+    assert readout["timed_out"] is True
+    assert result.status is Status.UNKNOWN
+    assert any("Resume with --from readout" in n for n in result.notes)
+
+
+def test_a_predecessor_silent_through_its_full_boot_wait_is_still_blocked(orch, clock):
+    """Budget left, full boot wait given, no answer: that is a real finding,
+    FAIL and blocked, not a timeout."""
+    arm(orch)
+    orch.settings.set("run.phase_timeout", 100_000)
+    orch.ssh_factory = WaitFactory(orch.ssh_factory, silent={"mu2e-cfo-01.fnal.gov"})
+    orch.ssh_factory.base.expect_first(
+        r"chassis power status", off_for("mu2e-trk-01-ipmi.fnal.gov"))
+    start = clock()
+    result = phase2_poweron.run(orch, plan=plan(orch, ["mu2e-trk-01"]))
+
+    assert clock() - start >= 600                     # it was given the wait
+    assert power_on_targets(orch) == []
+    assert result.data["blocked_at"] == "cfo"
+    assert result.data["timed_out"] is False
+    assert result.status is Status.FAIL
+    cfo = {s["name"]: s for s in result.data["stages"]}["cfo"]
+    assert cfo["timed_out"] is False and cfo["not_reached"] == []
+    assert "did not answer ssh" in " ".join(result.notes)
+    assert not any("Resume with --from" in n for n in result.notes)
+
+
+def test_a_target_silent_through_its_full_boot_wait_still_fails(orch, clock):
+    arm(orch)
+    orch.settings.set("run.phase_timeout", 100_000)
+    orch.ssh_factory = WaitFactory(orch.ssh_factory, silent={"mu2e-trk-01.fnal.gov"})
+    orch.ssh_factory.base.expect_first(
+        r"chassis power status", off_for("mu2e-trk-01-ipmi.fnal.gov"))
+    result = phase2_poweron.run(orch, plan=plan(orch, ["mu2e-trk-01"]))
+
+    readout = {s["name"]: s for s in result.data["stages"]}["readout"]
+    assert readout["status"] == "fail" and readout["timed_out"] is False
+    assert "1 never answered ssh" in readout["summary"]
+    assert result.data["timed_out"] is False
+    assert result.data["aborted_at"] == "readout"
+    assert result.status is Status.FAIL

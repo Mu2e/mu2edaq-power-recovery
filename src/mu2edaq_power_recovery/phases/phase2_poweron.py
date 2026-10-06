@@ -31,7 +31,12 @@ checked before every stage and every node's power command, and it caps every
 ssh call's timeout (see :meth:`Orchestrator.budget`).  Each stage's boot wait
 runs concurrently under one stage deadline, ``now + min(boot_timeout, phase
 time left)``.  Stages and nodes the budget never reached are UNKNOWN with
-``TIMEOUT_SUMMARY``.
+``TIMEOUT_SUMMARY``.  So are nodes the budget cut off inside a stage -- a
+power-state read or a boot wait that ran out of phase time, not of the node's
+own boot_timeout: "we could not look" is never reported as "it is down"
+(PR #30 review).  A stage the budget stopped short of its ``require:`` is
+``timed_out``; the run stops there, powers nothing later, and says
+``Resume with --from <stage>``.
 
 Nothing here issues a power command directly: every one goes through
 :meth:`IPMIClient.ensure_on`, which enforces the protected-host list and the
@@ -392,6 +397,24 @@ def _record(orch: Orchestrator, node: Node, outcome: Dict[str, Any],
                              outcome["action"], dry_run, outcome.get("detail", ""))
 
 
+def _cut_by_budget(orch: Orchestrator, ipmi: Any, bmc_host: Optional[str]) -> bool:
+    """Whether an UNREACHABLE read of *bmc_host* is the phase budget's doing.
+
+    True only when the budget has expired *and* the call to the gateway ended
+    in a timeout (``unreachable_reason == "timeout"``): the BMC was never
+    asked.  A BMC that answered nothing before the budget ran out stays
+    UNREACHABLE.
+    """
+    reasons = getattr(ipmi, "unreachable_reason", None) or {}
+    return orch.budget_expired() and reasons.get(bmc_host) == "timeout"
+
+
+def _not_run(before: Optional[str] = None) -> Dict[str, Any]:
+    """The outcome of a node the phase budget stopped before it was looked at."""
+    return {"action": "not_run", "ok": False, "before": before, "after": before,
+            "detail": TIMEOUT_SUMMARY}
+
+
 def _power_stage(orch: Orchestrator, nodes: Sequence[Node],
                  stage: Dict[str, Any],
                  allowed: Optional[FrozenSet[str]] = None,
@@ -462,6 +485,11 @@ def _power_stage(orch: Orchestrator, nodes: Sequence[Node],
             outcome = {"action": "failed", "ok": False,
                        "detail": f"IPMI error: {exc}"}
             log.error("%s: %s", node.hostname, outcome["detail"])
+        if outcome.get("action") == "unreachable" and \
+                _cut_by_budget(orch, ipmi, node.ipmi_host):
+            # The status read was cut short by run.phase_timeout, so nothing
+            # was sent and nothing was learned: not "BMC did not answer".
+            outcome = _not_run()
         outcomes[node.hostname] = outcome
         _record(orch, node, outcome, dry_run)
         log.info("%s: %s (%s)", node.short, outcome["action"], outcome["detail"])
@@ -473,14 +501,22 @@ def _verify_power(orch: Orchestrator, nodes: Sequence[Node]
     """A predecessor's power state, read and never changed.
 
     Only ``chassis power status`` is sent.  A node that is off is marked
-    ``predecessor_off``, which blocks the target stage.
+    ``predecessor_off``, which blocks the target stage.  A node the phase
+    budget left unread -- expired before the read, or cut it short -- is
+    ``not_run``: UNKNOWN, never a blocking failure.
     """
     outcomes: Dict[str, Dict[str, Any]] = {}
     for node in nodes:
+        if orch.budget_expired():
+            outcomes[node.hostname] = _not_run()
+            continue
         ipmi = orch.ipmi_for(node)
         state = None
-        if ipmi is not None and node.ipmi_host and not orch.budget_expired():
+        if ipmi is not None and node.ipmi_host:
             state = ipmi.power_status(node.ipmi_host).value
+            if state == "unreachable" and _cut_by_budget(orch, ipmi, node.ipmi_host):
+                outcomes[node.hostname] = _not_run()
+                continue
         if state == "off":
             outcomes[node.hostname] = {
                 "action": "predecessor_off", "ok": False, "before": state,
@@ -500,7 +536,8 @@ _NO_WAIT = ("dry_run", "predecessor_off", "out_of_scope", "not_run")
 def _wait_for_nodes(orch: Orchestrator, nodes: Sequence[Node],
                     stage: Dict[str, Any], defaults: Dict[str, Any],
                     powered: Dict[str, Dict[str, Any]],
-                    deadline: Optional[Deadline] = None) -> Dict[str, bool]:
+                    deadline: Optional[Deadline] = None,
+                    cut_off: Optional[set] = None) -> Dict[str, bool]:
     """Wait, concurrently, for the stage's nodes to answer SSH.
 
     Every node is waited for at once under one stage deadline, ``now +
@@ -514,6 +551,11 @@ def _wait_for_nodes(orch: Orchestrator, nodes: Sequence[Node],
 
     A node already on gets one quick probe; one that was just switched on, or
     whose state is uncertain, is polled until the deadline.
+
+    Hostnames that did not answer only because the *phase* budget ran out --
+    the stage deadline was shorter than boot_timeout because of it, or the
+    quick probe ran after it expired -- are added to *cut_off*.  A node that
+    stayed silent for its full boot wait is not: that one was looked at.
     """
     budget = float(stage.get("boot_timeout", defaults.get("boot_timeout", 600)))
     delay = float(orch.settings.get("ipmi.power_on_delay", 20))
@@ -526,6 +568,9 @@ def _wait_for_nodes(orch: Orchestrator, nodes: Sequence[Node],
         log.info("waiting %.0fs for the BMCs to release power", pause)
         orch.sleep(pause)
 
+    # The phase, not boot_timeout, sets this stage's end: a node still silent
+    # when it expires was not given its boot wait.
+    capped = phase.remaining() < budget
     stage_deadline = phase.child(budget)
     jobs: List[Any] = []
     for node in nodes:
@@ -571,6 +616,10 @@ def _wait_for_nodes(orch: Orchestrator, nodes: Sequence[Node],
             except Exception as exc:  # noqa: BLE001 - one node must not sink the stage
                 log.warning("waiting for %s failed: %s", node.short, exc)
                 answered[node.hostname] = False
+    if cut_off is not None and phase.expired():
+        for node, action in jobs:
+            if not answered.get(node.hostname) and (capped or action == "none"):
+                cut_off.add(node.hostname)
     return answered
 
 
@@ -640,7 +689,9 @@ def run_stage(orch: Orchestrator, stage: Any, defaults: Dict[str, Any],
         powered = _power_stage(orch, nodes, raw,
                                plan.allowed_power if plan is not None else None,
                                defaults)
-    answered = _wait_for_nodes(orch, nodes, raw, defaults, powered, deadline)
+    cut_off: set = set()
+    answered = _wait_for_nodes(orch, nodes, raw, defaults, powered, deadline,
+                               cut_off=cut_off)
 
     # Settle only if something actually booted -- there is no reason to wait 30
     # seconds for a stage whose nodes were all already running.
@@ -661,11 +712,19 @@ def run_stage(orch: Orchestrator, stage: Any, defaults: Dict[str, Any],
     for a in assessments:
         a.power_action = powered.get(a.node.hostname)
 
+    # Nodes the phase budget stopped before they were looked at: not read,
+    # not waited for, or not checked. UNKNOWN, never "not up".
+    stopped = set(cut_off)
+    stopped.update(h for h, v in powered.items() if v.get("action") == "not_run")
+    stopped.update(a.node.hostname for a in assessments if a.timed_out)
+
     blocked: Dict[str, str] = {}
     if verify_only:
         for node in nodes:
             if powered[node.hostname]["action"] == "predecessor_off":
                 blocked[node.hostname] = f"{node.short} is off"
+            elif node.hostname in stopped:
+                continue
             elif not answered.get(node.hostname, True):
                 blocked[node.hostname] = (f"{node.short} did not answer ssh "
                                           f"within the stage's boot wait")
@@ -680,23 +739,24 @@ def run_stage(orch: Orchestrator, stage: Any, defaults: Dict[str, Any],
                f" (require: {requirement})")
     if verify_only:
         summary += "; predecessor, verify only"
-    no_ssh = [h for h, ok in answered.items() if not ok]
+    no_ssh = [h for h, ok in answered.items() if not ok and h not in stopped]
     if no_ssh:
         summary += f"; {len(no_ssh)} never answered ssh"
     if blocked:
         summary += f"; {len(blocked)} not up"
-    timed_out = [a.node.hostname for a in assessments if a.timed_out]
-    if timed_out:
-        summary += f"; {len(timed_out)} not fully checked (phase_timeout)"
+    if stopped:
+        summary += f"; {len(stopped)} not fully checked ({TIMEOUT_SUMMARY})"
+    timed_out = bool(stopped) and not met
 
     orch.record(assessments)
-    orch.store.record_event(
-        f"stage '{name}' {'passed' if met else 'FAILED'}: {summary}",
-        level="info" if met else "error")
+    verdict = "passed" if met else ("TIMED OUT" if timed_out else "FAILED")
+    orch.store.record_event(f"stage '{name}' {verdict}: {summary}",
+                            level="info" if met else "error")
 
     return StageOutcome(
         **base, status=status.value, summary=summary,
-        require=requirement, met=met,
+        require=requirement, met=met, timed_out=timed_out,
+        not_reached=sorted(stopped),
         nodes=[n.hostname for n in nodes],
         power={h: v for h, v in powered.items()},
         answered=answered,
@@ -754,60 +814,76 @@ def run(orch: Orchestrator, progress: Optional[Any] = None,
     timed_out = False
     deadline = phase_deadline(orch)
 
+    def note(text: str) -> None:
+        result.notes.append(text)
+        log.error(text)
+        orch.store.record_event(text, level="error")
+
+    def never_reached(rest: Sequence[PlannedStage]) -> None:
+        for later in rest:
+            if later.role == ROLE_OUT_OF_SCOPE:
+                continue
+            skipped = _timed_out_stage(orch, later)
+            outcomes.append(skipped)
+            result.assessments.extend(skipped["assessments"])
+
     with orch.budget(deadline):
         for index, planned in enumerate(plan.stages):
             if deadline.expired():
                 timed_out = True
-                for rest in plan.stages[index:]:
-                    if rest.role == ROLE_OUT_OF_SCOPE:
-                        continue
-                    outcome = _timed_out_stage(orch, rest)
-                    outcomes.append(outcome)
-                    result.assessments.extend(outcome["assessments"])
-                note = (f"run.phase_timeout ({deadline.budget:.0f}s) expired before "
-                        f"stage '{planned.name}'; it and every later stage are "
-                        f"UNKNOWN ({TIMEOUT_SUMMARY}). Resume with --from "
-                        f"{planned.name}.")
-                result.notes.append(note)
-                log.error(note)
-                orch.store.record_event(note, level="error")
+                never_reached(plan.stages[index:])
+                note(f"run.phase_timeout ({deadline.budget:.0f}s) expired before "
+                     f"stage '{planned.name}'; it and every later stage are "
+                     f"UNKNOWN ({TIMEOUT_SUMMARY}). Resume with --from "
+                     f"{planned.name}.")
                 break
 
             outcome = run_stage(orch, planned, defaults, progress=progress,
                                 plan=plan, deadline=deadline)
             outcomes.append(outcome)
             result.assessments.extend(outcome.get("assessments", []))
-            if planned.role == ROLE_PREDECESSOR and not outcome["met"]:
+            if outcome.get("timed_out"):
+                # The budget, not the nodes, kept this stage from its
+                # require:. Stop whatever --continue-on-error says: later
+                # stages would get no time either, and nothing after an
+                # unverified stage may be powered.
+                timed_out = True
+                never_reached(plan.stages[index + 1:])
+                note(f"run.phase_timeout ({deadline.budget:.0f}s) expired during "
+                     f"stage '{planned.name}'; {len(outcome['not_reached'])} of "
+                     f"its node(s) and every later stage are UNKNOWN "
+                     f"({TIMEOUT_SUMMARY}), and nothing after it was powered. "
+                     f"Resume with --from {planned.name}.")
+            if planned.role == ROLE_PREDECESSOR and not outcome["met"] and \
+                    (outcome.get("blocked") or not outcome.get("timed_out")):
                 # Always stop, --continue-on-error or not: powering the
                 # requested nodes with a dependency down is what a scoped run
                 # must not do, and the predecessor was deliberately not
-                # powered, so only the operator can fix it.
+                # powered, so only the operator can fix it.  Only for a
+                # dependency seen to be down: one the budget left unread is
+                # the timeout above, not a FAIL.
                 blocked_at = aborted_at = outcome["name"]
                 target = next((p.name for p in plan.stages
                                if p.role == ROLE_TARGET), "the requested stage")
                 problems = "; ".join(outcome.get("blocked", {}).values()) or \
                     outcome["summary"]
-                result.notes.append(
-                    f"stopped before '{target}': predecessor stage "
-                    f"'{outcome['name']}' is not up ({problems}). It was only "
-                    f"verified -- a --node run never powers a predecessor -- so "
-                    f"nothing in '{target}' was switched on. Bring it up by "
-                    f"running that stage explicitly, e.g. mu2e-power-on "
-                    f"--execute --from {outcome['name']} --until "
-                    f"{outcome['name']}, then re-run this command.")
-                log.error(result.notes[-1])
-                orch.store.record_event(result.notes[-1], level="error")
+                note(f"stopped before '{target}': predecessor stage "
+                     f"'{outcome['name']}' is not up ({problems}). It was only "
+                     f"verified -- a --node run never powers a predecessor -- so "
+                     f"nothing in '{target}' was switched on. Bring it up by "
+                     f"running that stage explicitly, e.g. mu2e-power-on "
+                     f"--execute --from {outcome['name']} --until "
+                     f"{outcome['name']}, then re-run this command.")
+                break
+            if timed_out:
                 break
             if not outcome["met"] and stop_on_failure:
                 aborted_at = outcome["name"]
-                result.notes.append(
-                    f"sequence stopped after stage '{outcome['name']}' did not meet "
-                    f"its '{outcome['require']}' requirement. Later stages depend on "
-                    f"it, so continuing would produce failures that say nothing new. "
-                    f"Fix and re-run with --from {outcome['name']}, or use "
-                    f"--continue-on-error.")
-                log.error(result.notes[-1])
-                orch.store.record_event(result.notes[-1], level="error")
+                note(f"sequence stopped after stage '{outcome['name']}' did not meet "
+                     f"its '{outcome['require']}' requirement. Later stages depend on "
+                     f"it, so continuing would produce failures that say nothing new. "
+                     f"Fix and re-run with --from {outcome['name']}, or use "
+                     f"--continue-on-error.")
                 break
 
     result.status = overall_status(result.assessments)

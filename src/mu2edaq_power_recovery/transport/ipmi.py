@@ -65,7 +65,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
-from .base import CommandResult, Transport, TransportError, deadline_exempt
+from .base import (CommandResult, TimeoutExpired, Transport, TransportError,
+                   deadline_exempt)
 
 log = logging.getLogger(__name__)
 
@@ -266,7 +267,9 @@ class IPMIClient:
         self.reachability_precheck = reachability_precheck
         #: bmc -> why power_status() found it UNREACHABLE: "unresolved" (no
         #: DNS on the gateway), "no_session" (answers ping, no IPMI session),
-        #: "dark" (answers nothing) or "gateway" (the gateway itself failed).
+        #: "dark" (answers nothing), "gateway" (the gateway itself failed) or
+        #: "timeout" (the call to the gateway ran out of time, e.g. capped by
+        #: run.phase_timeout: the BMC was never asked).
         self.unreachable_reason: Dict[str, str] = {}
 
     @property
@@ -571,8 +574,13 @@ class IPMIClient:
         except IPMIUnreachable:
             self.unreachable_reason[bmc_host] = "dark"
             return PowerState.UNREACHABLE
-        except IPMIError:
-            self.unreachable_reason[bmc_host] = "gateway"
+        except IPMIError as exc:
+            # "timeout": the ssh call to the gateway ran out of time -- most
+            # often because run.phase_timeout capped it -- so the BMC was not
+            # asked, rather than asked and silent. Phase 2 uses this to keep a
+            # budget cut-off UNKNOWN instead of "BMC did not answer".
+            self.unreachable_reason[bmc_host] = (
+                "timeout" if isinstance(exc.__cause__, TimeoutExpired) else "gateway")
             return PowerState.UNREACHABLE
         if not result.ok:
             if result.meta.get("credentials_refused"):
