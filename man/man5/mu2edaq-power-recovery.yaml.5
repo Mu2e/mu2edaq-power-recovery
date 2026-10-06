@@ -102,30 +102,45 @@ that pattern will appear in the report and in the logbook entry.
 .SS run
 .TP
 .I label
-Label for the recovery, shown in the report and the logbook subject.
+Label for the recovery, shown in the report and the logbook subject. It is also
+the value the
+.B MU2E_POWER_RECOVERY_ARM
+token must equal to arm an unattended live run (see
+.IR dry_run ).
 .TP
 .I dry_run
 Default
 .BR true .
-While true, no power command is issued.
-.B \-\-execute
-sets it false \(em but it is
-.I not
-a second, independent gate. This is an ordinary configuration key, so setting it
-false here, in
+Setting it
+.B false
+here, in
 .IR config/.env ,
 or as
 .B MU2E_POWER_RECOVERY_RUN_DRY_RUN=false
-arms the destructive path on its own, with no flag on the command line. Nothing
-re-checks that
+does
+.I not
+arm a live run. It only
+.I permits
+the token path: a run is live when the invocation passes
+.BR \-\-execute ,
+or when the process environment carries
+.BI MU2E_POWER_RECOVERY_ARM= label
+equal to a non-empty
+.IR run.label .
+With this key false and neither of those, the run exits 2 and says both ways to
+authorise. A token given while this key is true, with no label, or with the
+wrong label, also exits 2.
 .B \-\-execute
-was given. The run prints
-.B "LIVE RUN \-\- power commands WILL be issued."
-when it is armed.
+works whatever this key says. The token is never a configuration key and is a
+configuration error in
+.IR config/.env .
+The run prints
+.B "LIVE RUN \-\- power commands WILL be issued (authorised by ...)"
+when it is armed, and records what armed it.
 .IP
 .B \-\-simulate
-is the gate no configuration file can open: it forces this key back to true
-whatever else was asked for, including
+is the gate nothing can open: it forces this key back to true whatever else was
+asked for, including
 .B \-\-execute
 on the same command line.
 .TP
@@ -135,17 +150,24 @@ Default
 Stop phase 2 at the first stage that does not meet its requirement.
 .TP
 .I phase_timeout
-Intended wall-clock budget for one phase, in seconds; 0 disables.
-.B Not currently enforced:
-the value is read from the file and carried in the run record, but no phase
-consults it. The effective bounds on a run are the per-command ones,
-.I ssh.command_timeout
-and
-.IR ipmi.timeout .
+Wall-clock budget for each of phases 1, 2 and 3, in seconds; 0 or null
+disables. Default 7200. Enforced on a monotonic clock: it is checked before
+every phase-2 stage, before each node's power command and before every node and
+check the orchestrator runs, and every ssh call's timeout (checks, IPMI through
+a gateway, mesh probes) is capped at the time left. A phase-2 stage's boot wait
+ends at now +
+.RI min( boot_timeout ", time left)."
+The phase therefore overruns by at most the one call in flight when the budget
+expires. Everything it never reached is recorded UNKNOWN,
+.IR "not run: phase_timeout expired" ,
+distinct from a failed check and from an unreachable node. Phase 4 probes
+nothing and is not bounded.
 .TP
 .IR from_stage ", " until_stage
 Default stage range for phase 2; normally set with
 .BR \-\-from / \-\-until .
+A name that is not a stage of the sequence, or a reversed range, exits 2 before
+any credential is acquired, listing the valid names.
 .SS topology
 .TP
 .IR file ", " sequence_file ", " checks_file

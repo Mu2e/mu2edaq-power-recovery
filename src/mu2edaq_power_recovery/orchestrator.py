@@ -10,11 +10,11 @@ from __future__ import annotations
 
 import logging
 import time
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence
 
 import yaml
 
@@ -31,6 +31,12 @@ from .version import VersionInfo, collect as collect_version
 
 log = logging.getLogger(__name__)
 
+#: The summary given to every node, check, stage or path a phase never reached
+#: because ``run.phase_timeout`` ran out. UNKNOWN, never FAIL: nothing was
+#: looked at, and "the budget ran out" needs a different response from both
+#: "it is broken" and "it did not answer". Re-exported by phases/base.py.
+TIMEOUT_SUMMARY = "not run: phase_timeout expired"
+
 
 @dataclass
 class NodeAssessment:
@@ -45,6 +51,9 @@ class NodeAssessment:
     #: Set when neither ICMP nor SSH got an answer, so the remaining checks
     #: were never run.
     unreachable: bool = False
+    #: Set when run.phase_timeout expired before every check had run; the
+    #: checks not reached are UNKNOWN with TIMEOUT_SUMMARY.
+    timed_out: bool = False
 
     @property
     def status(self) -> Status:
@@ -76,6 +85,9 @@ class NodeAssessment:
     def summary(self) -> str:
         if not self.results:
             return "no checks ran"
+        if self.timed_out and all(r.summary == TIMEOUT_SUMMARY
+                                  for r in self.results):
+            return TIMEOUT_SUMMARY
         if self.unreachable:
             return ("did not answer ICMP or SSH; its remaining checks were "
                     "not run")
@@ -101,6 +113,7 @@ class NodeAssessment:
             "power_state": self.power_state,
             "power_action": self.power_action,
             "unreachable": self.unreachable,
+            "timed_out": self.timed_out,
             "duration": round(self.duration, 2),
             "results": [r.as_dict() for r in self.results],
         }
@@ -116,6 +129,8 @@ class SimulatedSSHFactory:
 
     def __init__(self, topology: Topology, rules: Optional[Sequence] = None):
         self.topology = topology
+        #: Mirrors SSHFactory.deadline; scripted transports ignore it.
+        self.deadline: Any = None
         self.base = FakeTransport("simulated")
         for pattern, response in (rules if rules is not None else healthy_node_rules()):
             self.base.expect(pattern, response)
@@ -136,9 +151,15 @@ class SimulatedSSHFactory:
 class Orchestrator:
     """Shared run state and the check-execution engine."""
 
-    def __init__(self, settings: Any, simulate: bool = False):
+    def __init__(self, settings: Any, simulate: bool = False,
+                 clock: Optional[Callable[[], float]] = None,
+                 sleep: Optional[Callable[[float], None]] = None):
         self.settings = settings
         self.simulate = simulate
+        #: Injectable so a test can drive phase timeouts and boot waits on a
+        #: fake clock whose sleep advances it, rather than sleeping for real.
+        self.clock: Callable[[], float] = clock or time.monotonic
+        self.sleep: Callable[[float], None] = sleep or time.sleep
         self.topology = Topology.load(settings.config_path("topology.file"))
         self.checks_config = self._load_yaml(settings.config_path("topology.checks_file"))
         self.sequence_config = self._load_yaml(
@@ -154,7 +175,17 @@ class Orchestrator:
         ])
         self.kerberos: Optional[KerberosManager] = None
         self.vault: Optional[VaultCredentials] = None
+        #: The first location's client, kept for callers that want "the" IPMI
+        #: client (phase 1's readiness summary reads the shared breaker
+        #: through it). Per-node work goes through :meth:`ipmi_for`.
         self.ipmi: Optional[IPMIClient] = None
+        #: location -> IPMI client running ipmitool on a gateway of *that*
+        #: location. A BMC is never driven through another site's gateway.
+        self.ipmi_clients: Dict[str, IPMIClient] = {}
+        #: The running phase's run.phase_timeout Deadline (None between
+        #: phases). Every ssh transport the factory builds caps its per-call
+        #: timeout at the time this has left; see :meth:`budget`.
+        self._deadline: Any = None
         #: One BMC account serves every BMC, so one breaker serves every IPMI
         #: client this run builds, whichever gateway it runs ipmitool on.
         self.ipmi_breaker = CredentialBreaker()
@@ -192,6 +223,39 @@ class Orchestrator:
             return self.topology.resolve(names, self.locations)
         return self.topology.all_nodes(self.locations)
 
+    # -- time budget -------------------------------------------------------
+
+    @property
+    def deadline(self) -> Any:
+        return self._deadline
+
+    @deadline.setter
+    def deadline(self, value: Any) -> None:
+        self._deadline = value
+        if self.ssh_factory is not None and hasattr(self.ssh_factory, "deadline"):
+            self.ssh_factory.deadline = value
+
+    @contextmanager
+    def budget(self, deadline: Any) -> Iterator[Any]:
+        """Make *deadline* the running phase's budget for the ``with`` block.
+
+        While it is set, :meth:`assess_nodes` starts no node and
+        :meth:`assess_node` runs no check once it has expired, and every ssh
+        call (checks, IPMI through a gateway, mesh probes) has its timeout
+        capped at the time remaining. So a phase overruns its budget by at
+        most the one call in flight when the budget expires -- and that call
+        was itself capped at what was left when it started.
+        """
+        previous = self._deadline
+        self.deadline = deadline
+        try:
+            yield deadline
+        finally:
+            self.deadline = previous
+
+    def budget_expired(self) -> bool:
+        return self._deadline is not None and self._deadline.expired()
+
     # -- credentials -------------------------------------------------------
 
     def prepare_credentials(self) -> Dict[str, Any]:
@@ -222,11 +286,17 @@ class Orchestrator:
             # phase-2 power path, which are the parts most worth rehearsing.
             # dry_run is forced on, so even the simulated client refuses to
             # pretend it switched anything.
-            self.ipmi = IPMIClient(
-                gateway=self.ssh_factory.for_host("simulated-gateway"),
-                username="simulated", password="simulated",
-                dry_run=True, protected=self.topology.is_protected,
-                breaker=self.ipmi_breaker)
+            # One per location, like a real run, all on the shared breaker.
+            for location in self.locations:
+                gateway = self.ssh_factory.gateway_for(location)
+                if not gateway:
+                    continue
+                self.ipmi_clients[location] = IPMIClient(
+                    gateway=self.ssh_factory.for_host(gateway, direct=True),
+                    username="simulated", password="simulated",
+                    dry_run=True, protected=self.topology.is_protected,
+                    breaker=self.ipmi_breaker)
+            self.ipmi = next(iter(self.ipmi_clients.values()), None)
             info["notes"].append("simulated run: no credentials acquired, no "
                                  "host contacted; all command output is scripted")
             self.notes.extend(info["notes"])
@@ -277,7 +347,8 @@ class Orchestrator:
         try:
             creds = self.vault.ipmi()
             info["ipmi"] = creds.redacted()
-            self.ipmi = self._make_ipmi_client(creds)
+            self.ipmi_clients = self._make_ipmi_clients(creds)
+            self.ipmi = next(iter(self.ipmi_clients.values()), None)
         except VaultError as exc:
             info["notes"].append(f"IPMI unavailable: {exc}")
             log.warning("IPMI credentials unavailable: %s", exc)
@@ -285,20 +356,35 @@ class Orchestrator:
         self.notes.extend(info["notes"])
         return info
 
-    def _make_ipmi_client(self, creds: Any) -> Optional[IPMIClient]:
-        """Build an IPMI client that runs ipmitool on a responsive gateway."""
-        gateway_host = None
+    def _make_ipmi_clients(self, creds: Any) -> Dict[str, IPMIClient]:
+        """One IPMI client per location, each on a gateway of that location.
+
+        The IPMI subnets are per site and not routable between them, so a BMC
+        must be driven from its own location's gateway; one client for the
+        whole run (the first gateway that answered anywhere) would send a
+        teststand BMC's commands through MC-2. Every client shares the run's
+        one :class:`CredentialBreaker` -- one BMC account serves every BMC --
+        and keeps the protected-host refusal.
+        """
+        clients: Dict[str, IPMIClient] = {}
         for location in self.locations:
             gateway_host = self.ssh_factory.gateway_for(location)
-            if gateway_host:
-                break
-        if not gateway_host:
-            log.error("no gateway is reachable; IPMI commands cannot be issued")
-            self.notes.append("no gateway reachable -- IPMI is unavailable, so "
-                              "power state cannot be read or changed")
-            return None
+            if not gateway_host:
+                log.error("no gateway is reachable for %s; its BMCs cannot be "
+                          "driven", location)
+                self.notes.append(
+                    f"no gateway reachable for {location} -- IPMI is "
+                    f"unavailable there, so its power state cannot be read "
+                    f"or changed")
+                continue
+            clients[location] = self._make_ipmi_client(creds, gateway_host)
+            log.info("IPMI commands for %s will be issued from %s",
+                     location, gateway_host)
+        return clients
+
+    def _make_ipmi_client(self, creds: Any, gateway_host: str) -> IPMIClient:
+        """An IPMI client that runs ipmitool on *gateway_host*."""
         gateway = self.ssh_factory.for_host(gateway_host, direct=True)
-        log.info("IPMI commands will be issued from %s", gateway_host)
         return IPMIClient(
             gateway=gateway,
             username=self.settings.get("ipmi.username") or creds.username,
@@ -320,6 +406,15 @@ class Orchestrator:
             reachability_precheck=bool(
                 self.settings.get("ipmi.reachability_precheck", True)),
         )
+
+    def ipmi_for(self, node: Node) -> Optional[IPMIClient]:
+        """The IPMI client for *node*'s location, or None.
+
+        None when that location has no reachable gateway, or when the node is
+        not in the inventory (location 'unknown'): there is no gateway of its
+        own to drive it from, and borrowing another site's would be wrong.
+        """
+        return self.ipmi_clients.get(node.location)
 
     def surface_credential_failure(self, notes: Optional[List[str]] = None
                                    ) -> Optional[str]:
@@ -357,7 +452,7 @@ class Orchestrator:
             settings=self.settings,
             topology=self.topology,
             ssh_factory=self.ssh_factory,
-            ipmi=self.ipmi,
+            ipmi=self.ipmi_for(node),
             checks_config=self.checks_config,
             local=self.local,
             baseline=merged,
@@ -392,6 +487,14 @@ class Orchestrator:
         #: question and learn nothing new, so they are UNKNOWN without a call.
         bmc_unread: Optional[CheckResult] = None
         for check_id in ids:
+            if self.budget_expired():
+                assessment.timed_out = True
+                assessment.results.append(CheckResult(
+                    node=node.hostname, check_id=check_id, status=Status.UNKNOWN,
+                    summary=TIMEOUT_SUMMARY,
+                    detail="run.phase_timeout ran out before this check was "
+                           "reached; nothing was looked at"))
+                continue
             if bmc_unread is not None and check_id in ("power.sensors",
                                                        "power.sel"):
                 state = bmc_unread.data.get("state")

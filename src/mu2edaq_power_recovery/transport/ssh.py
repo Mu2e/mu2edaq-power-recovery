@@ -146,7 +146,8 @@ class SSHTransport(Transport):
                  local: Optional[LocalTransport] = None,
                  credentials: Optional[Sequence[Any]] = None,
                  on_success: Optional[Callable[[Any], None]] = None,
-                 max_capture: int = 65536):
+                 max_capture: int = 65536,
+                 deadline_source: Optional[Callable[[], Any]] = None):
         self.host = host
         self.user = user
         self.jump = jump
@@ -168,6 +169,10 @@ class SSHTransport(Transport):
         self._runners: Dict[str, LocalTransport] = {}
         #: What each credential was tried and rejected for, for the report.
         self.attempts: List[Dict[str, Any]] = []
+        #: Returns the running phase's Deadline (or None). Every call's
+        #: timeout is capped at what it has left, so no single ssh call can
+        #: carry a phase far past run.phase_timeout.
+        self.deadline_source = deadline_source
 
     # -- command construction ---------------------------------------------
 
@@ -224,6 +229,21 @@ class SSHTransport(Transport):
 
     # -- execution ---------------------------------------------------------
 
+    def _capped(self, timeout: Optional[float]) -> float:
+        """*timeout* (or command_timeout) capped at the phase budget left.
+
+        Raises TimeoutExpired, without starting ssh, when the budget is
+        already spent.
+        """
+        wanted = float(timeout or self.command_timeout)
+        deadline = self.deadline_source() if self.deadline_source else None
+        if deadline is None:
+            return wanted
+        if deadline.expired():
+            raise TimeoutExpired(f"{self.host}: run.phase_timeout expired; "
+                                 f"command not started")
+        return max(1.0, min(wanted, deadline.remaining()))
+
     def _run_once(self, command: Command, timeout: Optional[float],
                   user: Optional[str], input_text: Optional[str],
                   credential: Optional[Any]) -> CommandResult:
@@ -232,7 +252,7 @@ class SSHTransport(Transport):
         started = time.monotonic()
         try:
             result = self._runner(credential).run(
-                argv, timeout=timeout or self.command_timeout,
+                argv, timeout=self._capped(timeout),
                 input_text=input_text)
         except TimeoutExpired as exc:
             raise TimeoutExpired(f"{self.host}: {exc}") from exc
@@ -326,28 +346,55 @@ class SSHTransport(Transport):
             return False
 
     def wait_for_ssh(self, budget: float, interval: float = 15.0,
-                     user: Optional[str] = None) -> bool:
-        """Poll until the host answers SSH or *budget* seconds elapse.
+                     user: Optional[str] = None, deadline: Any = None,
+                     clock: Optional[Callable[[], float]] = None,
+                     sleep: Optional[Callable[[float], None]] = None,
+                     gate: Any = None) -> bool:
+        """Poll until the host answers SSH, *budget* runs out, or *deadline*.
 
         Used after an IPMI power-on.  Returns True as soon as a session opens;
         the caller is responsible for the post-boot settle wait, because
         "sshd is listening" is earlier than "the machine has finished booting".
+
+        *deadline* is a shared stage deadline (anything with ``expires_at``):
+        phase 2 waits for a whole stage's nodes concurrently under one, so N
+        nodes that never answer cost one boot_timeout, not N. The wait ends
+        at whichever of ``now + budget`` and ``deadline.expires_at`` comes
+        first. Each attempt's timeout is capped at the time left, so the wait
+        overruns by at most the capped attempt in flight. *clock* and *sleep*
+        default to ``time.monotonic`` / ``time.sleep``; tests pass a fake pair.
+
+        *gate*, when given, is a context manager held around each attempt
+        (phase 2 passes a semaphore of ``ssh.max_sessions``), so many nodes
+        can be waited for at once while only that many ssh sessions exist;
+        the sleeps between attempts hold nothing.
         """
-        deadline = time.monotonic() + budget
+        clock = clock or time.monotonic
+        sleep = sleep or time.sleep
+        end = clock() + float(budget)
+        if deadline is not None:
+            end = min(end, float(deadline.expires_at))
         attempt = 0
-        while time.monotonic() < deadline:
+        while clock() < end:
             attempt += 1
+            per_try = min(float(self.connect_timeout + 5), max(1.0, end - clock()))
             try:
-                if self.run("true", timeout=self.connect_timeout + 5, user=user).ok:
+                if gate is not None:
+                    with gate:
+                        ok = self.run("true", timeout=per_try, user=user).ok
+                else:
+                    ok = self.run("true", timeout=per_try, user=user).ok
+                if ok:
                     log.info("%s answered ssh after %d attempt(s)", self.host, attempt)
                     return True
             except TransportError:
                 pass
-            remaining = deadline - time.monotonic()
+            remaining = end - clock()
             if remaining <= 0:
                 break
-            time.sleep(min(interval, remaining))
-        log.warning("%s did not answer ssh within %.0fs", self.host, budget)
+            sleep(min(interval, remaining))
+        log.warning("%s did not answer ssh within %.0fs (%d attempt(s))",
+                    self.host, budget, attempt)
         return False
 
 
@@ -385,6 +432,10 @@ class SSHFactory:
         #: host -> the credential that worked there, so a transport rebuilt for
         #: the same node does not repeat the search.
         self._working: Dict[str, Any] = {}
+        #: The running phase's Deadline, set by Orchestrator.budget(). Read
+        #: at call time by every transport built here, including the IPMI
+        #: gateway transports built before the phase started.
+        self.deadline: Any = None
 
     # -- gateway selection -------------------------------------------------
 
@@ -506,6 +557,7 @@ class SSHFactory:
             max_capture=self.settings.get("logging.max_capture_bytes", 65536),
             credentials=chain,
             on_success=lambda credential: self._note_success(host, credential),
+            deadline_source=lambda: self.deadline,
         )
 
     def for_node(self, node: Any, user: Optional[str] = None,

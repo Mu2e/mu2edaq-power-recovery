@@ -188,6 +188,13 @@ expect, stop and find out why.
 mu2e-power-on --execute --label "Sept 2026 outage"
 ```
 
+`--execute` is this invocation's authorisation; nothing else on the command
+line or in the configuration arms a run by itself. An unattended run that
+cannot pass the flag sets `run.dry_run: false` and `run.label: <label>` in its
+configuration and `MU2E_POWER_RECOVERY_ARM=<label>` in its own environment
+(never in `config/.env`, which is refused). `run.dry_run: false` with neither
+exits 2 with instructions.
+
 It will work through the stages in order and stop at the first one that does
 not meet its requirement.
 
@@ -204,14 +211,50 @@ mu2e-power-state --node mu2e-mgr-01 -v
 mu2e-power-on --execute --from manager
 ```
 
-**Spell the stage name right, and check the stage list it prints before you
-walk away.** An unmatched `--from` or `--until` is silently ignored, not
-rejected: `--from manger` does not error, it starts from the *first* stage and
-powers on the whole sequence, readout included. The stage names are the `name:`
-keys in `config/power-sequence.yaml` — `gateways`, `manager`, `dataloggers`,
-`dcs`, `cfo`, `readout`. A dry run (`mu2e-power-on --from <stage>`, no `--execute`)
-lists the stages it would act on, which is the cheap way to confirm the name
-took.
+Stage names are the `name:` keys in `config/power-sequence.yaml` —
+`gateways`, `manager`, `dataloggers`, `dcs`, `cfo`, `readout`. A misspelt
+`--from`/`--until` (or `run.from_stage`/`run.until_stage`), or a reversed range,
+exits 2 before any password prompt, listing the valid names; nothing is
+contacted.
+
+### Powering on only some nodes
+
+```sh
+# one readout node; everything it depends on is VERIFIED, never powered
+mu2e-power-on --execute --node mu2e-trk-01
+
+# that node and nothing else at all (no predecessor checks)
+mu2e-power-on --execute --from readout --node mu2e-trk-01
+```
+
+With `--node`, the stages holding the named nodes are cut down to them; the
+stages before them (from `--from`, or the start of the sequence) are
+**verify-only**: their power state is read, they are waited for and checked,
+but no power command is sent to them. The run prints the plan as `scope:` lines
+before it starts. If a predecessor is off or never answers, the run stops
+before the requested nodes — even with `--continue-on-error` — and names the
+stage. Bring that stage up explicitly and re-run:
+
+```sh
+mu2e-power-on --execute --from manager --until manager
+mu2e-power-on --execute --node mu2e-trk-01
+```
+
+Stages after the requested nodes are not run. A node in no stage (for example
+`mu2e-trk-15`, which is in the inventory but not in `readout`), or in a stage
+outside `--from`/`--until`/`--location`, is an error naming its stage.
+`--location teststand` alone is an error with the shipped sequence, whose
+stages are all MC-2.
+
+### How long a stage can take
+
+Each stage waits for all its nodes at once, under one deadline of
+`boot_timeout` (600 s by default) — at most `ssh.max_sessions` ssh attempts at a
+time — so a stage of dead nodes costs one `boot_timeout`, not one per node.
+`run.phase_timeout` (7200 s) bounds the whole phase: every ssh call is capped at
+the time left, and stages the budget never reached are UNKNOWN, `not run:
+phase_timeout expired` (not FAIL — nothing was looked at). Resume with
+`--from <stage>` as the note says.
 
 If you know a node is dead and want the rest of the cluster up anyway:
 
@@ -478,11 +521,7 @@ interrupt was handled) do these apply:
   kdestroy -c <cache>             # destroy each cache the run left behind
   ```
 
-Ctrl-C (SIGINT) *is* handled: it records the interruption, marks the run
-`interrupted` and runs cleanup. If you are at the terminal the run is on,
-interrupt it there rather than using the stop script. `--force` is documented
-as the path where the store may not record the interruption; in practice
-neither path records it.
+Ctrl-C (SIGINT) takes the same clean path as SIGTERM.
 
 ## What the tools will refuse to do
 
@@ -491,13 +530,14 @@ neither path records it.
   to power-cycle one of those, do it deliberately from a session on the gateway
   itself, having thought about how you will get back in.
   (`mu2e-node-inventory --protected` lists them.) Powering one *on* is allowed.
-- Any power command at all while `run.dry_run` is true, which is the default.
-  Note what this does *not* say: `--execute` is one way to set `run.dry_run`
-  false, not a second independent gate. `run: {dry_run: false}` in
-  `config/power-recovery.yaml` or `config/.env`, or
-  `MU2E_POWER_RECOVERY_RUN_DRY_RUN=false` in the environment, arms live power
-  commands with no flag on the command line. The run prints `LIVE RUN -- power
-  commands WILL be issued.` when that is the case; read the banner.
+- Any power command at all unless this invocation authorised it: `--execute`,
+  or `MU2E_POWER_RECOVERY_ARM` equal to the configured `run.label` with
+  `run.dry_run: false`. `run.dry_run: false` alone is refused (exit 2), and the
+  token is refused in `config/.env`. A live run prints `LIVE RUN -- power
+  commands WILL be issued (authorised by ...)`.
+- A power command to a node outside `--node`/`--location`, or to a
+  predecessor stage of a `--node` run: those are verified only.
+- Running a `--from`/`--until` typo: it exits 2 instead of widening the run.
 - Anything whatsoever under `--simulate`, which overrides `--execute`. The local
   transport is scripted too, so even a `ping` in a rehearsal is answered from
   the script.

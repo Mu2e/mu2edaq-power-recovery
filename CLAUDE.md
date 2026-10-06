@@ -19,6 +19,7 @@ through a gateway with Kerberos/GSSAPI; BMCs are reached by running `ipmitool`
 mu2e-power-recovery --phase all --simulate   # rehearse; contacts nothing
 mu2e-power-state                             # phase 1, read-only
 mu2e-power-on --execute                      # phase 2, actually switches on
+mu2e-power-on --execute --node mu2e-trk-01   # one node; predecessors verify-only
 mu2e-power-netcheck                          # phase 3
 mu2e-power-report --post-ecl                 # phase 4
 
@@ -30,6 +31,11 @@ ctest --test-dir build --output-on-failure
 Diagnostics: `mu2e-node-inventory`, `mu2e-ipmi-tool`, `mu2e-ssh-probe`,
 `mu2e-vault-ipmi` (Python console scripts) and `mu2e-probe` (the C++ binary,
 built by CMake to `build/mu2e-probe`, not a console script).
+
+Live power commands need this invocation's authorisation: `--execute`, or
+`MU2E_POWER_RECOVERY_ARM=<run.label>` in the process environment with
+`run.dry_run: false` and that `run.label` configured. `run.dry_run: false`
+alone exits 2 (`cli.authorize_live`).
 
 `--phase` belongs to `mu2e-power-recovery` alone; the four single-phase drivers
 reject it. All five drivers take `--version` and `--help`; the four Python
@@ -120,11 +126,13 @@ Precedence is fixed: **command line > environment > `config/.env` > YAML >
 built-in defaults**. Any key is settable as `MU2E_POWER_RECOVERY_<DOTTED_PATH>`
 upper-cased with underscores.
 
-Three variables are read directly rather than through that mechanism:
+Four variables are read directly rather than through that mechanism:
 `NO_COLOR` (never colour), `FORCE_COLOR` (colour even off a tty; `NO_COLOR`
-wins) — both in `console.py` — and `MU2E_POWER_RECOVERY_UPDATED`
+wins) — both in `console.py` — `MU2E_POWER_RECOVERY_UPDATED`
 (`selfupdate.REEXEC_GUARD`), set across phase 0's `os.execve` so the
-re-executed process does not check for updates again.
+re-executed process does not check for updates again, and
+`MU2E_POWER_RECOVERY_ARM` (`settings.ARM_ENV`), the live-run token, which
+`load()` never ingests and refuses in `config/.env`.
 
 ## 5. Testing
 
@@ -282,6 +290,29 @@ could fire for two nodes or for neither.
 - **The IPMI network is probed from gateways** (`origin: gateways` in
   `checks.yaml`'s mesh section). A node's `ipmi` entry is its BMC, which the
   node's own OS cannot route to; never make node OSes the sources for it.
+- **Live mode is decided once, by `cli.authorize_live()`, per invocation.**
+  Never let a configuration layer arm a run: `--execute` does not write
+  `run.dry_run` as an override; the decision is written back afterwards so
+  everything downstream reads one value. The ARM token stays out of
+  `settings._apply_env` and out of `config/.env`. `--simulate` beats
+  everything.
+- **Phase 2's scope is a `SequencePlan` made before credentials.**
+  `plan_sequence()` is the only place `--node`/`--location`/`--from`/`--until`
+  become stages; anything it cannot honour exactly is a
+  `SequenceSelectionError` (exit 2), never a widening. `--node` predecessors
+  are verify-only — never add a power path for them — and `_power_stage` must
+  keep refusing hosts outside `plan.allowed_power`. Validate names at plan
+  time, not in `run_stage`.
+- **A BMC is driven through its own location's gateway.** Use
+  `Orchestrator.ipmi_for(node)`, not `orch.ipmi`, for per-node IPMI; build any
+  new client with `_make_ipmi_client(creds, gateway)` so it gets the shared
+  breaker and `protected=topology.is_protected`.
+- **Time goes through the orchestrator's clock and sleep.** No `time.sleep` or
+  `time.monotonic` in phases; use `orch.clock`/`orch.sleep` and a `Deadline`
+  (`phases/base.py`), so tests run on a fake clock. Run phase work under
+  `orch.budget(deadline)`; work it never reached is UNKNOWN `TIMEOUT_SUMMARY`,
+  not FAIL. Boot waits share one stage deadline and a `ssh.max_sessions`
+  semaphore; do not reintroduce a per-node wait.
 - Parsers live in `checks/parsers.py` with their own tests, against real
   command output rather than invented samples.
 
@@ -298,15 +329,20 @@ could fire for two nodes or for neither.
   `vault.ipmi_path` / `ipmi_*_field` fix it without a code change.
 - **`ecl-client`'s Python surface is version-dependent.** `report/ecl.py` tries
   the module-level `post()` first and the class API second.
-- **Phase 2 waits for nodes one at a time.** `_wait_for_nodes` walks a stage's
-  nodes in sequence, so one node that never returns costs the whole
-  `boot_timeout` before the next is tried. The `readout` stage has 28 nodes.
-- **`--execute` is not an independent gate.** It only sets
-  `run.dry_run = False` (`cli.py:184-185`), and `IPMIClient` is gated on
-  `run.dry_run` alone (`orchestrator.py:308`). Setting `run.dry_run: false` in
-  the config, `.env` or the environment arms live power commands with no flag.
-  Several documents claimed two gates; they have been corrected to describe
-  this. `--simulate` is the only genuinely independent gate.
+- **Resolved in fix/poweron-safety** (kept here so nobody re-adds them): phase
+  2 now waits for a stage's nodes concurrently (#13); `--execute` is a real
+  per-invocation gate (`cli.authorize_live`, #11); an unknown `--from`/`--until`
+  is an error (#2); `--node`/`--location` bound phase 2 (#1). SIGTERM *is*
+  handled: `cli.install_sigterm_handler()` routes it into the Ctrl-C path, so
+  the stop script's TERM marks the run `interrupted` and runs cleanup; only
+  SIGKILL (`--force`) skips it.
+- **Power commands within a stage are serial.** `_power_stage` walks the
+  stage's nodes in order (deliberately: the breaker serialises them until the
+  BMC account is proven, and it spreads the inrush). A stage of dark BMCs
+  therefore costs one `ipmi.timeout` × retries per node before the boot wait.
+- **`mu2e-trk-15`..`18` are in the inventory but in no phase-2 stage**
+  (`readout` lists trk 1-14). Left as is by decision; `--node mu2e-trk-15`
+  on a power-on is therefore an error naming that it is in no stage.
 - **SIGKILL is not a clean stop.** SIGTERM is: `cli.install_sigterm_handler()`
   raises KeyboardInterrupt, `assess_nodes` and the mesh probe shut their pools
   down with `cancel_futures=True` instead of waiting out the queue, and
@@ -320,9 +356,6 @@ could fire for two nodes or for neither.
   continues.
   `ambient_warning()` covers one fatal condition and one benign one, so making
   it halt means separating them first.
-- **An unmatched `--from`/`--until` stage name is silently ignored**
-  (`phase2_poweron.py:289-295`), so a typo widens the power-on to the whole
-  sequence rather than erroring.
 - **Nothing has been run against the live cluster end to end.** See
   [PROJECT-STATUS.md](PROJECT-STATUS.md) §6.3 for what is and is not verified.
 

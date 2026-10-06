@@ -32,9 +32,14 @@ report page.
 .B 2. poweron
 Nodes are brought up in the dependency order given by
 .BR mu2edaq-power-sequence.yaml (5).
-Each stage is verified before the next begins. Requires
-.B \-\-execute
-to issue any power command.
+Each stage is verified before the next begins. Issues no power command unless
+this invocation authorises it (see
+.BR "LIVE RUNS" ).
+With
+.B \-\-node
+only the named nodes are powered and the stages before them are verified,
+never powered (see
+.BR "PHASE 2 SCOPE" ).
 .TP
 .B 3. network
 Node-to-node connectivity across the lab, data and IPMI segments, including a
@@ -71,8 +76,12 @@ subject. Defaults to
 .IR user@host " " date .
 .TP
 .B \-\-execute
-Actually issue power commands. Without it the run is a dry run: power states
-are read and the intended actions are reported, but no chassis is switched on.
+Authorise this invocation to issue power commands. Without it (or the
+.B MU2E_POWER_RECOVERY_ARM
+token, see
+.BR "LIVE RUNS" )
+the run is a dry run: power states are read and the intended actions are
+reported, but no chassis is switched on.
 .TP
 .B \-\-simulate
 Contact nothing at all; answer every command from a built-in script. Use this
@@ -92,7 +101,10 @@ from the configuration.
 .TP
 .BI \-\-node " HOST"
 Limit the run to these nodes. Repeatable. Short or fully-qualified names are
-both accepted, as is a name that is not in the inventory.
+both accepted, as is a name that is not in the inventory (phases 1 and 3). A
+name that is not a valid hostname exits 2 before any credential is acquired. In
+phase 2 it bounds what is powered; see
+.BR "PHASE 2 SCOPE" .
 .TP
 .B \-\-continue\-on\-error
 In phase 2, carry on to the next stage even when a stage does not meet its
@@ -105,7 +117,9 @@ has failed, which is otherwise where it stops.
 .BI \-\-from " STAGE" ", " \-\-until " STAGE"
 Start and stop the power-on sequence at these stage names, inclusive. Use
 .B \-\-from
-to resume a sequence that stopped, after fixing whatever stopped it.
+to resume a sequence that stopped, after fixing whatever stopped it. A name
+that is not a stage, or a range whose end comes before its start, exits 2
+before any credential is acquired and lists the valid stage names.
 .TP
 .B \-\-include\-failed
 In phase 3, probe nodes that failed an earlier phase instead of skipping them.
@@ -385,27 +399,104 @@ failure advances it. Once
 .I ssh.login
 has been refused, the remaining SSH checks for that node are skipped rather
 than each opening its own connection to be refused again.
+.SH LIVE RUNS
+A run issues state-changing IPMI commands only when
+.I this invocation
+authorises it. The configuration can permit a live run; it cannot arm one.
+.TP
+.B \-\-simulate
+Never live, whatever else is set.
+.TP
+.B \-\-execute
+Live. This is the normal way. An
+.B MU2E_POWER_RECOVERY_ARM
+token set alongside it is ignored, with a warning.
+.TP
+.B MU2E_POWER_RECOVERY_ARM=\fIlabel\fP
+For unattended runs that cannot pass a flag. Live only when the configuration
+sets
+.I run.dry_run: false
+.B and
+a non-empty
+.I run.label
+equal to the token. The token is read from the process environment alone: it
+is not a configuration key, and putting it in
+.I config/.env
+is a configuration error (exit 2), because a persistent file that arms every
+later run is exactly what it exists to prevent. A token with no label, the
+wrong label, or with
+.I run.dry_run
+true exits 2.
+.TP
+.B run.dry_run: false alone
+From the YAML file,
+.I config/.env
+or
+.BR MU2E_POWER_RECOVERY_RUN_DRY_RUN=false ,
+with neither of the above: exit 2, with a message naming where the setting came
+from and both ways to authorise.
+.PP
+The decision is made before phase 0 and before any credential. A live run
+prints
+.B "LIVE RUN \-\- power commands WILL be issued (authorised by ...)"
+before the first phase, logs a warning and records an event in the run store
+naming what armed it.
+.SH PHASE 2 SCOPE
+The power-on plan is made before any credential is acquired and before the
+run is recorded; anything it cannot honour exactly exits 2.
+.B \-\-location
+drops stages in other locations (with a notice; none left is an error).
+.B \-\-node
+cuts the stages holding the named nodes to those nodes; the stages before them
+(from the start of the
+.BR \-\-from / \-\-until
+range) are verify-only \(em power state read, ssh waited for, checks run, no
+power command \(em and if one of them is not up, the run stops before the
+requested nodes, even with
+.BR \-\-continue\-on\-error ,
+and says which stage to run explicitly. Stages after the last requested node
+are not run. A name in no stage, or only outside the range or locations, is an
+error naming its stage. See
+.BR mu2e-power-on (1).
+.SH TIME LIMITS
+Four timeouts nest:
+.TP
+.I run.phase_timeout
+Wall-clock budget of each of phases 1\(en3 (0 or null: unbounded). Checked
+before every stage, node and check; what it never reached is UNKNOWN,
+.IR "not run: phase_timeout expired" .
+.TP
+.IR boot_timeout " (per stage)"
+How long phase 2 waits for a stage's nodes to answer ssh, all at once under one
+stage deadline of now +
+.RI min( boot_timeout ", phase time left)."
+Concurrent ssh attempts are bounded by
+.IR ssh.max_sessions .
+.TP
+.I ssh.command_timeout
+Per command, capped at the phase time left.
+.TP
+.I ssh.connect_timeout
+Per connection; a boot-wait attempt is
+.I connect_timeout
++ 5 s, capped at the stage time left.
+.PP
+So a phase overruns its budget by at most the one call in flight when it
+expires, and that call was itself capped at what was left when it started.
 .SH SAFETY
 .TP
 .B Dry run by default
-No power command is issued while
-.I run.dry_run
-is true, which is the default.
-.B \-\-execute
-is the supported way to set it false, but it is not a separate gate:
-.I run.dry_run
-is an ordinary configuration key, so setting it false in
-.IR config/power\-recovery.yaml ", " config/.env
-or as
-.B MU2E_POWER_RECOVERY_RUN_DRY_RUN=false
-arms the destructive path with no flag on the command line. The run says which
-it is \(em
-.B "LIVE RUN \-\- power commands WILL be issued."
-\(em before the first phase.
+No power command is issued unless this invocation authorises it; see
+.BR "LIVE RUNS" .
 .B \-\-simulate
-is the gate no configuration file can open: it forces
+is the gate nothing can open: it forces
 .I run.dry_run
 back to true whatever else was asked for.
+.TP
+.B Scope is enforced twice
+The phase-2 plan decides which hosts may be powered; the power step refuses any
+other host independently and records it as
+.IR out_of_scope .
 .TP
 .B Protected hosts
 .BR "chassis power off" ", " cycle " and " reset
@@ -531,7 +622,7 @@ Priority, lowest first: built-in defaults, the YAML config file,
 .IR config/.env ,
 the environment, the command line.
 .PP
-Three further variables are read directly rather than as configuration keys:
+Four further variables are read directly rather than as configuration keys:
 .TP
 .B NO_COLOR
 When set to any non-empty value, output is not coloured, whatever the terminal
@@ -542,6 +633,12 @@ When set, output is coloured even when stdout is not a terminal \(em for
 capturing a coloured transcript into a file or a pipe.
 .B NO_COLOR
 wins if both are set.
+.TP
+.B MU2E_POWER_RECOVERY_ARM
+The per-invocation live-run token; see
+.BR "LIVE RUNS" .
+Never read from
+.IR config/.env .
 .TP
 .B MU2E_POWER_RECOVERY_UPDATED
 Set to
@@ -560,7 +657,9 @@ Every phase completed and nothing failed.
 A phase completed but one or more nodes failed their checks.
 .TP
 .B 2
-The run could not start: configuration, credentials, or no reachable gateway.
+The run could not start: configuration, credentials, no reachable gateway, a
+live run the invocation did not authorise, or a phase-2 stage or node
+selection that cannot be honoured.
 .TP
 .B 3
 Interrupted by the operator.

@@ -21,7 +21,7 @@ from ..checks import Status
 from ..checks.mesh import MeshProbe, MeshResult
 from ..orchestrator import Orchestrator
 from ..topology import Node
-from .base import PhaseResult
+from .base import TIMEOUT_SUMMARY, PhaseResult, phase_deadline
 
 log = logging.getLogger(__name__)
 
@@ -57,7 +57,11 @@ def run(orch: Orchestrator, nodes: Optional[Sequence[Node]] = None,
     probe = MeshProbe(orch.ssh_factory, orch.checks_config,
                       max_workers=int(orch.settings.get("ssh.max_sessions", 16)),
                       topology=orch.topology)
-    mesh_results: List[MeshResult] = probe.run_all(targets)
+    deadline = phase_deadline(orch)
+    with orch.budget(deadline):
+        mesh_results: List[MeshResult] = probe.run_all(targets, deadline=deadline)
+    not_run = sum(1 for m in mesh_results for e in m.untested
+                  if e.detail == TIMEOUT_SUMMARY)
 
     statuses = [m.status for m in mesh_results]
     result.status = max(statuses, key=lambda s: s.rank) if statuses else Status.UNKNOWN
@@ -70,6 +74,13 @@ def run(orch: Orchestrator, nodes: Optional[Sequence[Node]] = None,
         "unreachable_sources": sorted({s for m in mesh_results
                                        for s in m.unreachable_sources()}),
     }
+
+    result.data["timed_out"] = bool(not_run)
+    if not_run:
+        result.notes.append(
+            f"run.phase_timeout ({deadline.budget:.0f}s) expired: {not_run} "
+            f"path(s) were never probed and are UNKNOWN ({TIMEOUT_SUMMARY})")
+        orch.store.record_event(result.notes[-1], level="error")
 
     # An interpretation, not just a matrix: a node that reaches nothing and a
     # target nobody reaches have different causes, and saying which is which

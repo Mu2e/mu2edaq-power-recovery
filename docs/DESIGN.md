@@ -451,6 +451,50 @@ run the stage's profile → evaluate `require:` (`all` / `majority` / `any`).
 - After a power-on, the node's context carries `expect_recent_boot`, so
   `host.uptime` can flag a machine that reports days of uptime — which means
   the IPMI command reached a different chassis than the operator thought.
+- **Scope is planned before credentials.** `plan_sequence()` turns
+  `--from`/`--until`, `--location` and `--node` into a `SequencePlan` of
+  stages with roles (`full`, `target`, `predecessor`, `out_of_scope`) and an
+  `allowed_power` host set, or raises `SequenceSelectionError` (exit 2).
+  Unknown or reversed stage names, duplicate stage names, invalid hostnames
+  anywhere in the sequence, and a `--node` host in no usable stage are all
+  errors: a bound on a power operation that silently widens is worse than
+  none. Every stage's node list is validated at planning time, so a bad name
+  cannot surface mid-sequence after earlier stages were powered.
+- **Predecessors are verify-only.** With `--node`, the stages before the
+  target (from the start of the range) have their power state read, are waited
+  for and checked, and are never powered — the operator asked for one node, so
+  the run must not decide to power a dependency. A predecessor stage that is
+  not up (a node off or silent, or its `require:` missed) stops the run before
+  the target, regardless of `--continue-on-error`, with the stage to run
+  explicitly. Chosen over auto-powering predecessors (which widens the
+  operator's request) and over refusing a partial selection outright (which
+  makes single-node recovery impossible).
+- **`_power_stage` re-checks `allowed_power`** and records any other host as
+  `out_of_scope` without calling `ensure_on` — defence in depth against a plan
+  bug.
+- **One IPMI client per location**, each on a gateway of its own location
+  (`Orchestrator.ipmi_for`); the IPMI subnets are per site. All share the
+  run's one `CredentialBreaker` and keep the protected-host check.
+- **Boot waits are concurrent.** Every node of a stage is waited for at once
+  under one stage deadline, `now + min(boot_timeout, phase time left)`, with
+  ssh attempts bounded by a semaphore of `ssh.max_sessions` and starts
+  staggered by 0.5 s. Power commands stay serial (the breaker serialises them
+  until proven, and it spreads the inrush).
+
+### Time budget
+
+`run.phase_timeout` is a `Deadline` (phases/base.py) on the orchestrator's
+injectable monotonic clock. `Orchestrator.budget()` installs it for phases 1–3;
+while set, the orchestrator starts no node and no check once it has expired,
+phase 2 checks it before each stage and each power command, and every
+`SSHTransport` built by the factory caps each call's timeout at
+`min(configured, remaining)` (and refuses to start a call once it is spent).
+The nesting is phase budget ⊇ stage boot deadline ⊇ per-call
+`ssh.command_timeout` / `connect_timeout + 5`; overrun is bounded by the one
+call in flight at expiry. Work never reached is UNKNOWN with `not run:
+phase_timeout expired` — distinct from FAIL (looked, broken) and from
+unreachable (could not look). Tests drive this with a fake clock whose sleep
+advances it.
 
 ### Phase 3 — network
 
@@ -612,8 +656,12 @@ needs an answer that does not involve reading four files.
 
 | Mechanism | What it stops |
 |---|---|
-| `run.dry_run` default true, `--execute` required | A power command issued by accident |
-| `--simulate` overrides `--execute` | A rehearsal that turns out not to be one |
+| Live runs need per-invocation authorisation: `--execute`, or `MU2E_POWER_RECOVERY_ARM` = configured `run.label` with `run.dry_run: false`; config `dry_run: false` alone exits 2; the token is refused in `config/.env` (`cli.authorize_live`) | A power command armed by a persistent file, or issued by accident |
+| `--simulate` overrides everything, including `--execute` and the token | A rehearsal that turns out not to be one |
+| Phase-2 plan (`plan_sequence`) made before credentials; unknown/reversed stage names and out-of-scope `--node` are errors | A typo or a scoped command widening a power-on |
+| `--node` predecessors verify-only; `_power_stage` refuses hosts outside `allowed_power` | Powering nodes the operator did not name |
+| Per-location IPMI clients | Driving a BMC through another site's gateway |
+| `run.phase_timeout` enforced; per-call timeouts capped | An outage run that never ends |
 | `protected:` host list, checked before the command is built | Cutting off access to the cluster being recovered |
 | Gateway stage is `power_on: false` | Power-cycling the jump host mid-sequence |
 | Attempt recorded before it is issued | Losing the audit trail to a crash |

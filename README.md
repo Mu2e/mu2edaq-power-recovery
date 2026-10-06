@@ -85,7 +85,7 @@ commands each *are* their phase. Every driver takes `--version` and `--help`.
 |---|---|---|
 | 0 | *(automatic)* | Check GitHub for a newer revision, fast-forward, rebuild if needed, restart, print the version and config digest. |
 | 1 | `mu2e-power-state` | **Read-only** survey of every node: reachability, logins, disks, mounts, interfaces, link speeds, services, PCIe, and chassis power from the BMC. Nothing is changed. |
-| 2 | `mu2e-power-on` | Power the cluster on in dependency order, verifying each stage before starting the next. Dry run unless `--execute`. |
+| 2 | `mu2e-power-on` | Power the cluster on in dependency order, verifying each stage before starting the next. Dry run unless this invocation authorises it (`--execute`). `--node` powers only the named nodes. |
 | 3 | `mu2e-power-netcheck` | Node-to-node connectivity across the lab, data and IPMI segments, with a jumbo-frame probe on the data network. |
 | 4 | `mu2e-power-report` | The consolidated narrative, optionally posted to the ECL. |
 
@@ -109,23 +109,40 @@ Each stage: read power state → power on what is off → wait for SSH → settl
 run the stage's check profile → decide whether it met its `require:`
 (`all`, `majority` or `any`). A stage that fails stops the sequence, because
 every later stage depends on the services the earlier ones provide. Resume with
-`--from <stage>` after fixing it.
+`--from <stage>` after fixing it. A stage name that is not in the sequence, or a
+reversed `--from`/`--until` range, exits 2 before anything is contacted.
+
+A scoped run powers only what it names. `--location` drops stages in other
+locations. `--node mu2e-trk-01` cuts `readout` to that node, and runs the
+stages before it **verify-only**: their power state is read, they are waited
+for and checked, but they are never sent a power command. If one of them is
+not up, the run stops before `readout` and tells you which stage to run
+explicitly. Later stages are not run. `--from readout --node mu2e-trk-01`
+touches that one node only.
+
+Each stage waits for all its nodes at once under one deadline, so 28 dead
+readout nodes cost one `boot_timeout`, not 28. `run.phase_timeout` bounds each
+of phases 1–3; anything it never reached is UNKNOWN, `not run: phase_timeout
+expired`.
 
 ## Safety
 
 This tool can switch machines off, so the destructive path is gated and fenced:
 
-- **Dry run by default.** `run.dry_run` starts true and nothing is switched
-  until it is false. `--execute` is the *supported* way to set it — but it is
-  only one way. `run.dry_run` is an ordinary configuration key, so
-  `run: {dry_run: false}` in `config/power-recovery.yaml`, a line in
-  `config/.env`, or `MU2E_POWER_RECOVERY_RUN_DRY_RUN=false` in the environment
-  arms the destructive path on its own, with no flag on the command line. The
-  run says which it is — it prints `LIVE RUN -- power commands WILL be issued.`
-  before the first phase — but read that banner rather than trusting that the
-  absence of `--execute` means a dry run.
-- **`--simulate` is inert, and is the one gate no configuration file can
-  open.** It forces `run.dry_run` back to true whatever else was asked for,
+- **Dry run unless this invocation says otherwise.** Live power commands need
+  a per-invocation authorisation: `--execute` on the command line, or, for an
+  unattended run, `MU2E_POWER_RECOVERY_ARM=<run.label>` in the process
+  environment together with `run.dry_run: false` and a matching `run.label` in
+  the configuration. `run.dry_run: false` on its own — in the YAML,
+  `config/.env` or the environment — arms nothing: the run exits 2 and says
+  how to authorise. The token is never read from `config/.env` (that is a
+  configuration error), so no persistent file can arm a later bare invocation.
+  A live run prints `LIVE RUN -- power commands WILL be issued (authorised by
+  ...)` and records what armed it.
+- **Scope is enforced twice.** The phase-2 plan decides which hosts may be
+  powered before any credential is acquired; the power step independently
+  refuses any other host and records it as `out_of_scope`.
+- **`--simulate` is inert, and is the one gate nothing can open.** It forces `run.dry_run` back to true whatever else was asked for,
   including `--execute` on the same command line, and contacts nothing — the
   local transport is scripted too, so even a `ping` is answered from the
   script, and the publisher refuses to copy a rehearsal's report to the live web

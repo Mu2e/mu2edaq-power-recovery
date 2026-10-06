@@ -15,10 +15,12 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import signal
 import sys
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from . import __version__, console
 from .checks import DESCRIPTIONS, Status
@@ -27,7 +29,8 @@ from .orchestrator import Orchestrator
 from .phases import PHASES, phase1_assess, phase2_poweron, phase3_network, phase4_report
 from .report import Publisher, ReportWriter
 from .selfupdate import SelfUpdater
-from .settings import ConfigError, load as load_settings
+from .phases.phase2_poweron import SequenceSelectionError, plan_sequence
+from .settings import ARM_ENV, ConfigError, load as load_settings
 from .topology import TopologyError
 
 log = logging.getLogger(__name__)
@@ -53,10 +56,28 @@ examples
   # regenerate and post the report for an earlier run
   mu2e-power-report --run-id 17 --post-ecl
 
+live power commands
+  A run is a dry run unless this invocation authorises it, in one of two ways:
+    --execute                    on the command line; or
+    MU2E_POWER_RECOVERY_ARM=<run.label>
+                                 in the process environment, together with
+                                 run.dry_run: false in the configuration and a
+                                 run.label equal to the token.
+  run.dry_run: false on its own (YAML, config/.env or environment) does not
+  arm anything: it is refused with exit 2. --simulate always wins.
+
+scope in phase 2
+  --location drops stages in other locations. --node cuts the stages holding
+  the named nodes down to them; earlier stages are VERIFY-ONLY (never sent a
+  power command) and a predecessor that is not up stops the run before the
+  requested nodes. Later stages are not run. A name, stage or range that
+  cannot be honoured exactly is an error (exit 2) before any credential.
+
 exit status
   0  every phase completed and nothing failed
   1  a phase completed but one or more nodes failed their checks
-  2  the run could not start (configuration, credentials, no gateway)
+  2  the run could not start (configuration, credentials, no gateway,
+     live-run authorisation, stage or node selection)
   3  interrupted by the operator
 """
 
@@ -90,8 +111,11 @@ def build_parser(prog: Optional[str] = None, description: Optional[str] = None,
                      help="label for this recovery, shown in the report and the "
                           "logbook entry")
     run.add_argument("--execute", action="store_true",
-                     help="actually issue power commands. Without it the run is "
-                          "a dry run: states are read, nothing is switched on.")
+                     help="authorise live power commands for this invocation. "
+                          "Without it (or the MU2E_POWER_RECOVERY_ARM token) the "
+                          "run is a dry run: states are read, nothing is switched "
+                          "on. run.dry_run: false in configuration alone is "
+                          "refused.")
     run.add_argument("--simulate", action="store_true",
                      help="contact nothing at all; answer every command from a "
                           "built-in script. For rehearsal and for testing the "
@@ -101,14 +125,18 @@ def build_parser(prog: Optional[str] = None, description: Optional[str] = None,
                           "Repeatable; defaults to topology.locations.")
     run.add_argument("--node", action="append", metavar="HOST",
                      help="limit the run to these nodes. Repeatable. Accepts "
-                          "short or fully-qualified names.")
+                          "short or fully-qualified names. In phase 2 only these "
+                          "nodes are powered; earlier stages are verified, never "
+                          "powered.")
     run.add_argument("--continue-on-error", action="store_true",
                      help="in phase 2, carry on to the next stage even when a "
                           "stage does not meet its requirement")
     run.add_argument("--from", dest="from_stage", metavar="STAGE",
-                     help="start the power-on sequence at this stage")
+                     help="start the power-on sequence at this stage (an "
+                          "unknown name is an error)")
     run.add_argument("--until", dest="until_stage", metavar="STAGE",
-                     help="stop the power-on sequence after this stage")
+                     help="stop the power-on sequence after this stage (an "
+                          "unknown name is an error)")
     run.add_argument("--include-failed", action="store_true",
                      help="in phase 3, probe nodes that failed an earlier phase "
                           "instead of skipping them")
@@ -170,6 +198,10 @@ def cli_overrides(args: argparse.Namespace) -> Dict[str, Any]:
     by :meth:`Settings.apply_cli`, so an absent flag never overrides a config
     file.  The two exceptions are the store-true flags, which are only sent
     when true for the same reason.
+
+    ``--execute`` is deliberately absent: it is not a configuration value but
+    this invocation's authorisation, decided by :func:`authorize_live`, which
+    then sets ``run.dry_run`` itself.
     """
     overrides: Dict[str, Any] = {
         "run.label": args.label,
@@ -182,8 +214,6 @@ def cli_overrides(args: argparse.Namespace) -> Dict[str, Any]:
         "report.publish.target": args.publish_target,
         "database.url": args.database_url,
     }
-    if args.execute:
-        overrides["run.dry_run"] = False
     if args.simulate:
         # A simulated run must never be able to touch anything, whatever else
         # was asked for -- including --execute on the same command line.
@@ -201,6 +231,105 @@ def cli_overrides(args: argparse.Namespace) -> Dict[str, Any]:
     if args.location:
         overrides["topology.locations"] = list(args.location)
     return overrides
+
+
+# ---------------------------------------------------------------------------
+# Live-run authorisation
+# ---------------------------------------------------------------------------
+
+
+class LiveAuthorizationError(ValueError):
+    """The configuration asks for live mode, or an ARM token was given, but
+    this invocation's authorisation does not hold. Exit 2."""
+
+
+@dataclass
+class Authorization:
+    """The decision :func:`authorize_live` made, and what it rests on."""
+
+    live: bool
+    source: str
+
+
+def _dry_run_source(settings: Any) -> str:
+    """Which layer last set run.dry_run (for the error message)."""
+    for layer in reversed(getattr(settings, "overrides", [])):
+        if layer.path == "run.dry_run":
+            return layer.source
+    return "built-in default"
+
+
+def authorize_live(settings: Any, args: argparse.Namespace,
+                   environ: Mapping[str, str]) -> Authorization:
+    """Decide whether this invocation may issue state-changing IPMI commands.
+
+    Two independent conditions, one of which must be given *per invocation*:
+
+    * ``--simulate``: never live, whatever else is set.
+    * ``--execute``: live. The shipped configuration is ``run.dry_run: true``
+      and every documented example uses the bare flag, so the flag alone
+      authorises; a stray ARM token beside it is ignored with a warning.
+    * no flag, ``MU2E_POWER_RECOVERY_ARM`` in the process environment: live
+      only if the configuration permits it (``run.dry_run: false``) *and* the
+      token equals the configured, non-empty ``run.label``. Any other
+      combination -- a null label, a mismatch, ``run.dry_run: true`` -- is an
+      error, because a token that does not do what it says is a mistake.
+    * no flag, no token, ``run.dry_run: false`` from YAML, ``config/.env`` or
+      the environment: an error. That key alone only *permits* the token path;
+      it never arms a run, so a persistent file cannot turn a bare invocation
+      into a live one.
+    * otherwise: dry run.
+
+    On return ``run.dry_run`` has been set to ``not live`` (source recorded),
+    so everything downstream -- the IPMI clients, the banner, the run store --
+    reads one resolved value exactly as before. Raises
+    :class:`LiveAuthorizationError`.
+    """
+    token = environ.get(ARM_ENV)
+    label = settings.get("run.label")
+    config_live = settings.get("run.dry_run", True) is False
+    how = (f"pass --execute on the command line, or set {ARM_ENV}=<run.label> "
+           f"in the environment of this invocation together with "
+           f"run.dry_run: false and a run.label")
+
+    if args.simulate:
+        decision = Authorization(False, "--simulate")
+    elif args.execute:
+        if token is not None:
+            log.warning("%s is set but ignored: --execute already authorises "
+                        "this run", ARM_ENV)
+        decision = Authorization(True, "--execute")
+    elif token is not None:
+        if not config_live:
+            raise LiveAuthorizationError(
+                f"{ARM_ENV} is set but run.dry_run is true "
+                f"({_dry_run_source(settings)}); the token only arms a run whose "
+                f"configuration sets run.dry_run: false. Unset it for a dry run, "
+                f"or use --execute.")
+        if not label:
+            raise LiveAuthorizationError(
+                f"{ARM_ENV} is set but run.label is not; the token must equal a "
+                f"configured run.label, so with no label it can match nothing.")
+        if token != str(label):
+            raise LiveAuthorizationError(
+                f"{ARM_ENV}={token!r} does not match run.label {label!r}; "
+                f"refusing to arm the run.")
+        decision = Authorization(True, f"{ARM_ENV} (run.label {label!r})")
+    elif config_live:
+        raise LiveAuthorizationError(
+            f"run.dry_run is false ({_dry_run_source(settings)}) but this "
+            f"invocation did not authorise live power commands. The "
+            f"configuration only permits a live run; to authorise one, {how}. "
+            f"For a dry run, set run.dry_run back to true.")
+    else:
+        decision = Authorization(False, "default (dry run)")
+
+    settings.set("run.dry_run", not decision.live,
+                 source=f"live-run authorisation: {decision.source}")
+    if decision.live:
+        log.warning("LIVE run authorised by %s: power commands will be issued",
+                    decision.source)
+    return decision
 
 
 # ---------------------------------------------------------------------------
@@ -335,17 +464,25 @@ PHASE_TITLES = {
 
 
 def run_phases(orch: Orchestrator, args: argparse.Namespace,
-               phase_names: Sequence[str]) -> List[Any]:
-    """Execute the requested phases in order, returning their results."""
+               phase_names: Sequence[str],
+               nodes: Optional[Sequence[Any]] = None,
+               plan: Optional[Any] = None) -> List[Any]:
+    """Execute the requested phases in order, returning their results.
+
+    *nodes* and *plan* are resolved by :func:`main` before credentials are
+    acquired; given neither, they are resolved here (--node for phases 1 and
+    3; phase 2 plans the sequence itself).
+    """
     results: List[Any] = []
-    nodes = orch.nodes(args.node) if args.node else None
+    if nodes is None and args.node:
+        nodes = orch.nodes(args.node)
 
     for name in phase_names:
         if name == "assess":
             result = phase1_assess.run(orch, nodes)
         elif name == "poweron":
             result = phase2_poweron.run(orch, from_stage=args.from_stage,
-                                        until_stage=args.until_stage)
+                                        until_stage=args.until_stage, plan=plan)
         elif name == "network":
             result = phase3_network.run(orch, nodes,
                                         include_failed=args.include_failed)
@@ -425,6 +562,18 @@ def main(argv: Optional[Sequence[str]] = None,
     if args.list_checks:
         return print_checks(args.json)
 
+    # --- live-run authorisation -------------------------------------------
+    # Before the self-update and before anything is contacted: a run whose
+    # configuration asks for live mode without this invocation's say-so
+    # stops here.
+    authorization: Optional[Authorization] = None
+    if not args.list_nodes:
+        try:
+            authorization = authorize_live(settings, args, os.environ)
+        except LiveAuthorizationError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+
     # --- phase 0 ----------------------------------------------------------
     if not args.simulate:
         do_self_update(settings)
@@ -439,18 +588,48 @@ def main(argv: Optional[Sequence[str]] = None,
     if not args.quiet:
         print(orch.version.banner())
     if args.list_nodes:
-        return print_nodes(orch, args.node, args.json)
+        try:
+            return print_nodes(orch, args.node, args.json)
+        except TopologyError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        finally:
+            orch.close()
 
     if args.simulate:
         print("  SIMULATED RUN -- no host will be contacted; command output is "
               "answered from a built-in script.\n")
     elif settings.get("run.dry_run", True):
         print("  DRY RUN -- power states will be read but nothing will be "
-              "switched on. Pass --execute to act.\n")
+              "switched on. Pass --execute to act (see 'live power commands' "
+              "in --help).\n")
     else:
-        print("  LIVE RUN -- power commands WILL be issued.\n")
+        print(f"  LIVE RUN -- power commands WILL be issued "
+              f"(authorised by {authorization.source if authorization else '?'}).\n")
 
     phase_names = PHASE_ORDER if args.phase == "all" else [args.phase]
+
+    # --- scope ------------------------------------------------------------
+    # Resolved before credentials and before the run row exists, so a bad
+    # --node, --from/--until or --location costs the operator no password
+    # prompt and leaves no half-started run in the store.
+    try:
+        nodes = orch.nodes(args.node) if args.node else None
+        plan = None
+        if "poweron" in phase_names:
+            plan = plan_sequence(orch.sequence_config, orch.topology,
+                                 orch.locations, args.node,
+                                 settings.get("run.from_stage"),
+                                 settings.get("run.until_stage"))
+    except (TopologyError, SequenceSelectionError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        orch.close()
+        return 2
+    if plan is not None:
+        for notice in plan.notices:
+            print(f"  scope: {notice}")
+        if plan.notices:
+            print()
 
     # --- run --------------------------------------------------------------
     exit_code = 0
@@ -464,7 +643,11 @@ def main(argv: Optional[Sequence[str]] = None,
             version=orch.version.as_dict(),
             settings=settings.redacted(),
         )
-        results = run_phases(orch, args, phase_names)
+        if authorization is not None and authorization.live:
+            orch.store.record_event(
+                f"LIVE run: power commands authorised by {authorization.source}",
+                level="warning")
+        results = run_phases(orch, args, phase_names, nodes=nodes, plan=plan)
 
         if not args.no_report:
             report_info = write_report(orch, results, settings)
@@ -555,7 +738,11 @@ def main_state(argv: Optional[Sequence[str]] = None) -> int:
 def main_poweron(argv: Optional[Sequence[str]] = None) -> int:
     return main(argv, fixed_phase="poweron", prog="mu2e-power-on",
                 description="Phase 2: power the cluster on in dependency order. "
-                            "Requires --execute to issue any power command.")
+                            "Issues no power command unless this invocation "
+                            "authorises it (--execute, or the "
+                            "MU2E_POWER_RECOVERY_ARM token); --node powers only "
+                            "the named nodes and verifies the stages before "
+                            "them.")
 
 
 def main_netcheck(argv: Optional[Sequence[str]] = None) -> int:
