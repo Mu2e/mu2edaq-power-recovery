@@ -6,9 +6,12 @@ switch that came back with a VLAN missing, a port in the wrong group, or jumbo
 frames off on one uplink leaves every node individually healthy and the DAQ
 unable to move data.
 
-Only nodes that passed phase 2 are probed by default -- probing a node that is
-known to be down adds a full ping timeout per pair and tells the operator
-nothing they do not already know.
+Only nodes that passed an earlier phase are probed by default on the
+``origin: nodes`` networks -- probing a node that is known to be down adds a
+full ping timeout per pair and tells the operator nothing they do not already
+know.  The ``origin: gateways`` networks (IPMI) still probe every node's BMC:
+the BMC does not depend on the host OS, and the BMCs of the nodes that did not
+come back are exactly the ones the operator needs to reach next.
 """
 from __future__ import annotations
 
@@ -21,7 +24,7 @@ from ..checks import Status
 from ..checks.mesh import MeshProbe, MeshResult
 from ..orchestrator import Orchestrator
 from ..topology import Node
-from .base import PhaseResult
+from .base import TIMEOUT_SUMMARY, PhaseResult, phase_deadline
 
 log = logging.getLogger(__name__)
 
@@ -38,14 +41,19 @@ def run(orch: Orchestrator, nodes: Optional[Sequence[Node]] = None,
                          started_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
 
     targets = list(nodes if nodes is not None else orch.nodes())
+    if nodes is None:
+        result.notes.extend(orch.empty_location_notes())
+    excluded: List[str] = []
     if not include_failed:
-        targets, excluded = _reachable_only(orch, targets)
+        _, excluded = _reachable_only(orch, targets)
         if excluded:
             result.notes.append(
-                f"{len(excluded)} node(s) excluded because they did not pass an "
-                f"earlier phase: {', '.join(sorted(excluded)[:8])}"
+                f"{len(excluded)} node(s) excluded from node-to-node probes "
+                f"because they did not pass an earlier phase: "
+                f"{', '.join(sorted(excluded)[:8])}"
                 + (" ..." if len(excluded) > 8 else "")
-                + ". Use --include-failed to probe them anyway.")
+                + ". Their BMCs are still probed from the gateways. "
+                  "Use --include-failed to probe them anyway.")
     if not targets:
         result.status = Status.UNKNOWN
         result.summary = "no nodes available to probe"
@@ -55,26 +63,41 @@ def run(orch: Orchestrator, nodes: Optional[Sequence[Node]] = None,
     orch.store.record_event(f"phase 3 (network) started over {len(targets)} node(s)")
 
     probe = MeshProbe(orch.ssh_factory, orch.checks_config,
-                      max_workers=int(orch.settings.get("ssh.max_sessions", 16)))
-    mesh_results: List[MeshResult] = probe.run_all(targets)
+                      max_workers=int(orch.settings.get("ssh.max_sessions", 16)),
+                      topology=orch.topology)
+    deadline = phase_deadline(orch)
+    with orch.budget(deadline):
+        mesh_results: List[MeshResult] = probe.run_all(targets, deadline=deadline,
+                                                       exclude=excluded)
+    not_run = sum(1 for m in mesh_results for e in m.untested
+                  if e.detail == TIMEOUT_SUMMARY)
 
     statuses = [m.status for m in mesh_results]
     result.status = max(statuses, key=lambda s: s.rank) if statuses else Status.UNKNOWN
-    result.summary = "; ".join(
-        f"{m.network}: {len(m.edges) - len(m.failures)}/{len(m.edges)} paths ok"
-        + (f", {len(m.mtu_failures)} jumbo-frame failure(s)" if m.mtu_failures else "")
-        for m in mesh_results) or "no networks probed"
+    result.summary = "; ".join(_summary(m) for m in mesh_results) or "no networks probed"
     result.data = {
         "networks": [m.as_dict() for m in mesh_results],
         "isolated_nodes": sorted({n for m in mesh_results for n in m.isolated_nodes()}),
         "unreachable_targets": sorted({t for m in mesh_results
                                        for t in m.unreachable_targets()}),
+        "unreachable_sources": sorted({s for m in mesh_results
+                                       for s in m.unreachable_sources()}),
     }
+
+    result.data["timed_out"] = bool(not_run)
+    if not_run:
+        result.notes.append(
+            f"run.phase_timeout ({deadline.budget:.0f}s) expired: {not_run} "
+            f"path(s) were never probed and are UNKNOWN ({TIMEOUT_SUMMARY})")
+        orch.store.record_event(result.notes[-1], level="error")
 
     # An interpretation, not just a matrix: a node that reaches nothing and a
     # target nobody reaches have different causes, and saying which is which
     # here saves the operator reading a 900-cell table to work it out.
     for m in mesh_results:
+        # The probe's own notes first: gateway coverage and locations with no
+        # gateway, which the counts below cannot express.
+        result.notes.extend(m.notes)
         # Aggregated, not one note per host: a fabric-wide failure would
         # otherwise produce fifty identical lines and bury the one diagnosis
         # that differs.  Counts plus a sample is what an operator can act on.
@@ -88,8 +111,39 @@ def run(orch: Orchestrator, nodes: Optional[Sequence[Node]] = None,
                 if len(isolated) > 2 else
                 f"{m.network}: {_sample(isolated)} reached nothing -- look at "
                 f"that node's interface and its switch port, not at the fabric")
-        one_way = [h for h in m.unreachable_targets() if h not in isolated]
-        if one_way:
+        dark = m.unreachable_sources()
+        if dark:
+            # UNKNOWN, not FAIL: nothing was learned about the paths from
+            # these sources, so they are kept out of the isolation analysis.
+            result.notes.append(
+                f"{m.network}: {len(dark)} probe source(s) could not be used "
+                f"({_sample(dark)}) -- their {sum(1 for e in m.untested if e.source in dark)} "
+                f"path(s) are UNKNOWN, not failed. Fix the login or the host "
+                f"first, then rerun phase 3.")
+        partial = sorted({e.source for e in m.untested} - set(dark)
+                         - set(m.pseudo_sources))
+        if partial:
+            result.notes.append(
+                f"{m.network}: {len(partial)} source(s) returned no result for "
+                f"some targets ({_sample(partial)}) -- those paths are UNKNOWN; "
+                f"the probe was probably cut off by its timeout")
+        # A target whose own host could not be logged into has not been shown
+        # to "probe out"; it belongs to the dark-source note above.
+        unresolved = m.unresolved_targets()
+        if unresolved:
+            result.notes.append(
+                f"{m.network}: {len(unresolved)} name(s) do not resolve "
+                f"({_sample(unresolved)}) -- fix the inventory or DNS; this is "
+                f"not a network fault")
+        one_way = [h for h in m.unreachable_targets() if h not in isolated
+                   and h not in unresolved
+                   and m.target_hosts.get(h, h) not in dark]
+        if one_way and m.origin == "gateways":
+            result.notes.append(
+                f"{m.network}: {len(one_way)} target(s) answered no gateway "
+                f"({_sample(one_way)}) -- the BMC is unpowered, hung or "
+                f"misaddressed, or its switch port is down")
+        elif one_way:
             result.notes.append(
                 f"{m.network}: {len(one_way)} host(s) could not be reached by "
                 f"anyone although they probe out themselves ({_sample(one_way)}) "
@@ -108,6 +162,21 @@ def run(orch: Orchestrator, nodes: Optional[Sequence[Node]] = None,
     result.duration = time.monotonic() - started
     result.finished_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     return result
+
+
+def _summary(m: MeshResult) -> str:
+    """'data: 3/4 tested paths ok, 2 untested (1 source unreachable)'."""
+    c = m.counts()
+    text = f"{m.network}: {c['ok']}/{c['tested']} tested paths ok"
+    if c["unknown"]:
+        text += f", {c['unknown']} untested"
+        if c["unreachable_sources"]:
+            text += f" ({c['unreachable_sources']} source(s) unreachable)"
+    if m.mtu_failures:
+        text += f", {len(m.mtu_failures)} jumbo-frame failure(s)"
+    if m.origin == "gateways":
+        text += " [from gateways]"
+    return text
 
 
 def _sample(hosts: Sequence[str], limit: int = 5) -> str:

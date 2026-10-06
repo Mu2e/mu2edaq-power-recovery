@@ -1,4 +1,4 @@
-.TH MU2E-POWER-RECOVERY 1 "2026-09-18" "mu2edaq-power-recovery 0.1.0" "Mu2e DAQ Operations"
+.TH MU2E-POWER-RECOVERY 1 "2026-09-29" "mu2edaq-power-recovery 0.2.0" "Mu2e DAQ Operations"
 .SH NAME
 mu2e-power-recovery \- assess, power on, verify and report on the Mu2e DAQ clusters after a power outage
 .SH SYNOPSIS
@@ -32,9 +32,14 @@ report page.
 .B 2. poweron
 Nodes are brought up in the dependency order given by
 .BR mu2edaq-power-sequence.yaml (5).
-Each stage is verified before the next begins. Requires
-.B \-\-execute
-to issue any power command.
+Each stage is verified before the next begins. Issues no power command unless
+this invocation authorises it (see
+.BR "LIVE RUNS" ).
+With
+.B \-\-node
+only the named nodes are powered and the stages before them are verified,
+never powered (see
+.BR "PHASE 2 SCOPE" ).
 .TP
 .B 3. network
 Node-to-node connectivity across the lab, data and IPMI segments, including a
@@ -43,8 +48,10 @@ with a missing VLAN or the wrong MTU, which leaves every node individually
 healthy while the DAQ cannot move data.
 .TP
 .B 4. report
-The consolidated narrative, assembled from the stored run and optionally posted
-to the electronic logbook. It probes nothing and can be re-run at any time.
+The consolidated narrative, assembled from the stored run after the run has
+been finished, and optionally posted to the electronic logbook. It probes
+nothing and can be re-run at any time (see
+.BR "REPORT LIFECYCLE" ).
 .PP
 Before any phase, a run that will contact the cluster checks its GitHub remote
 for a newer revision, fast-forwards if it is behind, rebuilds if the pull
@@ -71,8 +78,12 @@ subject. Defaults to
 .IR user@host " " date .
 .TP
 .B \-\-execute
-Actually issue power commands. Without it the run is a dry run: power states
-are read and the intended actions are reported, but no chassis is switched on.
+Authorise this invocation to issue power commands. Without it (or the
+.B MU2E_POWER_RECOVERY_ARM
+token, see
+.BR "LIVE RUNS" )
+the run is a dry run: power states are read and the intended actions are
+reported, but no chassis is switched on.
 .TP
 .B \-\-simulate
 Contact nothing at all; answer every command from a built-in script. Use this
@@ -92,7 +103,10 @@ from the configuration.
 .TP
 .BI \-\-node " HOST"
 Limit the run to these nodes. Repeatable. Short or fully-qualified names are
-both accepted, as is a name that is not in the inventory.
+both accepted, as is a name that is not in the inventory (phases 1 and 3). A
+name that is not a valid hostname exits 2 before any credential is acquired. In
+phase 2 it bounds what is powered; see
+.BR "PHASE 2 SCOPE" .
 .TP
 .B \-\-continue\-on\-error
 In phase 2, carry on to the next stage even when a stage does not meet its
@@ -105,7 +119,9 @@ has failed, which is otherwise where it stops.
 .BI \-\-from " STAGE" ", " \-\-until " STAGE"
 Start and stop the power-on sequence at these stage names, inclusive. Use
 .B \-\-from
-to resume a sequence that stopped, after fixing whatever stopped it.
+to resume a sequence that stopped, after fixing whatever stopped it. A name
+that is not a stage, or a range whose end comes before its start, exits 2
+before any credential is acquired and lists the valid stage names.
 .TP
 .B \-\-include\-failed
 In phase 3, probe nodes that failed an earlier phase instead of skipping them.
@@ -184,12 +200,44 @@ default cache's principal before every mint and restore the pointer after it,
 and the service chain is abandoned outright if a restore actually fails, rather
 than leaving the operator's shell pointing at a service identity.
 .IP
-The guard is best-effort, not a precondition. When the default cache reports no
-principal at all the guard cannot be taken, and the mint proceeds
-.I unguarded
-\(em a debug line says so, and the restore afterwards is skipped because there
-is no principal to restore. That is the one case where a mint can displace a
-default this tool will not put back.
+The guard is a precondition. When the default cache cannot be read before a
+mint \(em
+.B klist
+is missing, there is no default cache, or its output names no principal
+\(em the mint is refused before
+.B get-kerberos-ticket
+runs, because a displacement could then be neither detected nor undone. Either
+guard failure (unreadable before, or displaced and not restorable after)
+abandons the service identities for the rest of the run: the run continues on
+the operator credential alone, and the reason and what to do about it
+.RB ( kinit ", or " "kswitch \-p" )
+are recorded as a phase note and as an
+.B error
+event in the run store. The decision is made on the error's type, not its
+wording.
+.IP
+One exception: when both
+.B \-\-principal
+and
+.B \-\-root\-principal
+are designated, the run uses only its own private caches and no default cache
+at all, so a mint may proceed when klist reports that there is simply no
+default (a fresh macOS login, for example). If the mint leaves its service
+identity as the new default, that cache is destroyed by name; if it cannot be,
+the service identities are abandoned as above. A missing or unparsable klist is
+still refused. Acquiring the designated principals themselves is allowed when there is no
+default at all (the operator's own principal becoming the default is not a
+displacement); a default that exists but cannot be read is refused before the
+password prompt \(em run
+.B klist
+to see why.
+.IP
+Minting is serialised. The service identities are minted once each, before any
+worker thread starts, and every mint \(em including
+.BR kinit (1)
+of a designated principal \(em runs as one locked read/mint/restore
+transaction, so two workers can neither mint the same identity twice nor
+interleave their restores of the default cache.
 .IP
 A Heimdal cache has a
 .I name
@@ -247,9 +295,16 @@ Post the phase-4 report to the electronic logbook. Requires the
 package and ECL credentials in Vault.
 .TP
 .BI \-\-run\-id " N"
-Operate on an existing run rather than starting a new one. Used with
-.B \-\-phase report
-to regenerate or repost an earlier run's report.
+Regenerate (and with
+.BR \-\-post\-ecl ,
+repost) the report of stored run
+.IR N .
+Valid only with
+.BR "\-\-phase report" ;
+with any other phase it is an error (exit 2), because it would mean reporting
+on one run while recording another. A run id that is not in the store is a
+usage error (exit 2): no run row is created and no credential is touched.
+Without it, the report phase reports on the newest run.
 .SS General
 .TP
 .BR \-h ", " \-\-help
@@ -258,7 +313,7 @@ exit.
 .TP
 .B \-\-version
 Print
-.I mu2edaq-power-recovery 0.1.0
+.I mu2edaq-power-recovery 0.2.0
 and exit. The same flag is accepted by
 .BR mu2e-power-state (1),
 .BR mu2e-power-on (1),
@@ -292,13 +347,125 @@ Print every registered check and exit.
 Print the node inventory and exit.
 .TP
 .B \-\-json
-Print the result as JSON on stdout instead of tables.
+Reserve stdout for exactly one JSON document; every human-readable line
+(banner, mode notice, phase tables, notes, report and self-update messages, and
+a self-update rebuild's output) goes to stderr. See
+.BR "JSON OUTPUT" .
 .TP
 .BR \-v ", " \-\-verbose
 Debug logging.
 .TP
 .BR \-q ", " \-\-quiet
 Warnings and errors only.
+.SH REPORT LIFECYCLE
+The run store is the record; the pages are rendered from it. The order within
+an invocation is fixed:
+.IP 1. 4
+phases 1 to 3 run and store their results;
+.IP 2. 4
+the run's final status (\fBcomplete\fR, \fBcomplete_with_failures\fR, or on
+the failure paths \fBerror\fR or \fBinterrupted\fR) and
+.I finished_at
+are written;
+.IP 3. 4
+phase 4 records its
+.B report
+phase and an event against the run and assembles the narrative from the final
+export;
+.IP 4. 4
+the run's bundle is rendered, the logbook entry is posted with that bundle's
+pages attached, the logbook outcome is written into the bundle's
+.I data/report.json
+and recorded as an event, and only then is the site published, once.
+.PP
+So no page, JSON file or logbook entry of a finished run says it is in
+progress. After an error or an interrupt the bundle is still rendered (never
+posted or published) and carries the terminal status.
+.PP
+.B Current state is reconciled.
+For each node and check the newest result wins. A failure that a later phase
+re-checked and passed is listed as
+.I resolved
+(still visible in its phase's page, the evidence and the timeline); only
+failures that are still current are
+.IR outstanding .
+Phase 2's profiles re-check subsets, so a phase-1 failure of a check phase 2
+did not run again stays outstanding. A node's status is the roll-up of its
+current checks. When its latest assessment could not reach it, the status is
+the worse of UNREACHABLE and that roll-up: a failure nothing has superseded
+keeps the node FAILED, since "we could not look again" does not clear "it is
+broken".
+The headline, counts, next steps, the logbook text and the exit status are all
+derived from this one reconciled table, together with the latest phase-3
+verdict.
+.PP
+.B Regeneration
+.RB ( "\-\-phase report" ,
+optionally
+.BR "\-\-run\-id N" )
+attaches to the selected run instead of opening a new one, never calls the
+credential bootstrap, and never changes the run's status or
+.IR finished_at .
+It adds a
+.B report
+phase row and events to that run. Vault is contacted only when the logbook post
+needs the ECL credentials; under
+.B \-\-simulate
+nothing is posted.
+.PP
+.B The report site.
+Each run is rendered into
+.I html/runs/<id>/
+(pages and
+.IR data/ )
+from that run's stored rows alone, with a page only for the phases the run
+contains; the navigation links only those. The directory is emptied first, so
+nothing from another run can survive in it. The top level of
+.I html/
+is the latest view: the newest run's bundle rendered again, with the pages and
+data files of phases the newest run lacks removed, plus
+.I runs.html
+(the run history). Regenerating an older run rewrites its bundle and leaves the
+top level as it is.
+.I report.keep_runs
+bounds the number of bundles kept: the newest that many, plus the bundle just
+rendered. Regenerating an old run therefore never deletes its own bundle
+before it can be posted, nor a newer run's; the surplus one goes at the next
+render of a newer run.
+.SH JSON OUTPUT
+With
+.BR \-\-json ,
+stdout carries exactly one JSON document and nothing else, so
+.B "| jq ."
+works directly; there are no ANSI escapes in it even with
+.BR FORCE_COLOR .
+For
+.B \-\-list\-checks
+and
+.B \-\-list\-nodes
+the document is the listing. Otherwise it is an object:
+.PP
+.RS
+.EX
+{"version":   {package_version, git_describe, ...},
+ "run_id":    N or null,
+ "status":    the run's stored status,
+ "exit_code": the process exit status,
+ "phases":    [one PhaseResult per phase that ran],
+ "report":    {output_dir, run_dir, pages, data, latest,
+               publication, ecl} or null,
+ "error":     present only on an error or interrupt}
+.EE
+.RE
+.PP
+It is written on the error and interrupt paths too, with
+.I error
+set. Phase 4's full run export is not repeated in
+.IR phases ;
+it is in
+.IR runs/<id>/data/run-export.json .
+The four single-phase commands follow the same contract. An argument the parser
+rejects is reported on stderr before any document exists.
 .SH PHASE 0
 A run that will contact the cluster begins by checking
 .I origin
@@ -315,6 +482,60 @@ the remote does not, the tool says so and runs the code that is checked out
 rather than reconciling anything itself. A fetch that fails or times out is a
 warning, never a stop. When an update is applied, the process re-executes once
 so the new code is actually the code that runs.
+.PP
+If the update touched a build input
+.RI ( selfupdate.rebuild_globs )
+and the rebuild
+.RB ( bootstrap.sh )
+fails, is missing, or cannot start, the update is abandoned: the checkout is
+reset to the full pre-update revision
+.RB ( "git reset \-\-hard" ,
+or
+.B \-\-keep
+when a dirty tree was allowed by
+.IR selfupdate.allow_dirty ,
+which keeps local edits), the process is
+.I not
+re-executed, and the run continues on the code it started with. The message
+asks the operator to run
+.B ./bootstrap.sh
+by hand, and warns that a partly run bootstrap may already have changed the
+virtual environment. If the reset itself fails the run stops with exit 2: the
+checkout no longer matches the running code, which still imports modules from
+disk. What phase 0 did (full before/after revisions, whether it rolled back,
+the revision it attempted) is stored in the run's provenance
+.RI ( version.selfupdate
+in the run store and the report).
+.SH RUN LOCK
+An invocation that can act on hardware \(em phases 1, 2 or 3 without
+.B \-\-simulate
+\(em takes an exclusive operating-system lock on
+.I run.lock_file
+.RI ( logs/power-recovery.lock )
+before phase 0, and a second such invocation exits 2 naming the holder's pid,
+start time, host and command line.
+.BR \-\-simulate ,
+.BR \-\-list\-checks ,
+.B \-\-list\-nodes
+and report-only runs do not take it. The kernel releases the lock however the
+process ends; the file, with the last holder's JSON record, is left in place
+and believed only while the lock is held. The lock is released immediately
+before the phase-0 re-exec and taken again by the new process.
+Phase 0 itself runs only under the lock: an invocation that does not take it
+\(em a report regeneration, a listing \(em never updates the checkout, which a
+live run may be executing from. The lock file is ignored by git, so it never
+makes the checkout look modified to phase 0.
+.PP
+.RS
+.EX
+python \-m mu2edaq_power_recovery.runlock status    # holder, or "not running"
+python \-m mu2edaq_power_recovery.runlock pid       # pid only while held
+.EE
+.RE
+.PP
+.B stop\-mu2edaq\-power\-recovery.sh
+signals only the pid the lock reports, and only while that process's command
+line is still the driver's.
 .SH DIAGNOSING A REFUSED LOGIN
 The primary login and ticket are logged before anything is attempted, and each
 attempt is logged at debug level in the form
@@ -353,27 +574,124 @@ failure advances it. Once
 .I ssh.login
 has been refused, the remaining SSH checks for that node are skipped rather
 than each opening its own connection to be refused again.
+.SH LIVE RUNS
+A run issues state-changing IPMI commands only when
+.I this invocation
+authorises it. The configuration can permit a live run; it cannot arm one.
+.TP
+.B \-\-simulate
+Never live, whatever else is set.
+.TP
+.B \-\-execute
+Live. This is the normal way. An
+.B MU2E_POWER_RECOVERY_ARM
+token set alongside it is ignored, with a warning.
+.TP
+.B MU2E_POWER_RECOVERY_ARM=\fIlabel\fP
+For unattended runs that cannot pass a flag. Live only when the configuration
+sets
+.I run.dry_run: false
+.B and
+a non-empty
+.I run.label
+equal to the token. The token is read from the process environment alone: it
+is not a configuration key, and putting it in
+.I config/.env
+is a configuration error (exit 2), because a persistent file that arms every
+later run is exactly what it exists to prevent. A token with no label, the
+wrong label, or with
+.I run.dry_run
+true exits 2.
+.TP
+.B run.dry_run: false alone
+From the YAML file,
+.I config/.env
+or
+.BR MU2E_POWER_RECOVERY_RUN_DRY_RUN=false ,
+with neither of the above: exit 2, with a message naming where the setting came
+from and both ways to authorise \(em for an invocation that includes phase 2
+.RB ( "\-\-phase poweron" ,
+.BR "\-\-phase all" ,
+.BR mu2e-power-on ).
+.TP
+.B Read-only invocations
+.BR "\-\-phase assess" ,
+.BR network ,
+.B report
+and their drivers
+.RB ( mu2e-power-state ,
+.BR mu2e-power-netcheck ,
+.BR mu2e-power-report )
+cannot issue a power command, so nothing is authorised and nothing is
+refused: they always run as a dry run, whatever
+.IR run.dry_run ,
+.B \-\-execute
+or the token say, and log an info line naming what was ignored. Refusing them
+would stop every read-only driver at a site that set
+.I run.dry_run: false
+for the token path.
+.PP
+The decision is made before phase 0 and before any credential. A live run
+prints
+.B "LIVE RUN \-\- power commands WILL be issued (authorised by ...)"
+before the first phase, logs a warning and records an event in the run store
+naming what armed it.
+.SH PHASE 2 SCOPE
+The power-on plan is made before any credential is acquired and before the
+run is recorded; anything it cannot honour exactly exits 2.
+.B \-\-location
+drops stages in other locations (with a notice; none left is an error).
+.B \-\-node
+cuts the stages holding the named nodes to those nodes; the stages before them
+(from the start of the
+.BR \-\-from / \-\-until
+range) are verify-only \(em power state read, ssh waited for, checks run, no
+power command \(em and if one of them is not up, the run stops before the
+requested nodes, even with
+.BR \-\-continue\-on\-error ,
+and says which stage to run explicitly. Stages after the last requested node
+are not run. A name in no stage, or only outside the range or locations, is an
+error naming its stage. See
+.BR mu2e-power-on (1).
+.SH TIME LIMITS
+Four timeouts nest:
+.TP
+.I run.phase_timeout
+Wall-clock budget of each of phases 1\(en3 (0 or null: unbounded). Checked
+before every stage, node and check; what it never reached is UNKNOWN,
+.IR "not run: phase_timeout expired" .
+.TP
+.IR boot_timeout " (per stage)"
+How long phase 2 waits for a stage's nodes to answer ssh, all at once under one
+stage deadline of now +
+.RI min( boot_timeout ", phase time left)."
+Concurrent ssh attempts are bounded by
+.IR ssh.max_sessions .
+.TP
+.I ssh.command_timeout
+Per command, capped at the phase time left.
+.TP
+.I ssh.connect_timeout
+Per connection; a boot-wait attempt is
+.I connect_timeout
++ 5 s, capped at the stage time left.
+.PP
+So a phase overruns its budget by at most the one call in flight when it
+expires, and that call was itself capped at what was left when it started.
 .SH SAFETY
 .TP
 .B Dry run by default
-No power command is issued while
-.I run.dry_run
-is true, which is the default.
-.B \-\-execute
-is the supported way to set it false, but it is not a separate gate:
-.I run.dry_run
-is an ordinary configuration key, so setting it false in
-.IR config/power\-recovery.yaml ", " config/.env
-or as
-.B MU2E_POWER_RECOVERY_RUN_DRY_RUN=false
-arms the destructive path with no flag on the command line. The run says which
-it is \(em
-.B "LIVE RUN \-\- power commands WILL be issued."
-\(em before the first phase.
+No power command is issued unless this invocation authorises it; see
+.BR "LIVE RUNS" .
 .B \-\-simulate
-is the gate no configuration file can open: it forces
+is the gate nothing can open: it forces
 .I run.dry_run
 back to true whatever else was asked for.
+.TP
+.B Scope is enforced twice
+The phase-2 plan decides which hosts may be powered; the power step refuses any
+other host independently and records it as
+.IR out_of_scope .
 .TP
 .B Protected hosts
 .BR "chassis power off" ", " cycle " and " reset
@@ -409,7 +727,23 @@ account on each. Only a RAKP failure or
 counts as a rejection;
 .I "Unable to establish IPMI v2 / RMCP+ session"
 deliberately does not, because a dark chassis says exactly that and after an
-outage a dark chassis is the expected case. Set
+outage a dark chassis is the expected case. This holds with sixteen workers
+assessing at once: until one BMC has accepted the credential, IPMI commands go
+out one at a time, so a wrong credential reaches one BMC, and every waiting
+check reports the shared diagnosis as
+.B unknown
+without invoking ipmitool. Each such unproven call is preceded by one
+.B ping \-c 1 \-W 1
+of the BMC from the gateway, outside that one-at-a-time gate: a dark BMC is
+reported unreachable without ipmitool, its
+.BR power.sensors " and " power.sel
+are
+.B unknown
+without a further call, and dark BMCs are therefore checked concurrently. Two
+BMCs that answer the ping and still fail with "Unable to establish" trip the
+stop as well (likely a wrong username).
+.I ipmi.reachability_precheck: false
+disables the ping for BMCs that filter ICMP. Set
 .I ipmi.stop_on_auth_failure: false
 to carry on regardless.
 .TP
@@ -463,10 +797,19 @@ Local overrides. Not in version control.
 The run store.
 .TP
 .I html/
-The generated report site.
+The report site: the newest run's view at the top level,
+.I runs.html
+and one bundle per run under
+.IR html/runs/<id>/ .
 .TP
 .I logs/power-recovery.log
 Rotating log of every run.
+.TP
+.I logs/power-recovery.lock
+The run lock
+.RI ( run.lock_file );
+see
+.BR "RUN LOCK" .
 .SH ENVIRONMENT
 Every configuration key can be overridden by an environment variable named
 .BI MU2E_POWER_RECOVERY_ KEY
@@ -483,7 +826,7 @@ Priority, lowest first: built-in defaults, the YAML config file,
 .IR config/.env ,
 the environment, the command line.
 .PP
-Three further variables are read directly rather than as configuration keys:
+Four further variables are read directly rather than as configuration keys:
 .TP
 .B NO_COLOR
 When set to any non-empty value, output is not coloured, whatever the terminal
@@ -494,6 +837,12 @@ When set, output is coloured even when stdout is not a terminal \(em for
 capturing a coloured transcript into a file or a pipe.
 .B NO_COLOR
 wins if both are set.
+.TP
+.B MU2E_POWER_RECOVERY_ARM
+The per-invocation live-run token; see
+.BR "LIVE RUNS" .
+Never read from
+.IR config/.env .
 .TP
 .B MU2E_POWER_RECOVERY_UPDATED
 Set to
@@ -512,7 +861,19 @@ Every phase completed and nothing failed.
 A phase completed but one or more nodes failed their checks.
 .TP
 .B 2
-The run could not start: configuration, credentials, or no reachable gateway.
+The run could not start: configuration, credentials, no reachable gateway, a
+live run the invocation did not authorise, another run holding the run lock, a
+failed update that could not be rolled back, a phase-2 stage or node selection
+that cannot be honoured, or a
+.B \-\-run\-id
+that is misplaced or not in the store; or it stopped on an internal error
+(recorded as status
+.BR error ).
+.PP
+Statuses 0 and 1 are decided by the reconciled current state (see
+.BR "REPORT LIFECYCLE" ),
+so a failure that a later phase re-checked and passed does not make the
+run exit 1.
 .TP
 .B 3
 Interrupted by the operator.
@@ -554,11 +915,19 @@ mu2e-power\-on \-\-execute \-\-from dcs
 .EE
 .RE
 .PP
-Regenerate and post the report for an earlier run:
+Regenerate and post the report for an earlier run (no new run is created):
 .PP
 .RS
 .EX
 mu2e-power\-report \-\-run\-id 17 \-\-post\-ecl
+.EE
+.RE
+.PP
+Machine-readable result:
+.PP
+.RS
+.EX
+mu2e-power-recovery \-\-phase all \-\-simulate \-\-json | jq .status
 .EE
 .RE
 .SH SEE ALSO

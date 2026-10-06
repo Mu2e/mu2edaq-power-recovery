@@ -1,4 +1,4 @@
-.TH MU2E-POWER-ON 1 "2026-09-18" "mu2edaq-power-recovery 0.1.0" "Mu2e DAQ Operations"
+.TH MU2E-POWER-ON 1 "2026-09-29" "mu2edaq-power-recovery 0.2.0" "Mu2e DAQ Operations"
 .SH NAME
 mu2e-power-on \- phase 2: bring the Mu2e DAQ cluster up in dependency order
 .SH SYNOPSIS
@@ -25,6 +25,10 @@ to whatever is off;
 .IP \(bu 2
 wait for SSH to answer, up to the stage's
 .IR boot_timeout ;
+every node of the stage is waited for at once, under one stage deadline, so a
+stage whose nodes never answer costs one
+.IR boot_timeout ,
+not one per node;
 .IP \(bu 2
 wait the stage's
 .I settle
@@ -52,14 +56,90 @@ A stage that does not meet its requirement stops the sequence, unless
 .B \-\-continue\-on\-error
 is given. That is deliberate: later stages depend on the services the earlier
 ones provide, so continuing would produce failures that say nothing new.
+.SH SCOPE AND DEPENDENCIES
+What the phase may touch is decided before any credential is acquired, from
+.BR \-\-from / \-\-until ,
+.B \-\-location
+and
+.BR \-\-node .
+A selection that cannot be honoured exactly is an error (exit 2) \(em never a
+silent widening.
+.IP \(bu 2
+.B \-\-from
+and
+.B \-\-until
+must name stages exactly; an unknown name, a reversed range, or a sequence with
+duplicate stage names is rejected with the list of valid names.
+.IP \(bu 2
+.B \-\-location
+drops stages whose
+.I location:
+is not among those requested, with a notice; if no stage is left, that is an
+error. The shipped sequence is all MC-2, so
+.B \-\-location teststand
+alone has nothing to run.
+.IP \(bu 2
+.B \-\-node
+cuts the stages that hold the named nodes down to those nodes. The stages
+before them, from the start of the
+.BR \-\-from / \-\-until
+range, are
+.B predecessors
+and are included
+.BR verify-only :
+their power state is read, they are waited for and checked, but no power command
+is sent to them. If a predecessor stage is not up \(em a node in it is off,
+never answers ssh, or the stage misses its
+.I require
+setting \(em the run stops before the requested nodes' stage, whatever
+.B \-\-continue\-on\-error
+says, and tells you to run that stage explicitly
+.RB ( "\-\-from STAGE \-\-until STAGE" ).
+Stages after the last one holding a requested node are not run (SKIP, "outside
+requested scope").
+.B \-\-from
+bounds how far back predecessors reach:
+.B "\-\-from readout \-\-node mu2e-trk-01"
+touches that one node and nothing else.
+.IP \(bu 2
+A
+.B \-\-node
+name that is in no stage, or only in stages outside the range or the locations,
+is an error naming the stage(s) it is in.
+.PP
+The notices describing all of this are printed before the run starts and are
+kept in the report notes and the run store's events. Independently of the plan,
+the power step refuses any host the plan did not allow, recording it as action
+.IR out_of_scope .
+.PP
+Each BMC is driven through a gateway of its own location; a location whose
+gateways do not answer has no IPMI there, rather than borrowing another site's.
+.SH TIME LIMITS
+.I run.phase_timeout
+bounds the whole phase. It is checked before every stage and before each node's
+power command, and every ssh call's timeout is capped at the time left, so the
+phase overruns by at most the one call in flight. A stage's boot wait ends at
+now +
+.RI min( boot_timeout ", phase time left)."
+Stages and nodes the budget never reached are UNKNOWN with
+.IR "not run: phase_timeout expired" ,
+distinct from a failed check and from an unreachable node; resume with
+.BR \-\-from .
 .SH SAFETY
 This command is a
 .B dry run
-unless
+unless this invocation authorises live power commands, with
 .B \-\-execute
-is given: power states are read, and the report shows what
+or with the
+.B MU2E_POWER_RECOVERY_ARM
+token (see
+.BR mu2e-power-recovery (1),
+.BR "LIVE RUNS" ).
+In a dry run power states are read, and the report shows what
 .I would
 have been switched on, but no chassis is touched.
+.I run.dry_run: false
+in the configuration alone does not arm anything; it is refused with exit 2.
 .PP
 .BR "chassis power off" ", " cycle " and " reset
 are refused for the hosts listed under
@@ -74,8 +154,9 @@ and
 .BR \-\-execute .
 The gateway stage never issues a power command at all; it verifies only.
 .PP
-All the BMCs share one credential set, so a refused BMC credential is not
-retried and not repeated: the first rejection stops the run issuing IPMI and
+The BMCs of a location share one credential set, so a refused BMC credential
+is not retried and not repeated: the first rejection stops the run issuing
+IPMI to that location (other locations, whose account may differ, carry on) and
 produces one diagnosis naming the username that was refused, instead of walking
 the same wrong credential through every chassis and locking the account on
 each. Only a RAKP failure or
@@ -83,7 +164,11 @@ each. Only a RAKP failure or
 counts;
 .I "Unable to establish IPMI v2 / RMCP+ session"
 does not, because that is also what a chassis with no standby power says, and
-after an outage that is the expected case. Set
+after an outage that is the expected case. A node whose power state could not
+be read because of that refusal is recorded as
+.IR credentials_refused ,
+distinct both from a BMC that did not answer and from the deliberate
+protected-host refusal. Set
 .I ipmi.stop_on_auth_failure: false
 to override.
 .PP
@@ -108,26 +193,18 @@ Stop after this stage. Useful for bringing up the infrastructure nodes and
 pausing before the detector readout.
 .TP
 .B "Spelling, for both of the above"
-A stage name that matches nothing is
-.I silently ignored,
-not rejected:
-.B \-\-from
-falls back to the first stage and
-.B \-\-until
-to the last. So
-.B "mu2e-power-on \-\-execute \-\-from manger"
-\(em one letter wrong \(em powers on the
-.I whole
-sequence, readout included, with no error and no note in the report. For a flag
-whose purpose is to bound what gets switched on, check the name took: the stage
-names are the
+A stage name must match a
 .I name:
-keys in
+key in
 .BR mu2edaq-power-sequence.yaml (5)
-.RB ( gateways ", " manager ", " dataloggers ", " dcs ", " cfo ", " readout ),
-and a dry run without
-.B \-\-execute
-lists the stages it would act on.
+.RB ( gateways ", " manager ", " dataloggers ", " dcs ", " cfo ", " readout )
+exactly.
+.B "mu2e-power-on \-\-execute \-\-from manger"
+exits 2 before any credential is acquired, listing the valid names; so does a
+reversed range, and so does a typo in
+.I run.from_stage
+or
+.IR run.until_stage .
 .TP
 .B \-\-continue\-on\-error
 Do not stop at the first stage that fails its requirement.
@@ -137,7 +214,9 @@ Do not stop at the first stage that fails its requirement.
 Label for this run, shown in the report header and the logbook subject.
 .TP
 .B \-\-execute
-Required for this phase to switch anything on. Without it nothing is issued.
+Authorises this invocation to switch things on. Without it (or the
+.B MU2E_POWER_RECOVERY_ARM
+token) nothing is issued.
 .TP
 .B \-\-simulate
 Contact nothing at all; answer every command from the built-in script. It
@@ -147,18 +226,15 @@ on the same command line, so a rehearsal cannot become a real power-on by
 leaving a flag behind.
 .TP
 .BI \-\-location " NAME"
-Repeatable. Accepted, but it does not narrow this phase: each stage in
-.BR mu2edaq-power-sequence.yaml (5)
-carries its own
+Repeatable. Stages whose
 .I location:
-and its node list is expanded against that.
+is not listed are not run. See
+.BR "SCOPE AND DEPENDENCIES" .
 .TP
 .BI \-\-node " HOST"
-Repeatable. Accepted, and likewise does not narrow this phase \(em stage
-membership comes from the sequence file, not from the command line. To bound
-what is powered on, use
-.BR \-\-from " and " \-\-until ,
-or edit the sequence file.
+Repeatable. Only these nodes are powered; the stages before theirs are
+verified, never powered, and later stages are not run. See
+.BR "SCOPE AND DEPENDENCIES" .
 .TP
 .B \-\-include\-failed
 Accepted; it governs phase 3 and has no effect here.
@@ -210,7 +286,7 @@ Print the option summary and exit.
 .TP
 .B \-\-version
 Print
-.I mu2edaq-power-recovery 0.1.0
+.I mu2edaq-power-recovery 0.2.0
 and exit.
 .TP
 .BI \-\-config " FILE"
@@ -234,7 +310,12 @@ Print every registered check and exit.
 Print the node inventory and exit.
 .TP
 .B \-\-json
-Print the result as JSON on stdout instead of tables.
+Reserve stdout for exactly one JSON document; every human-readable line
+(banner, mode notice, phase tables, notes, report and self-update messages, and
+a self-update rebuild's output) goes to stderr. See
+.B JSON OUTPUT
+in
+.BR mu2e-power-recovery (1).
 .TP
 .BR \-v ", " \-\-verbose
 Debug logging, including the exact
@@ -252,7 +333,10 @@ Every stage met its requirement.
 The sequence ran but a stage failed, or nodes failed their checks.
 .TP
 .B 2
-The sequence could not start: no gateway, or no BMC credentials.
+The sequence could not start: no gateway, no BMC credentials, a stage or node
+selection that cannot be honoured, a configuration that asks for a live run
+this invocation did not authorise, or another run holding the run lock
+.RI ( run.lock_file ).
 .SH EXAMPLES
 See what would happen, without doing it:
 .RS
@@ -272,6 +356,24 @@ Resume at the DCS stage after repairing it:
 .RS
 .EX
 mu2e-power-on \-\-execute \-\-from dcs
+.EE
+.RE
+.PP
+Power on one readout node, verifying (not powering) everything it depends on:
+.RS
+.EX
+mu2e-power-on \-\-execute \-\-node mu2e-trk-01
+.EE
+.RE
+.PP
+Arm an unattended run from its environment instead of the flag (the
+configuration must set
+.I run.dry_run: false
+and
+.IR "run.label: sept-2026" ):
+.RS
+.EX
+MU2E_POWER_RECOVERY_ARM=sept-2026 mu2e-power-on \-\-no\-prompt
 .EE
 .RE
 .PP

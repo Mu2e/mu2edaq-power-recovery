@@ -109,3 +109,80 @@ def test_a_database_url_overrides_the_sqlite_path(settings, tmp_path):
     store = RunStore.from_settings(settings)
     assert store.url.endswith("explicit.db")
     store.close()
+
+
+def test_attach_selects_an_existing_run_without_inserting_one(store):
+    first = store.start_run("one", True, {}, {})
+    store.finish_run("complete")
+    store.start_run("two", True, {}, {})
+    run = store.attach(first)
+    assert run["id"] == first and store.run_id == first
+    assert len(store.list_runs()) == 2
+    with pytest.raises(KeyError):
+        store.attach(99)
+
+
+def test_phase_and_event_writes_can_name_their_run(store):
+    first = store.start_run("one", True, {}, {})
+    second = store.start_run("two", True, {}, {})      # now current
+    phase_id = store.start_phase("report", 4, run_id=first)
+    store.record_event("for the first run", run_id=first)
+    store.finish_phase("complete", "done", {"x": 1}, phase_id=phase_id)
+    store.annotate_phase(phase_id, {"_result": {"status": "ok"}})
+    assert [p["name"] for p in store.get_phases(first)] == ["report"]
+    assert store.get_phases(second) == []
+    assert store.get_phases(first)[0]["data"] == {"x": 1,
+                                                  "_result": {"status": "ok"}}
+    assert [e["message"] for e in store.get_events(first)] == ["for the first run"]
+    store.finish_run("error", run_id=first)
+    assert store.get_run(first)["status"] == "error"
+    assert store.get_run(second)["status"] == "running"
+
+
+def test_a_run_records_whether_it_was_simulated(store):
+    real = store.start_run("real", True, {}, {})
+    rehearsal = store.start_run("rehearsal", True, {}, {}, simulated=True)
+    assert store.is_simulated(real) is False
+    assert store.is_simulated(rehearsal) is True
+    assert {r["id"]: r["simulated"] for r in store.list_runs()} == \
+        {real: 0, rehearsal: 1}
+    assert store.export_run(rehearsal)["run"]["simulated"] == 1
+
+
+def test_an_older_store_gains_the_simulated_column(tmp_path):
+    # A store written before the column existed: create_all() does not alter
+    # an existing table, so RunStore must add it, and resolve the NULL of an
+    # old row from the note every simulated run recorded.
+    import sqlite3
+    path = tmp_path / "old.db"
+    with sqlite3.connect(str(path)) as conn:
+        conn.execute("create table runs (id integer primary key, label "
+                     "varchar(255), started_at datetime, finished_at datetime, "
+                     "operator varchar(128), workstation varchar(255), dry_run "
+                     "integer, status varchar(32), version json, settings json)")
+        conn.execute("create table events (id integer primary key, run_id "
+                     "integer, level varchar(16), message text, recorded_at "
+                     "datetime)")
+        conn.execute("insert into runs (id, label, dry_run, status) "
+                     "values (1, 'old real', 1, 'complete')")
+        conn.execute("insert into runs (id, label, dry_run, status) "
+                     "values (2, 'old rehearsal', 1, 'complete')")
+        conn.execute("insert into events (run_id, level, message) values "
+                     "(2, 'note', 'simulated run: no credentials acquired, no "
+                     "host contacted; all command output is scripted')")
+        # A different 'simulated run:' message is not the marker.
+        conn.execute("insert into events (run_id, level, message) values "
+                     "(1, 'info', 'simulated run: nothing was posted to the "
+                     "logbook')")
+    store = RunStore(f"sqlite:///{path}")
+    try:
+        assert store.is_simulated(1) is False
+        assert store.is_simulated(2) is True
+        new = store.start_run("new", True, {}, {}, simulated=True)
+        assert store.is_simulated(new) is True
+    finally:
+        store.close()
+    with sqlite3.connect(str(path)) as conn:
+        cols = [row[1] for row in conn.execute("pragma table_info(runs)")]
+    assert "simulated" in cols
+    RunStore(f"sqlite:///{path}").close()          # idempotent on reopen

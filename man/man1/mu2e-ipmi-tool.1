@@ -1,4 +1,4 @@
-.TH MU2E-IPMI-TOOL 1 "2026-09-18" "mu2edaq-power-recovery 0.1.0" "Mu2e DAQ Operations"
+.TH MU2E-IPMI-TOOL 1 "2026-09-29" "mu2edaq-power-recovery 0.2.0" "Mu2e DAQ Operations"
 .SH NAME
 mu2e-ipmi-tool \- run an ipmitool command against Mu2e DAQ BMCs, from a gateway
 .SH SYNOPSIS
@@ -10,6 +10,8 @@ mu2e-ipmi-tool \- run an ipmitool command against Mu2e DAQ BMCs, from a gateway
 .RB [ \-\-execute ]
 .RB [ \-\-diagnose ]
 .RB [ \-\-show\-command ]
+.RB [ \-\-principal
+.IR PRINCIPAL ]
 .I ARG...
 .SH DESCRIPTION
 Issues one
@@ -37,28 +39,46 @@ is run
 .I on the gateway,
 not locally: the IPMI subnets (192.168.157.0/24 at MC-2, 192.168.150.0/24 at
 the teststand) are not routable from off site.
-.SH WHAT THIS TOOL DOES NOT TEST
-It reaches the gateway with the
-.I ambient
-Kerberos ticket only. Unlike a real run and unlike
-.BR mu2e-ssh-probe (1),
-it builds no credential chain \(em no service-identity fallbacks \(em and it
-does not check whether the default credential cache holds a personal principal.
-Two consequences, both of which have been mistaken for something else:
+.SH CREDENTIALS
+The gateway session is opened through the same credential bootstrap a
+recovery run uses, so a result here is evidence about what the run would see:
 .IP \(bu 2
-It can fail against a gateway a real run would open, because the run would
-have fallen back to a service identity and this will not.
+The default credential cache is checked first, and a warning is printed when it
+holds a service identity or a principal other than
+.IR kerberos.principal .
 .IP \(bu 2
-It can succeed while a real run fails, or the other way round, when the default
-cache has been displaced by a service ticket \(em on macOS the usual residue of
-an earlier run.
+A designated principal
+.RI ( kerberos.principal ", " kerberos.root_principal ,
+or
+.BR \-\-principal / \-\-root\-principal )
+is acquired into a cache private to the invocation \(em prompting for its
+password if it has no valid ticket \(em and that cache is what
+.BR ssh (1)
+is given.
+.IP \(bu 2
+The operator's own principal leads the chain; the Mu2e service identities from
+Vault follow as fallbacks, tried only on an authentication refusal, exactly as
+in a run. A default-cache guard failure while minting one (the default could
+not be read beforehand, or was displaced and could not be restored) abandons
+the fallbacks and continues on the operator credential alone.
+.IP \(bu 2
+Every private cache is destroyed on the way out \(em on success, on an error,
+and on Ctrl-C or
+.B SIGTERM
+(which takes the same path).
 .PP
-Treat a working
+.B \-\-show\-command
+acquires and mints nothing: printing an invocation is no reason to prompt for a
+password. If it has to pick a gateway (no
+.BR \-\-gateway ),
+that probe runs with the credentials that already exist.
+.PP
+A working
 .B mu2e-ipmi-tool
-as evidence about the
+is still primarily evidence about the
 .I BMC
-credentials, never as evidence that the recovery can log in. For that, use
-.B mu2e-ssh-probe \-\-run true.
+credentials. Whether the recovery can log in to the nodes is
+.BR "mu2e-ssh-probe \-\-run true" .
 .SH OPTIONS
 .TP
 .BI \-n " HOST" "\fR, \fP" \-\-node " HOST"
@@ -68,17 +88,19 @@ and no
 .BR \-c ,
 every node at the location that has a BMC is targeted.
 .IP
-Targets are then filtered to nodes that have a BMC \(em but if that filter would
-empty the list, the unfiltered list is used instead. Naming
-.I only
-hosts with no
+Only nodes with a BMC are addressed. Every other node selected by
+.B \-n
+or
+.B \-c
+is named on standard error with the reason, which distinguishes an
+.I "unknown host"
+(not in the topology for the location) from a node with
+.I "no BMC"
+(in the topology, but with no
 .I ipmi:
-interface therefore does not stop the tool: it runs
-.B ipmitool \-H None
-on the gateway and reports the resulting failure. Only
-.B \-\-diagnose
-rejects such a host properly, with
-.IR "has no BMC in the topology" .
+interface). The tool never falls back to the unfiltered selection: when no node
+with a BMC remains it exits with status 2 before Vault is read or a gateway is
+contacted.
 .BR mu2e-node-inventory (1)
 .B \-n ipmi \-\-hostnames
 lists the hosts that actually have one.
@@ -126,13 +148,25 @@ from the environment.
 .B \-\-execute
 Really issue a state-changing verb
 .RB ( "chassis power on" / off / cycle / reset ).
-Without it, the intended action is reported and nothing is sent.
+Without it, the intended action is reported and nothing is sent. Either way,
+a state-changing verb first lists every target by hostname and BMC, marking a
+protected host whose destructive verb will be refused.
 .TP
 .B \-\-yes
-Skip the confirmation prompt before a destructive verb.
+Skip the confirmation prompt before a destructive verb. The prompt refers to
+that full list of targets, never to a count.
 .TP
 .B \-\-json
 Emit the per-node results as JSON.
+.TP
+.BI \-\-principal " PRINCIPAL"
+Kerberos principal for the gateway login; overrides
+.IR kerberos.principal .
+A password is prompted for when it has no valid ticket.
+.TP
+.BI \-\-root\-principal " PRINCIPAL"
+Root-capable principal; overrides
+.IR kerberos.root_principal .
 .TP
 .BI \-\-config " FILE"
 Main configuration file. Default:
@@ -165,6 +199,16 @@ and
 .B \-\-yes
 do not override this. Powering any of them down would cut off access to the
 cluster being recovered, or stop the NFS server the rest of it mounts from.
+.PP
+A state-changing command issued with
+.B \-\-execute
+takes the recovery run lock
+.RI ( run.lock_file ,
+see
+.BR mu2e-power-recovery (1))
+for its duration, and exits 2 naming the holder if a recovery run already has
+it, so it cannot interleave power commands with phase 2. Reads and intent-only
+listings do not take it.
 .SH EXAMPLES
 Work out why a BMC refuses the session:
 .RS
@@ -252,17 +296,39 @@ the cipher suite \(em some BMCs need
 .I ipmi.cipher_suite: 17
 rather than 3.
 .PP
-A rejected credential is neither retried nor repeated. Every BMC shares one
-credential set, so the first rejection settles the matter for the whole run:
+A rejected credential is neither retried nor repeated. The BMCs of a location
+share one credential set, so the first rejection settles the matter for that
+location:
 .BR mu2e-power-on (1)
 stops issuing IPMI and reports a single diagnosis naming the refused username,
 rather than walking the same wrong credential through all forty-five chassis
 and locking the account on each. Only a RAKP failure or
 .I "unauthorized name"
 is read as a rejection; the RMCP+ message above deliberately is not, for the
-reason in point 1. Set
+reason in point 1. The stop holds under concurrency too: until one BMC has
+accepted the credential, IPMI commands are issued one at a time, so a wrong
+credential reaches exactly one BMC however many workers are running. Set
 .I ipmi.stop_on_auth_failure: false
-to override.
+to override both. This tool honours that key as the run does: in a
+.BR \-c / \-l
+sweep, the first refusal stops the remaining BMCs being asked, and the reason is
+printed once after the table.
+.PP
+While the credential is unproven each BMC is first pinged once from the
+gateway
+.RI ( ipmi.reachability_precheck );
+a BMC that does not answer is reported without ipmitool being run, and
+.B \-\-diagnose
+stops at once rather than spending its attempts on a dark BMC. Two BMCs that
+answer the ping and still fail with "Unable to establish" also stop the sweep:
+the likeliest cause is a wrong username. Set
+.I ipmi.reachability_precheck: false
+for BMCs that filter ICMP.
+.PP
+A name that is not a valid hostname (for example one containing
+.BR ; )
+is rejected with an error and exit status 2 before Vault or a gateway is
+contacted.
 .PP
 .B \-\-diagnose
 is capped at nine attempts for the same reason: each failure counts towards the
@@ -295,10 +361,14 @@ The command succeeded on every target.
 It failed, or was refused, on at least one target.
 .TP
 .B 2
-No credentials, or no gateway to run from.
+No selected node has a BMC, no credentials (BMC, or a designated Kerberos
+principal), or no gateway to run from.
 .TP
 .B 3
-The operator declined the confirmation prompt.
+The operator declined the confirmation prompt, or the tool was interrupted
+(Ctrl-C or
+.BR SIGTERM ;
+the private caches were destroyed).
 .SH SEE ALSO
 .BR mu2e-power-on (1),
 .BR mu2e-vault-ipmi (1),

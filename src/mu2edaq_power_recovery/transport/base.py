@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import abc
+import contextlib
 import shlex
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Union
 
@@ -123,3 +125,28 @@ class Transport(abc.ABC):
 
     def __exit__(self, *exc: Any) -> None:
         self.close()
+
+
+_EXEMPT = threading.local()
+
+
+@contextlib.contextmanager
+def deadline_exempt():
+    """Run the enclosed commands with their own timeout, not the phase budget.
+
+    For state-changing IPMI calls only. Capping 'chassis power on' at the
+    budget's last second would kill the local ssh while ipmitool runs on in
+    the gateway: the chassis may come on with nothing recorded (PR #30
+    review). The budget is checked before such a call is started instead.
+    Thread-local: concurrent workers keep their own caps.
+    """
+    previous = getattr(_EXEMPT, "on", False)
+    _EXEMPT.on = True
+    try:
+        yield
+    finally:
+        _EXEMPT.on = previous
+
+
+def is_deadline_exempt() -> bool:
+    return getattr(_EXEMPT, "on", False)

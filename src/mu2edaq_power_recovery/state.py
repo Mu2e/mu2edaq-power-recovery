@@ -22,7 +22,8 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 
 from sqlalchemy import (JSON, Column, DateTime, Float, ForeignKey, Integer,
-                        MetaData, String, Table, Text, create_engine, select)
+                        MetaData, String, Table, Text, create_engine, inspect,
+                        select, text)
 from sqlalchemy.engine import Engine
 
 log = logging.getLogger(__name__)
@@ -42,6 +43,12 @@ runs = Table(
     Column("status", String(32), default="running"),
     Column("version", JSON),
     Column("settings", JSON),
+    #: 1 for a --simulate rehearsal: every result in it is scripted. Added
+    #: after the first release, so a store created before it gets the column
+    #: from :meth:`RunStore._migrate`, and a row written by an older version
+    #: holds NULL -- resolved from the run's events (see
+    #: :meth:`RunStore._resolve_simulated`).
+    Column("simulated", Integer, nullable=True),
 )
 
 phases = Table(
@@ -102,6 +109,17 @@ actions = Table(
     Column("recorded_at", DateTime),
 )
 
+#: The note every simulated run has recorded since before the ``simulated``
+#: column existed (Orchestrator.prepare_credentials); how a NULL is resolved.
+SIMULATED_NOTE = "simulated run: no credentials acquired"
+
+#: Columns added to existing tables after the first release. ``create_all``
+#: creates missing tables but never alters an existing one, so each of these
+#: is added by :meth:`RunStore._migrate` with a plain ``ALTER TABLE ... ADD
+#: COLUMN``, which SQLite and Postgres both accept. Nullable, no default: a
+#: NULL means "written by a version that did not record it".
+_ADDED_COLUMNS = {"runs": [("simulated", "INTEGER")]}
+
 #: Free-form timeline: phase boundaries, operator decisions, warnings.
 events = Table(
     "events", metadata,
@@ -131,6 +149,7 @@ class RunStore:
         self.engine: Engine = create_engine(url, echo=echo, future=True,
                                             connect_args=connect_args)
         metadata.create_all(self.engine)
+        self._migrate()
         self.run_id: Optional[int] = None
         self.phase_id: Optional[int] = None
 
@@ -146,6 +165,24 @@ class RunStore:
             url = f"sqlite:///{path}"
         return cls(url)
 
+    def _migrate(self) -> None:
+        """Add the columns of :data:`_ADDED_COLUMNS` an older store lacks."""
+        for table, columns in _ADDED_COLUMNS.items():
+            present = {c["name"] for c in inspect(self.engine).get_columns(table)}
+            for name, sql_type in columns:
+                if name in present:
+                    continue
+                try:
+                    with self.engine.begin() as conn:
+                        conn.execute(text(f"ALTER TABLE {table} "
+                                          f"ADD COLUMN {name} {sql_type}"))
+                    log.info("run store: added column %s.%s", table, name)
+                except Exception:  # noqa: BLE001 - a concurrent process won
+                    again = {c["name"] for c in
+                             inspect(self.engine).get_columns(table)}
+                    if name not in again:
+                        raise
+
     @contextmanager
     def _connect(self) -> Iterator[Any]:
         with self.engine.begin() as conn:
@@ -154,7 +191,10 @@ class RunStore:
     # -- runs --------------------------------------------------------------
 
     def start_run(self, label: str, dry_run: bool, version: Dict[str, Any],
-                  settings: Dict[str, Any]) -> int:
+                  settings: Dict[str, Any], simulated: bool = False) -> int:
+        """Insert the run row. *simulated* marks a ``--simulate`` rehearsal:
+        such a run is never posted to the logbook or published, however it is
+        later regenerated (see :meth:`is_simulated`)."""
         with self._connect() as conn:
             result = conn.execute(runs.insert().values(
                 label=label,
@@ -162,38 +202,78 @@ class RunStore:
                 operator=os.environ.get("USER") or os.environ.get("USERNAME") or "unknown",
                 workstation=socket.gethostname(),
                 dry_run=1 if dry_run else 0,
+                simulated=1 if simulated else 0,
                 status="running",
                 version=version,
                 settings=settings,
             ))
             self.run_id = int(result.inserted_primary_key[0])
-        log.info("run %s started (%s)", self.run_id, "dry run" if dry_run else "LIVE")
+        log.info("run %s started (%s)", self.run_id,
+                 "simulated" if simulated else
+                 "dry run" if dry_run else "LIVE")
         return self.run_id
 
-    def finish_run(self, status: str = "complete") -> None:
-        if self.run_id is None:
+    def attach(self, run_id: int) -> Dict[str, Any]:
+        """Make an existing run the current one, without inserting a row.
+
+        Report regeneration operates on the run it was asked about: phase 4's
+        phase row and events belong to *that* run, and a local re-render must
+        not leave an unrelated empty run in the history. Raises
+        :class:`KeyError` when the run is not in the store.
+        """
+        run = self.get_run(run_id)
+        if run is None:
+            raise KeyError(run_id)
+        self.run_id = int(run_id)
+        self.phase_id = None
+        return run
+
+    def finish_run(self, status: str = "complete",
+                   run_id: Optional[int] = None) -> None:
+        rid = run_id or self.run_id
+        if rid is None:
             return
         with self._connect() as conn:
-            conn.execute(runs.update().where(runs.c.id == self.run_id).values(
+            conn.execute(runs.update().where(runs.c.id == rid).values(
                 finished_at=_now(), status=status))
 
     # -- phases ------------------------------------------------------------
 
-    def start_phase(self, name: str, number: int) -> int:
+    def start_phase(self, name: str, number: int,
+                    run_id: Optional[int] = None) -> int:
+        """Open a phase row against *run_id* (default: the current run)."""
         with self._connect() as conn:
             result = conn.execute(phases.insert().values(
-                run_id=self.run_id, name=name, number=number,
+                run_id=run_id or self.run_id, name=name, number=number,
                 started_at=_now(), status="running", data={}))
             self.phase_id = int(result.inserted_primary_key[0])
         return self.phase_id
 
     def finish_phase(self, status: str, summary: str = "",
-                     data: Optional[Dict[str, Any]] = None) -> None:
-        if self.phase_id is None:
+                     data: Optional[Dict[str, Any]] = None,
+                     phase_id: Optional[int] = None) -> None:
+        pid = phase_id or self.phase_id
+        if pid is None:
             return
         with self._connect() as conn:
-            conn.execute(phases.update().where(phases.c.id == self.phase_id).values(
+            conn.execute(phases.update().where(phases.c.id == pid).values(
                 finished_at=_now(), status=status, summary=summary, data=data or {}))
+
+    def annotate_phase(self, phase_id: int, extra: Dict[str, Any]) -> None:
+        """Merge *extra* into a phase row's ``data``.
+
+        Used to persist what the phase *returned* -- its verdict, notes,
+        title and duration -- beside what it stored itself, so every report
+        page can be rebuilt from the store alone.
+        """
+        rows = self._rows(select(phases.c.data).where(phases.c.id == phase_id))
+        if not rows:
+            return
+        merged = dict(rows[0]["data"] or {})
+        merged.update(extra)
+        with self._connect() as conn:
+            conn.execute(phases.update().where(phases.c.id == phase_id)
+                         .values(data=merged))
 
     # -- results -----------------------------------------------------------
 
@@ -240,10 +320,12 @@ class RunStore:
                 action=action, target=target, outcome=outcome,
                 dry_run=1 if dry_run else 0, detail=detail, recorded_at=_now()))
 
-    def record_event(self, message: str, level: str = "info") -> None:
+    def record_event(self, message: str, level: str = "info",
+                     run_id: Optional[int] = None) -> None:
         with self._connect() as conn:
             conn.execute(events.insert().values(
-                run_id=self.run_id, level=level, message=message, recorded_at=_now()))
+                run_id=run_id or self.run_id, level=level, message=message,
+                recorded_at=_now()))
 
     # -- reads -------------------------------------------------------------
 
@@ -256,14 +338,32 @@ class RunStore:
         if rid is None:
             return None
         rows = self._rows(select(runs).where(runs.c.id == rid))
-        return rows[0] if rows else None
+        return self._resolve_simulated(rows)[0] if rows else None
+
+    def is_simulated(self, run_id: Optional[int] = None) -> bool:
+        """True when stored run *run_id* was a ``--simulate`` rehearsal."""
+        run = self.get_run(run_id)
+        return bool(run and run.get("simulated"))
+
+    def _resolve_simulated(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Fill a NULL ``simulated`` (a row from an older version) from the
+        note every simulated run recorded, so the refusal to post or publish
+        a rehearsal holds for runs stored before the column existed too."""
+        for row in rows:
+            if row.get("simulated") is None:
+                hits = self._rows(select(events.c.id).where(
+                    events.c.run_id == row["id"],
+                    events.c.message.like(SIMULATED_NOTE + "%")).limit(1))
+                row["simulated"] = 1 if hits else 0
+        return rows
 
     def latest_run_id(self) -> Optional[int]:
         rows = self._rows(select(runs.c.id).order_by(runs.c.id.desc()).limit(1))
         return rows[0]["id"] if rows else None
 
     def list_runs(self, limit: int = 30) -> List[Dict[str, Any]]:
-        return self._rows(select(runs).order_by(runs.c.id.desc()).limit(limit))
+        return self._resolve_simulated(
+            self._rows(select(runs).order_by(runs.c.id.desc()).limit(limit)))
 
     def get_phases(self, run_id: Optional[int] = None) -> List[Dict[str, Any]]:
         rid = run_id or self.run_id

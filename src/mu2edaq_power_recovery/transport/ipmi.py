@@ -20,24 +20,75 @@ Safety
 marks ``protected`` (gateways, mu2e-mgr-01, mu2e-dcs-01) and refuses every
 state-changing verb unless the client was constructed with ``dry_run=False``.
 The refusal happens before the command is built, not inside the remote shell.
+
+Credential circuit breaker
+--------------------------
+Within one location the BMCs share an account, so one rejection means every
+later attempt there will be rejected too, and each one counts towards the
+BMC's lockout. :class:`CredentialBreaker` holds a location's answer to "has
+this credential been refused?" and is shared by every :class:`IPMIClient` of
+that location -- not of the run: on 2026-10-01 the teststand's BMCs answered
+ping and refused the account MC-2's BMCs accepted, so a refusal at one site
+says nothing about another. Until a first successful invocation proves the credential, it admits
+:data:`AUTH_PROBE_CONCURRENCY` (one) invocation at a time; once proven, calls
+run concurrently; once refused, no further invocation is made and every caller
+receives the same diagnosis as :class:`IPMICredentialsRefused`.
+
+Two refinements keep the gate from costing more than it saves:
+
+* **Reachability pre-check.** While the credential is unproven, each
+  invocation is preceded by ``ping -c 3 -i 0.2 -W 1 <bmc>`` from the same
+  gateway, outside the gate. Any reply counts: right after an outage the
+  first echo is often lost to a cold ARP entry. A BMC that answers none is
+  reported UNREACHABLE at once, without ipmitool and without queueing behind the
+  gate -- after an outage most BMCs may be dark, and serialising a full
+  ipmitool timeout for each one would stall the whole assessment.
+  ``ipmi.reachability_precheck: false`` turns it off for BMCs that filter
+  ICMP.
+* **"Unable to establish" from a live BMC.** That message alone cannot be
+  read as a refusal -- a dark BMC says it too. But from a BMC that has just
+  answered the ping, it is most likely a wrong username (see
+  ``_DIAGNOSES``). :data:`ESTABLISH_FAILURE_LIMIT` distinct BMCs doing so
+  while the credential is unproven trip the breaker. RAKP / "unauthorized
+  name" still trip it on the first occurrence.
+
+A credential refusal is *not* the protected-host refusal. That one is a
+deliberate decision of this module (``meta["reason"] == "protected"``); this
+one is the BMC telling us we could not look, and the checks report it as
+UNKNOWN.
 """
 from __future__ import annotations
 
 import logging
 import re
 import shlex
+import threading
 import time
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
-from .base import CommandResult, Transport, TransportError
+from .base import (CommandResult, TimeoutExpired, Transport, TransportError,
+                   deadline_exempt)
 
 log = logging.getLogger(__name__)
 
 
 class IPMIError(TransportError):
     """The BMC could not be reached or refused the command."""
+
+
+class IPMICredentialsRefused(IPMIError):
+    """No invocation was made: the run's IPMI credential has been refused.
+
+    Raised to every caller once :class:`CredentialBreaker` has tripped, with
+    the shared diagnosis as its message, so that "the credential is wrong" is
+    never read as "the BMC does not answer".
+    """
+
+
+class IPMIUnreachable(IPMIError):
+    """No invocation was made: the BMC did not answer the reachability ping."""
 
 
 class PowerState(str, Enum):
@@ -47,6 +98,9 @@ class PowerState(str, Enum):
     OFF = "off"
     UNKNOWN = "unknown"
     UNREACHABLE = "unreachable"
+    #: The BMC rejected the credential, or an earlier BMC did and the breaker
+    #: stopped this one being asked. Either way the state was not read.
+    REFUSED = "refused"
 
     @classmethod
     def parse(cls, text: str) -> "PowerState":
@@ -72,6 +126,94 @@ DESTRUCTIVE_VERBS = {"off", "cycle", "reset", "soft"}
 #: 'on' changes state too, but it is the entire point of phase 2 and is not
 #: destructive; it is still gated on dry_run, just not on `protected`.
 STATE_CHANGING_VERBS = DESTRUCTIVE_VERBS | {"on"}
+
+#: Authentication-sensitive invocations admitted at once while the credential
+#: is unproven. One: a wrong credential then reaches exactly one BMC (with that
+#: invocation's own ipmitool retries) before the breaker trips. Deliberately a
+#: constant, not a configuration key -- there is no safe reason to raise it.
+AUTH_PROBE_CONCURRENCY = 1
+
+#: Distinct BMCs that answered the reachability pre-check and then failed with
+#: "Unable to establish ... session" while the credential was unproven, before
+#: the breaker trips. Two, not one: a single BMC wanting another cipher suite
+#: must not stop the run, but two live BMCs refusing the session to a
+#: credential no BMC has accepted is the wrong-username signature.
+ESTABLISH_FAILURE_LIMIT = 2
+
+#: Echo requests in the reachability pre-check; any one reply is an answer.
+#: More than one because right after an outage the gateway's ARP entry for a
+#: BMC is cold and the first echo is often lost while it resolves -- one lost
+#: echo must not make a live chassis UNREACHABLE and leave it switched off.
+PRECHECK_ECHOES = 3
+
+#: The ipmitool text that means the RMCP+ session never opened.
+#: ipmitool's message when the BMC name does not resolve on the gateway.
+UNRESOLVED = "address lookup for"
+UNESTABLISHED = "unable to establish"
+
+#: Rows ``sel()`` asks for. The baseline comparison in power.sel needs to know
+#: when a reading came back full, because a full tail may have lost rows.
+SEL_TAIL = 20
+
+
+class CredentialBreaker:
+    """Shared "has the BMC credential been refused?" state.
+
+    One instance is shared by every :class:`IPMIClient` whose BMCs take the
+    same account -- in practice one location, whichever gateway its clients
+    run ipmitool on. Locations do not share one: the teststand's BMCs refuse
+    the account MC-2's accept (live, 2026-10-01). All state changes happen
+    under ``lock``:
+
+    * ``gate`` admits :data:`AUTH_PROBE_CONCURRENCY` invocation at a time
+      until ``proven`` is set;
+    * ``proven`` is set by the first successful invocation, after which the
+      gate is not taken and calls run concurrently;
+    * ``refused`` holds the diagnosis once a BMC has rejected the credential;
+      it is set once and never cleared.
+    """
+
+    def __init__(self, scope: str = "") -> None:
+        #: What the breaker covers (a location name), for the diagnosis.
+        self.scope = scope
+        self.lock = threading.Lock()
+        self.gate = threading.BoundedSemaphore(AUTH_PROBE_CONCURRENCY)
+        self.proven = threading.Event()
+        self._refused: Optional[str] = None
+        #: BMCs that answered the pre-check and still would not open a session.
+        self._unestablished: set = set()
+
+    @property
+    def refused(self) -> Optional[str]:
+        with self.lock:
+            return self._refused
+
+    def refuse(self, message: str) -> str:
+        """Trip the breaker; the first message wins. Returns the one in force."""
+        with self.lock:
+            if self._refused is None:
+                self._refused = message
+            return self._refused
+
+    def record_unestablished(self, bmc_host: str) -> int:
+        """Count a live BMC that would not open a session; return the count."""
+        with self.lock:
+            self._unestablished.add(bmc_host)
+            return len(self._unestablished)
+
+    def prove(self) -> None:
+        """Record that the credential has worked against a BMC."""
+        self.proven.set()
+
+    def where(self) -> str:
+        """The scope as " at <scope>" for a message; empty when unscoped."""
+        return f" at {self.scope}" if self.scope else ""
+
+    def check(self) -> None:
+        """Raise the shared diagnosis if the breaker has tripped."""
+        message = self.refused
+        if message:
+            raise IPMICredentialsRefused(message)
 
 
 @dataclass
@@ -110,7 +252,9 @@ class IPMIClient:
                  message_timeout: Optional[int] = None,
                  tool_retries: Optional[int] = None,
                  extra_args: Optional[List[str]] = None,
-                 stop_on_auth_failure: bool = True):
+                 stop_on_auth_failure: bool = True,
+                 breaker: Optional[CredentialBreaker] = None,
+                 reachability_precheck: bool = True):
         self.gateway = gateway
         self.username = username
         self._password = password
@@ -131,9 +275,26 @@ class IPMIClient:
         #: Callable(hostname) -> bool, normally Topology.is_protected.
         self.protected = protected or (lambda host: False)
         #: Stop issuing IPMI commands once a BMC has rejected the credentials.
+        #: False also bypasses the breaker's gate: calls are neither
+        #: serialised nor stopped.
         self.stop_on_auth_failure = stop_on_auth_failure
-        #: Set when that happens: the message, for every later caller.
-        self.credentials_refused: Optional[str] = None
+        #: Shared with every other client of the same location (BMC account).
+        self.breaker = breaker if breaker is not None else CredentialBreaker()
+        #: Ping each BMC from the gateway before an unproven invocation.
+        self.reachability_precheck = reachability_precheck
+        #: bmc -> why power_status() found it UNREACHABLE: "unresolved" (no
+        #: DNS on the gateway), "no_session" (answers ping, no IPMI session),
+        #: "dark" (answers nothing), "gateway" (the gateway itself failed) or
+        #: "timeout" (the call to the gateway ran out of time, e.g. capped by
+        #: run.phase_timeout: the BMC was never asked).
+        self.unreachable_reason: Dict[str, str] = {}
+
+    @property
+    def credentials_refused(self) -> Optional[str]:
+        """The shared diagnosis once a BMC has rejected the credentials."""
+        if not self.stop_on_auth_failure:
+            return None
+        return self.breaker.refused
 
     # -- command construction ---------------------------------------------
 
@@ -199,17 +360,122 @@ class IPMIClient:
         The password reaches the gateway on stdin: the remote shell reads one
         line into IPMI_PASSWORD, exports it, and runs ipmitool.  `read -r`
         keeps backslashes intact, and the variable is never echoed.
-        """
-        if self.credentials_refused:
-            # A BMC has already told us the username or password is wrong, and
-            # one credential set is used for every BMC in the cluster. Carrying
-            # on would put the same bad credentials to another sixty-four of
-            # them, three times each, with ipmitool retrying four times inside
-            # every one of those. That is the IPMI version of the refused-ssh
-            # burst, and it is a lot of failed authentications to send at a
-            # controller you are trying to recover.
-            raise IPMIError(self.credentials_refused)
 
+        With ``stop_on_auth_failure`` set, the call goes through the shared
+        :class:`CredentialBreaker`: refused already -> raise without invoking
+        anything; credential not yet proven -> wait for the gate, then look
+        again, because the call that held it may just have been rejected.
+        """
+        if not self.stop_on_auth_failure:
+            return self._invoke(bmc_host, args)
+
+        breaker = self.breaker
+        # A BMC has already told us the username or password is wrong, and
+        # one credential set is used for every BMC of this location. Carrying
+        # on would put the same bad credentials to every other one of them,
+        # three times each, with ipmitool retrying four times inside every one
+        # of those. That is the IPMI version of the refused-ssh burst, and it
+        # is a lot of failed authentications to send at a controller you are
+        # trying to recover.
+        breaker.check()
+        if breaker.proven.is_set():
+            return self._invoke(bmc_host, args)
+
+        # Unproven. First, outside the gate: does the BMC answer at all? A
+        # dark one gets no ipmitool invocation and does not queue behind the
+        # gate for a full ipmitool timeout.
+        answered = False
+        if self.reachability_precheck:
+            answered = self._precheck(bmc_host)
+
+        # One authentication attempt at a time, so a wrong credential reaches
+        # one BMC, not max_sessions of them at once.
+        breaker.gate.acquire()
+        try:
+            # Look again: the call that held the gate may have just been
+            # rejected -- or have just proven the credential, in which case
+            # this one need not hold everyone else up.
+            breaker.check()
+            if not breaker.proven.is_set():
+                return self._invoke(bmc_host, args, answered_ping=answered)
+        finally:
+            breaker.gate.release()
+        return self._invoke(bmc_host, args)
+
+    def _ping_command(self, bmc_host: str) -> str:
+        """:data:`PRECHECK_ECHOES` echo requests in the gateway's dialect.
+
+        Several, not one: right after an outage the gateway's ARP entry for
+        the BMC is cold, and the first echo is routinely lost while the
+        neighbour is resolved. One lost echo used to make a live BMC
+        UNREACHABLE, and ensure_on then never powered its chassis on.
+        """
+        target = shlex.quote(bmc_host)
+        count = PRECHECK_ECHOES
+        platform = getattr(self.gateway, "platform", "linux")
+        if platform.startswith("win") or platform == "cygwin":
+            return f"ping -n {count} -w 1000 {target}"
+        if platform.startswith("linux"):
+            # iputils: -W in seconds; 0.2 s is the shortest interval an
+            # unprivileged user may ask for.
+            return f"ping -c {count} -i 0.2 -W 1 -q {target}"
+        # BSD/macOS ping reads -W as milliseconds, and some BSDs refuse a
+        # sub-second -i to non-root, so keep the default one-second interval.
+        return f"ping -c {count} -W 1000 -q {target}"
+
+    @staticmethod
+    def _echo_answered(result: CommandResult) -> bool:
+        """True when *result* reports at least one echo reply.
+
+        iputils and BSD ping already exit 0 when any reply arrived; reading
+        the summary as well keeps "any reply" the rule if a ping variant
+        exits non-zero on partial loss.
+        """
+        if result.ok:
+            return True
+        text = result.stdout + result.stderr
+        match = (re.search(r"(\d+)\s+(?:packets\s+)?received", text)
+                 or re.search(r"received\s*=\s*(\d+)", text, re.IGNORECASE))
+        return bool(match) and int(match.group(1)) > 0
+
+    def _precheck(self, bmc_host: str) -> bool:
+        """Ping *bmc_host* from the gateway; raise IPMIUnreachable if silent.
+
+        Any reply to any of the :data:`PRECHECK_ECHOES` requests counts as
+        answered; only total silence is UNREACHABLE.
+
+        Returns True when the BMC answered, False when the pre-check could not
+        be made (no ping on the gateway: rc 126/127), in which case the
+        invocation proceeds as it would without one. Takes no gate: nothing
+        here authenticates.
+        """
+        try:
+            result = self.gateway.run(self._ping_command(bmc_host), timeout=10)
+        except TransportError as exc:
+            raise IPMIError(f"cannot reach gateway to talk to {bmc_host}: {exc}") from exc
+        if self._echo_answered(result):
+            return True
+        if result.rc in (126, 127):
+            log.warning("reachability pre-check unavailable on %s (rc=%s); "
+                        "asking %s directly", self.gateway.host, result.rc,
+                        bmc_host)
+            return False
+        log.info("%s answered none of %d pings from %s; not invoking "
+                 "ipmitool", bmc_host, PRECHECK_ECHOES, self.gateway.host)
+        raise IPMIUnreachable(f"BMC {bmc_host} answered none of "
+                              f"{PRECHECK_ECHOES} pings from "
+                              f"{self.gateway.host}")
+
+    def _invoke(self, bmc_host: str, args: List[str],
+                answered_ping: bool = False) -> CommandResult:
+        """The retry loop around one ipmitool invocation.
+
+        *answered_ping* says this invocation was made under the gate, with the
+        credential unproven, to a BMC that answered the pre-check -- the
+        condition under which "Unable to establish" counts towards
+        :data:`ESTABLISH_FAILURE_LIMIT`.
+        """
+        guarded = self.stop_on_auth_failure
         command = self._remote_command(bmc_host, args)
         script = (
             "IFS= read -r IPMI_PASSWORD || exit 97; "
@@ -218,6 +484,11 @@ class IPMIClient:
         )
         last: Optional[CommandResult] = None
         for attempt in range(1, self.retries + 2):
+            if guarded and attempt > 1:
+                # Once proven, calls run concurrently, so another thread (or
+                # another client sharing the breaker) may have been refused
+                # while this one slept.
+                self.breaker.check()
             try:
                 result = self.gateway.run(
                     ["/bin/sh", "-c", script],
@@ -235,8 +506,13 @@ class IPMIClient:
             if result.rc == 97:
                 raise IPMIError("internal error: no password delivered to the gateway")
             if result.ok:
+                if guarded:
+                    self.breaker.prove()
                 return result
             last = result
+            if UNRESOLVED in (result.stderr + result.stdout).lower():
+                # A name that does not resolve will not resolve on retry.
+                break
             if self._rejected_credentials(result):
                 # Retrying a wrong username is wrong the second and third time
                 # too. All it adds is two more failed authentications against
@@ -250,15 +526,35 @@ class IPMIClient:
                 time.sleep(1.0)
         assert last is not None
         self._annotate_failure(last, bmc_host)
-        if self.stop_on_auth_failure and self._rejected_credentials(last):
-            self.credentials_refused = (
-                f"{bmc_host} rejected the IPMI credentials for user "
-                f"{self.username!r}. The same credentials are used for every "
-                f"BMC, so no further IPMI command will be issued this run. "
-                f"{last.meta.get('diagnosis', '')} Re-run with ipmi.username "
-                f"set, or 'mu2e-ipmi-tool --diagnose' to find the combination "
-                f"that works.").strip()
-            log.error("%s", self.credentials_refused)
+        if self._rejected_credentials(last):
+            last.meta["credentials_refused"] = True
+            if guarded:
+                message = self.breaker.refuse(
+                    f"{bmc_host} rejected the IPMI credentials for user "
+                    f"{self.username!r}. The same credentials are used for "
+                    f"every BMC{self.breaker.where()}, so no further IPMI "
+                    f"command will be issued there this run. {last.meta.get('diagnosis', '')} Re-run with "
+                    f"ipmi.username set, or 'mu2e-ipmi-tool --diagnose' to find "
+                    f"the combination that works.".strip())
+                log.error("%s", message)
+        elif guarded and answered_ping and not self.breaker.proven.is_set() \
+                and UNESTABLISHED in (last.stderr + last.stdout).lower() \
+                and UNRESOLVED not in (last.stderr + last.stdout).lower():
+            last.meta["answered_ping"] = True
+            count = self.breaker.record_unestablished(bmc_host)
+            if count >= ESTABLISH_FAILURE_LIMIT:
+                last.meta["credentials_refused"] = True
+                message = self.breaker.refuse(
+                    f"{count} BMCs{self.breaker.where()}, most recently {bmc_host}, answered ping but "
+                    f"would not open an IPMI session for user "
+                    f"{self.username!r}, and no BMC{self.breaker.where()} has "
+                    f"accepted it this run. The likeliest cause is a wrong "
+                    f"username; no further IPMI command will be issued there "
+                    f"this run. "
+                    f"{last.meta.get('diagnosis', '')} Re-run with "
+                    f"ipmi.username set, or 'mu2e-ipmi-tool --diagnose' to find "
+                    f"the combination that works.".strip())
+                log.error("%s", message)
         return last
 
     @staticmethod
@@ -270,6 +566,12 @@ class IPMIClient:
     #: Substrings of ipmitool failures that mean the session never opened, and
     #: what an operator should actually check for each.
     _DIAGNOSES = (
+        # Before "unable to establish": ipmitool prints that too after a failed
+        # lookup, which read as a refused credential on the live teststand.
+        ("address lookup for",
+         "the BMC name does not resolve on the gateway: fix the topology "
+         "(an entry for a host that no longer exists) or DNS. No session was "
+         "attempted, so this says nothing about the credentials."),
         ("unable to establish",
          "the BMC refused the session. In order of likelihood: the username is "
          "wrong (upstream mu2e_ipmi.sh hard-codes 'MU2E' -- compare it against "
@@ -307,14 +609,61 @@ class IPMIClient:
     # -- read-only operations ---------------------------------------------
 
     def power_status(self, bmc_host: str) -> PowerState:
-        """Current chassis power state; UNREACHABLE when the BMC does not answer."""
+        """Current chassis power state.
+
+        UNREACHABLE when the BMC does not answer; REFUSED when it (or, through
+        the breaker, an earlier BMC) rejected the credential -- the BMC may be
+        perfectly healthy, we just could not look.
+        """
         try:
             result = self._run(bmc_host, ["chassis", "power", "status"])
-        except IPMIError:
+        except IPMICredentialsRefused:
+            return PowerState.REFUSED
+        except IPMIUnreachable:
+            self.unreachable_reason[bmc_host] = "dark"
+            return PowerState.UNREACHABLE
+        except IPMIError as exc:
+            # "timeout": the ssh call to the gateway ran out of time -- most
+            # often because run.phase_timeout capped it -- so the BMC was not
+            # asked, rather than asked and silent. Phase 2 uses this to keep a
+            # budget cut-off UNKNOWN instead of "BMC did not answer".
+            self.unreachable_reason[bmc_host] = (
+                "timeout" if isinstance(exc.__cause__, TimeoutExpired) else "gateway")
             return PowerState.UNREACHABLE
         if not result.ok:
+            if result.meta.get("credentials_refused"):
+                return PowerState.REFUSED
+            self.unreachable_reason[bmc_host] = self._why_unreachable(bmc_host, result)
             return PowerState.UNREACHABLE
         return PowerState.parse(result.output)
+
+    def _why_unreachable(self, bmc_host: str, result: CommandResult) -> str:
+        """Tell a missing name and a BMC that will not talk from a dark one.
+
+        All three end in ipmitool's "Unable to establish" line. On the live
+        teststand they were all reported as "does not answer ... no standby
+        power", which is true only of the last. The pre-check's pings from the
+        gateway, on failure only, separate a BMC that answers but refuses a
+        session; like the pre-check, any one reply counts, so a cold ARP entry
+        does not turn "no_session" into "dark".
+        """
+        text = (result.stderr + result.stdout).lower()
+        if UNRESOLVED in text:
+            return "unresolved"
+        if result.meta.get("answered_ping"):
+            return "no_session"
+        if UNESTABLISHED in text and self.reachability_precheck:
+            try:
+                if self._precheck(bmc_host):
+                    return "no_session"
+                # No ping on the gateway (rc 126/127): nothing to tell by.
+                return "unclassified"
+            except IPMIUnreachable:
+                return "dark"
+            except IPMIError:
+                # The gateway itself failed the ping: the BMC was not judged.
+                return "gateway"
+        return "dark"
 
     def sensors(self, bmc_host: str) -> List[SensorReading]:
         """Parse ``sdr elist`` into readings.
@@ -340,20 +689,24 @@ class IPMIClient:
                                           status=status))
         return readings
 
-    def sel(self, bmc_host: str, since: Optional[float] = None) -> List[str]:
-        """System event log entries, newest last.
+    def sel(self, bmc_host: str, since: Optional[float] = None) -> Optional[List[str]]:
+        """The last :data:`SEL_TAIL` lines of ``sel list``, newest last.
+
+        Returns None when the log could not be read -- distinct from ``[]``,
+        an empty log -- so a failed read is never taken for a clean one, and
+        never recorded as a baseline.
 
         *since* is accepted for symmetry with the checks but not used to filter
         here: BMC clocks drift badly across a power outage -- that is precisely
         when they lose time -- so filtering on the BMC's own timestamps would
-        silently discard real events.  The caller compares against a baseline
-        count instead.
+        silently discard real events.  The caller compares record identities
+        against a baseline instead (``parsers.diff_sel``).
         """
         try:
-            result = self._run(bmc_host, ["sel", "list", "last", "20"])
+            result = self._run(bmc_host, ["sel", "list", "last", str(SEL_TAIL)])
         except IPMIError:
-            return []
-        return result.lines() if result.ok else []
+            return None
+        return result.lines() if result.ok else None
 
     def fru(self, bmc_host: str) -> Dict[str, str]:
         """FRU inventory (product name, serial) -- identifies the physical box."""
@@ -413,6 +766,10 @@ class IPMIClient:
                                  rc=0, stdout=msg, host=bmc_host,
                                  meta={"dry_run": True, "would_run": verb})
         log.warning("IPMI %s -> %s (%s)", verb, bmc_host, target)
+        if verb in STATE_CHANGING_VERBS:
+            # Never cut short once started: see deadline_exempt().
+            with deadline_exempt():
+                return self._run(bmc_host, ["chassis", "power", verb])
         return self._run(bmc_host, ["chassis", "power", verb])
 
     def power_on(self, bmc_host: str, node_host: Optional[str] = None) -> CommandResult:
@@ -422,11 +779,20 @@ class IPMIClient:
         """Bring a chassis to the ON state, reporting what had to be done.
 
         Returns a dict with the state before, the action taken ('none',
-        'power_on', 'refused', 'unreachable') and the state after.  Phase 2
+        'power_on', 'dry_run', 'failed', 'unreachable', 'credentials_refused')
+        and the state after.  Phase 2
         records this verbatim, which is what lets the final report say which
         machines actually had to be switched on versus which were already up.
         """
         before = self.power_status(bmc_host)
+        if before is PowerState.REFUSED:
+            # Not a deliberate refusal (that is meta reason 'protected', from
+            # power()) and not a dark BMC: the credential was rejected, so the
+            # state is unknown and nothing was attempted.
+            return {"before": before.value, "action": "credentials_refused",
+                    "after": before.value, "ok": False,
+                    "detail": self.credentials_refused or
+                    f"BMC {bmc_host} rejected the IPMI credentials"}
         if before is PowerState.UNREACHABLE:
             return {"before": before.value, "action": "unreachable",
                     "after": before.value, "ok": False,
@@ -442,7 +808,9 @@ class IPMIClient:
         if not result.ok:
             return {"before": before.value, "action": "failed", "after": before.value,
                     "ok": False, "detail": result.stderr.strip() or result.stdout.strip()}
-        after = self.power_status(bmc_host)
+        with deadline_exempt():
+            # The command was sent; record what it did whatever the budget says.
+            after = self.power_status(bmc_host)
         return {"before": before.value, "action": "power_on", "after": after.value,
                 "ok": after is PowerState.ON,
                 "detail": f"issued chassis power on; now {after.value}"}

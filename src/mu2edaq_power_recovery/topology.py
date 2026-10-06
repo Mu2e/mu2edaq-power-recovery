@@ -18,6 +18,7 @@ What this module adds on top of the upstream expansion:
 """
 from __future__ import annotations
 
+import ipaddress
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -32,6 +33,76 @@ DEFAULT_DOMAIN = "fnal.gov"
 class TopologyError(ValueError):
     """The topology file is missing, malformed, or was queried for something
     it does not define."""
+
+
+# ---------------------------------------------------------------------------
+# Hostname validation
+# ---------------------------------------------------------------------------
+
+#: One DNS label: letters, digits and hyphens, 1-63 characters, neither
+#: starting nor ending with a hyphen (RFC 1123).
+_LABEL = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\Z")
+#: The only characters an IP literal may contain.  Checked before handing the
+#: string to ipaddress, so an IPv6 zone id ("fe80::1%eth0") -- whose text is
+#: not constrained -- is refused rather than passed through.
+_IP_CHARS = re.compile(r"^[0-9A-Fa-f:.]+\Z")
+
+
+def valid_hostname(name: Any) -> bool:
+    """True when *name* is a DNS hostname or an IPv4/IPv6 literal.
+
+    This is the boundary between configuration or command-line text and the
+    shell scripts phase 3 builds: a name that passes contains only
+    ``[A-Za-z0-9.-:]``, never starts with ``-`` (so it cannot be read as an
+    option by ping or ssh), and never contains whitespace, quotes or any shell
+    metacharacter.  The callers still shell-quote -- validation and quoting
+    are independent defences -- but a valid name comes out of ``shlex.quote``
+    unchanged, which the mesh markers rely on.
+
+    Accepted: ``mu2e-trk-01.fnal.gov``, ``mu2e-trk-01``, ``mu2edaq07``,
+    ``131.225.245.10``, ``fe80::1``, ``::1``, and an FQDN with a trailing dot.
+
+    The one function every hostname check uses -- load-time topology
+    validation, ``Topology.resolve()`` for command-line names, and any later
+    validator -- so the rule cannot drift between them.
+    """
+    if not isinstance(name, str) or not name or len(name) > 253:
+        return False
+    if _IP_CHARS.match(name) and ":" in name:
+        try:
+            ipaddress.IPv6Address(name)
+            return True
+        except ValueError:
+            return False
+    if _IP_CHARS.match(name) and re.match(r"^[0-9.]+\Z", name):
+        # All digits and dots: an IPv4 literal or nothing.  "1.2.3" would
+        # otherwise pass as three numeric DNS labels.
+        try:
+            ipaddress.IPv4Address(name)
+            return True
+        except ValueError:
+            return False
+    labels = name[:-1].split(".") if name.endswith(".") else name.split(".")
+    return all(_LABEL.match(label) for label in labels)
+
+
+def _is_ip_literal(name: str) -> bool:
+    try:
+        ipaddress.ip_address(name)
+        return True
+    except ValueError:
+        return False
+
+
+def require_hostname(name: Any, where: str) -> str:
+    """Return *name* if :func:`valid_hostname` accepts it, else raise."""
+    if not valid_hostname(name):
+        raise TopologyError(
+            f"invalid hostname {name!r} in {where}: a hostname must be DNS "
+            f"labels (letters, digits, '-', not starting or ending with '-') "
+            f"separated by '.', or an IPv4/IPv6 address; whitespace, quotes and "
+            f"shell metacharacters are not allowed")
+    return name
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +258,25 @@ class Topology:
                 self._aliases[alias] = name
                 self._aliases[alias.replace("-", "")] = name
         self._node_cache: Dict[str, Dict[str, Node]] = {}
+        self._validate_hostnames()
+
+    def _validate_hostnames(self) -> None:
+        """Reject any expanded name that is not a hostname, at load.
+
+        Every name here ends up as an ssh target or inside a phase-3 ping
+        script, so a stray space or metacharacter in the inventory is refused
+        once, with the location and network it came from, rather than
+        surfacing as a baffling probe failure (or a command) mid-recovery.
+        """
+        for host in self._protected:
+            require_hostname(host, "protected:")
+        for loc, info in self._locations.items():
+            for key in ("gateways", "ipmi_gateways"):
+                for gw in (info or {}).get(key, []) or []:
+                    require_hostname(gw, f"locations.{loc}.{key}")
+            for network, entries in ((info or {}).get("networks", {}) or {}).items():
+                for host in expand_entries(entries, self.domain, self.default_prefix):
+                    require_hostname(host, f"locations.{loc}.networks.{network}")
 
     # -- construction -----------------------------------------------------
 
@@ -234,6 +324,17 @@ class Topology:
 
     def gateways(self, location: str) -> List[str]:
         return list(self.location_info(location).get("gateways", []) or [])
+
+    def ipmi_gateways(self, location: str) -> List[str]:
+        """Hosts that run ipmitool for *location*'s BMCs.
+
+        ``ipmi_gateways:`` when the location sets it, else ``gateways:``. They
+        differ at the teststand: its BMCs sit on the MC-2 IPMI segment
+        (192.168.157.0/24), which mu2edaq-gateway has no interface on, so they
+        are driven from the MC-2 gateways (verified live 2026-10-01).
+        """
+        explicit = self.location_info(location).get("ipmi_gateways")
+        return list(explicit) if explicit else self.gateways(location)
 
     def hostnames(self, location: str, network: str) -> List[str]:
         """Raw expanded hostnames for one location/network, upstream-compatible."""
@@ -346,6 +447,22 @@ class Topology:
             grouped.setdefault(n.node_class, []).append(n)
         return grouped
 
+    def validate(self, sequence: Optional[Dict[str, Any]] = None) -> List[Finding]:
+        """Check the inventory for gaps and inconsistencies (#25).
+
+        Returns :class:`Finding` records -- ``error`` for what would break a
+        run (an invalid hostname or subnet, a stage naming an unknown
+        location), ``warning`` for what makes it incomplete or ambiguous (an
+        empty location, a BMC with no lab host, a subnet shared between
+        locations, a gateway or protected host missing from the inventory, a
+        node no power-sequence stage covers), ``info`` otherwise. *sequence*
+        is the parsed power-sequence.yaml; without it the stage checks are
+        skipped. Deliberately not called at load: an incomplete inventory is
+        normal (MC-1), and the load-time hostname rule already refuses what
+        cannot be run. Exposed as ``mu2e-node-inventory --validate``.
+        """
+        return _validate(self, sequence)
+
     def resolve(self, names: Sequence[str],
                 locations: Optional[Iterable[str]] = None) -> List[Node]:
         """Turn a list of hostnames (short or full) into Nodes.
@@ -354,12 +471,18 @@ class Topology:
         location 'unknown' -- an operator naming a host explicitly on the
         command line should get it probed, not silently dropped, even if the
         inventory has not caught up with the machine room.
+
+        Every name must pass :func:`valid_hostname` first, or TopologyError is
+        raised: these come from ``--node`` and end up as ssh destinations and
+        inside phase-3 shell scripts.  An IP literal is used as given.
         """
         out: List[Node] = []
         for name in names:
+            require_hostname(name, "the requested node list")
             found = self.node(name, locations)
             if found is None:
-                host = name if "." in name else f"{name}.{self.domain}"
+                literal = _is_ip_literal(name)
+                host = name if ("." in name or literal) else f"{name}.{self.domain}"
                 found = Node(
                     hostname=host,
                     location="unknown",
@@ -369,6 +492,152 @@ class Topology:
                 )
             out.append(found)
         return out
+
+
+# ---------------------------------------------------------------------------
+# Validation (mu2e-node-inventory --validate; never called at load)
+# ---------------------------------------------------------------------------
+
+
+#: Finding levels, most severe first.
+LEVELS = ("error", "warning", "info")
+
+
+@dataclass
+class Finding:
+    """One observation about the inventory. Only ``error`` fails validation."""
+
+    level: str
+    message: str
+
+    def as_dict(self) -> Dict[str, str]:
+        return {"level": self.level, "message": self.message}
+
+
+def _compress(names: Sequence[str], limit: int = 20) -> str:
+    shorts = sorted({n.split(".")[0] for n in names}, key=natural_key)
+    text = ", ".join(shorts[:limit])
+    return text + (f" and {len(shorts) - limit} more" if len(shorts) > limit else "")
+
+
+def _validate(topology: "Topology",
+              sequence: Optional[Dict[str, Any]] = None) -> List[Finding]:
+    findings: List[Finding] = []
+    add = lambda level, message: findings.append(Finding(level, message))  # noqa: E731
+
+    # -- hostnames (the load-time rule, by the same function) --------------
+    raw_names: List[Any] = []
+    for host in topology._protected:
+        raw_names.append((host, "protected:"))
+    for loc, info in topology._locations.items():
+        for key in ("gateways", "ipmi_gateways"):
+            for gw in (info or {}).get(key, []) or []:
+                raw_names.append((gw, f"locations.{loc}.{key}"))
+        for network, entries in ((info or {}).get("networks", {}) or {}).items():
+            try:
+                hosts = expand_entries(entries, topology.domain, topology.default_prefix)
+            except (TopologyError, TypeError, ValueError) as exc:
+                add("error", f"locations.{loc}.networks.{network}: {exc}")
+                continue
+            raw_names.extend((h, f"locations.{loc}.networks.{network}") for h in hosts)
+    for host, where in raw_names:
+        if not valid_hostname(host):
+            add("error", f"invalid hostname {host!r} in {where}")
+
+    # -- per location --------------------------------------------------------
+    inventory: Set[str] = set()
+    nodes_by_loc: Dict[str, Dict[str, Node]] = {}
+    for loc in topology.locations:
+        info = topology._locations.get(loc) or {}
+        try:
+            nodes = topology.nodes(loc)
+        except TopologyError as exc:
+            add("error", f"location {loc}: {exc}")
+            nodes = {}
+        nodes_by_loc[loc] = nodes
+        inventory.update(nodes)
+        if not nodes:
+            meta = ", ".join(f"{key}: {info[key]}" for key in
+                             ("status", "owner", "inventory_source") if info.get(key))
+            add("warning", f"location {loc} has no nodes configured"
+                + (f" ({meta})" if meta else "")
+                + "; every phase reports it as 'no nodes configured'")
+        orphans = [n.networks["ipmi"] for n in nodes.values()
+                   if "ipmi" in n.networks and "lab" not in n.networks]
+        if orphans:
+            add("warning", f"location {loc}: {len(orphans)} BMC(s) with no lab "
+                           f"host: {_compress(orphans)}")
+
+    # -- subnets -------------------------------------------------------------
+    parsed: List[Any] = []
+    for loc in topology.locations:
+        subnets = (topology._locations.get(loc) or {}).get("subnets", {}) or {}
+        for network, cidr in subnets.items():
+            try:
+                parsed.append((loc, network, cidr,
+                               ipaddress.ip_network(str(cidr), strict=False)))
+            except ValueError as exc:
+                add("error", f"locations.{loc}.subnets.{network}: {cidr!r} is not "
+                             f"a network ({exc})")
+    for i, (loc_a, net_a, cidr_a, a) in enumerate(parsed):
+        for loc_b, net_b, cidr_b, b in parsed[i + 1:]:
+            if loc_a == loc_b or a.version != b.version or not a.overlaps(b):
+                continue
+            how = "is the same subnet as" if a == b else "overlaps"
+            add("warning", f"subnet {loc_a}.{net_a} {cidr_a} {how} "
+                           f"{loc_b}.{net_b} {cidr_b}: a failed interface in it "
+                           f"cannot be attributed to one location")
+
+    # -- gateways and protected hosts ----------------------------------------
+    for loc in topology.locations:
+        for gw in topology.gateways(loc):
+            if gw not in inventory:
+                add("warning", f"gateway {gw} of location {loc} is not a lab host "
+                               f"in any location's inventory")
+    for host in sorted(topology._protected):
+        if host not in inventory:
+            add("warning", f"protected host {host} is not in the inventory")
+
+    # -- the power sequence --------------------------------------------------
+    if sequence is not None:
+        defaults = sequence.get("defaults", {}) or {}
+        staged: Dict[str, Set[str]] = {}
+        for stage in sequence.get("stages", []) or []:
+            name = stage.get("name", "?")
+            loc_name = stage.get("location", defaults.get("location", "mc2"))
+            try:
+                loc = topology.canonical_location(loc_name)
+            except TopologyError:
+                add("error", f"power-sequence stage {name}: unknown location "
+                             f"{loc_name!r}")
+                continue
+            try:
+                hosts = expand_entries(stage.get("nodes", []) or [],
+                                       topology.domain, topology.default_prefix)
+            except (TopologyError, TypeError, ValueError) as exc:
+                add("error", f"power-sequence stage {name}: {exc}")
+                continue
+            staged.setdefault(loc, set()).update(hosts)
+            missing = [h for h in hosts if h not in nodes_by_loc.get(loc, {})]
+            if missing:
+                add("warning", f"power-sequence stage {name}: {len(missing)} "
+                               f"node(s) not in the {loc} inventory: "
+                               f"{_compress(missing)}")
+        for loc, nodes in nodes_by_loc.items():
+            if not nodes:
+                continue
+            if loc not in staged:
+                add("info", f"location {loc} has no power-sequence stage; "
+                            f"phase 2 powers nothing there")
+                continue
+            unstaged = [h for h in nodes if h not in staged[loc]]
+            if unstaged:
+                add("warning", f"location {loc}: {len(unstaged)} inventory "
+                               f"node(s) in no power-sequence stage, so phase 2 "
+                               f"never powers them: {_compress(unstaged)}")
+    order = {level: i for i, level in enumerate(LEVELS)}
+    findings.sort(key=lambda f: order.get(f.level, len(LEVELS)))
+    return findings
 
 
 def natural_key(text: str):

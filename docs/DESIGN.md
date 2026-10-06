@@ -161,6 +161,55 @@ follow that this project had to be rebuilt around:
   that *times out* runs the check and restore too — the command had run, so it
   could have moved the default and then hung, which is the shape of the original
   incident — and a clobber is reported in preference to the timeout.
+- **The guard is a precondition, and its failures are typed.** A mint needs a
+  readable default principal *before* it runs; without one a displacement can
+  be neither detected nor undone, so `TicketSource.ticket()` raises
+  `DefaultCacheUnverifiable` (klist missing / no default cache / unparsable)
+  without running `get-kerberos-ticket`. A failed restore raises
+  `DefaultCacheDisplaced(before, after)`. `KerberosManager` catches the common
+  base, `DefaultCacheGuardError`, by type — it used to test the message for
+  `"default credential cache"`, which a rewording would have silently
+  defeated — and abandons the service identities for the run, recording why
+  as a phase note and an `error` event. The run carries on under the
+  operator's credential, which is the one that matters.
+- **One exception: a run that uses no default cache.** On a fresh macOS login
+  where `--principal` and `--root-principal` were minted by `_kinit` into
+  private FILE: caches, the collection has no default at all, and refusing
+  every service mint for "no default cache" disabled the fallbacks for nothing.
+  When both primary roles are private caches of this run
+  (`KerberosManager._primaries_private()`; root with no root principal runs on
+  the ambient cache, so it does not qualify) *and* klist reports specifically
+  no default (`NoDefaultCache`, a `str` subclass so the decision is on type),
+  the mint proceeds. Afterwards a default that has appeared naming the minted
+  identity is destroyed by name (`destroy_default`, `kdestroy -c`), and
+  `DefaultCacheDisplaced(None, after)` is raised if it cannot be. An ambient
+  primary, or an unparsable/missing klist, is still refused. `_kinit`
+  (`_guard_kinit`) is deliberately looser: on `NoDefaultCache` (a fresh login)
+  it proceeds, because what it mints is the operator's own designated
+  principal and that becoming the default is not a displacement; it refuses,
+  before the password prompt, only a default that exists but cannot be read.
+- **An interrupted mint is still guarded.** SIGTERM is raised as
+  KeyboardInterrupt, which can arrive while `get-kerberos-ticket` runs.
+  `TicketSource.ticket()` restores the default on any `BaseException` before
+  re-raising (a failed restore is logged; it must not mask the interrupt), and
+  `service_credential()` records the cache path for `cleanup()` before the
+  mint rather than after it. `_kinit` does the same for the designated
+  principals (`except BaseException`: restore, then re-raise). On macOS a
+  path is not enough -- Heimdal put the ticket in `API:<uuid>`, whose name is
+  otherwise learned only on success -- so an interrupted `_kinit`, and an
+  interrupted or timed-out (`TicketTimeout`) service mint, look the principal
+  up in the collection and record the name it gives for `cleanup()` (PR #29
+  review). The lookup runs `klist -l` and may itself fail or be interrupted;
+  that is logged, never raised over the original exception. The cache of the
+  principal that was the default before the mint is never recorded: it was
+  the operator's before the run touched it.
+- **Mints are serialised.** Every worker builds a chain, so an unguarded
+  check-then-mint let two threads mint one identity into one cache and
+  interleave their read-before/restore of the default. Each mint is now one
+  transaction under an `RLock` (double-checked, published last), and
+  `warm_fallbacks()` mints each fallback before the worker pool exists. The
+  diagnostics open credentials through the same `credential_session()`, so
+  what they test is what the run does.
 
 Two guards follow from this, and both are about the *next* run rather than this
 one. Before connecting to anything, a run reads the default cache and, when it
@@ -168,7 +217,8 @@ holds a service identity rather than a personal principal, logs a warning and
 prints the `kswitch`/`kdestroy` line that fixes it: otherwise sixty logins fail
 as `mu2eraw` with nothing in the ssh error to explain why.
 
-**This guard warns; it does not stop the run.** `Orchestrator.prepare()` calls
+**This guard warns; it does not stop the run.** `credential_session()` (used by
+`Orchestrator.prepare_credentials()`) calls
 `KerberosManager.ambient_warning()`, logs whatever comes back and appends it to
 the run's notes, then continues into `prepare()`, the SSH factory and every
 phase. The design intent was to halt, and halting is arguably right — an
@@ -213,9 +263,9 @@ genuinely needed, and the gateway-side wall-clock bound was widened so it cannot
 itself cut ipmitool's retries short. Diverging from a known-working invocation
 is a choice that has to earn itself.
 
-**A credential rejection is neither retried nor repeated.** All 45 BMCs share
-one credential set, so the first rejection settles the matter: the run stops
-issuing IPMI and reports one diagnosis naming the refused username and how to
+**A credential rejection is neither retried nor repeated.** The BMCs of a
+location share one credential set, so the first rejection settles the matter
+there: the run stops issuing IPMI to that location and reports one diagnosis naming the refused username and how to
 find the right one. Previously it retried the same rejected credentials three
 times per BMC, with four ipmitool retries inside each, and then did the same to
 the next BMC — a few hundred failed authentications against machines that count
@@ -224,6 +274,65 @@ them towards account lockout. Recognised only from RAKP failures and
 deliberately **excluded**: a dark chassis says exactly that, and after an outage
 a dark chassis is the expected case. `ipmi.stop_on_auth_failure: false`
 overrides the whole behaviour.
+
+**The stop is a synchronised circuit breaker, one per location, shared by
+that location's IPMI clients.**
+Phase 1 assesses sixteen nodes at once, so an unsynchronised "refused?" flag let
+many workers pass the check and each present the bad credential to a different
+BMC before the first rejection landed. `CredentialBreaker` (in
+`transport/ipmi.py`) holds a lock, a gate admitting one invocation while the
+credential is unproven, a `proven` event set by the first success, and the
+refusal message. The flag is re-read after the gate is acquired and before
+every retry; waiters raise `IPMICredentialsRefused` with the shared message and
+never invoke ipmitool. Once proven, calls run concurrently.
+
+Serialising unproven calls would make a cluster whose BMCs are mostly dark cost
+one full ipmitool timeout per BMC, in sequence, so each unproven call is
+preceded by a **reachability pre-check** outside the gate:
+`ping -c 3 -i 0.2 -W 1 <bmc>` from the same gateway (BSD dialect
+`-c 3 -W 1000`), and any reply counts. Three echoes, not one: right after an
+outage the gateway's ARP entry for a BMC is cold and the first echo is often
+lost, and with a single echo that made a live BMC UNREACHABLE, so `ensure_on`
+never switched its chassis on (PR #27 review). No reply at all raises
+`IPMIUnreachable` (an `IPMIError`, so `PowerState.UNREACHABLE`) with no
+ipmitool invocation and no gate taken, so dark BMCs are assessed concurrently.
+Phase 1's `assess_node` then reports `power.sensors` and `power.sel` UNKNOWN
+without asking a BMC whose `power.status` was UNREACHABLE or REFUSED. The
+pre-check also gives "Unable to establish" a meaning it lacks on its own: from
+a BMC that has *just answered ping*, while no BMC has accepted the credential,
+it is most likely a wrong username (`_DIAGNOSES`). `ESTABLISH_FAILURE_LIMIT`
+(2) distinct such BMCs trip the breaker; one does not, because a single BMC
+wanting another cipher suite must not stop its location. RAKP and "unauthorized
+name" still trip it on the first occurrence. `ipmi.reachability_precheck:
+false` (for BMCs that filter ICMP) restores the earlier behaviour: every
+unproven call goes to ipmitool, one at a time, and "Unable to establish" never
+trips. A gateway without `ping` (rc 126/127) skips the pre-check with a
+warning. The
+concurrency is a constant (1), not a setting. The object is shared by the
+clients of one location (`Orchestrator.ipmi_breaker_for`) because their BMCs
+share an account, and it is *not* shared between locations because theirs do
+not: on 2026-10-01 the teststand's BMCs (`mu2edaq-gateway-ipmi`,
+`mu2edaq04-ipmi`, `mu2edaq13-ipmi`) answered ping and refused the MC-2 account
+with "Unable to establish IPMI v2 / RMCP+ session" while MC-2's BMCs accepted
+it. With one run-wide breaker, two teststand BMCs probed before any MC-2 BMC
+proved the credential tripped the stop and blocked all MC-2 IPMI for the run
+(PR #27 review). The diagnosis names the location (`CredentialBreaker.scope`).
+A credential refusal surfaces as `PowerState.REFUSED` and the checks report it
+UNKNOWN — it is "we could not look", and it is kept apart from
+the protected-host refusal (`meta["reason"] == "protected"`), which is a
+deliberate decision of the tool.
+
+**SEL baselines are record identities, not a count.** `sel list last 20`
+returns twenty rows from any log that is full, so a length comparison between
+phase 1 and phase 2 saw nothing once rotation began. `power.sel` now keeps the
+survey as `{record_id: fingerprint}` (sensor, event, direction; the record id is
+the first hex column) and reports a record as new when its id is absent or its
+event changed under the same id. A reused id or a new "Log area
+reset/cleared" record means the log was cleared since the survey (WARN). A full
+tail in which every row is new may have lost more off its front; that is noted.
+Timestamps are never compared: the BMC clock is what an outage resets. A failed
+read returns `None`, reports UNKNOWN, and records no baseline. The baseline
+lives in the orchestrator for the life of the process only.
 
 ## 3. Checks as data
 
@@ -321,6 +430,39 @@ Three deliberate conservatisms:
 - **It re-executes rather than pretending.** Python has already imported the
   modules that changed on disk, so continuing in-process would run the old code
   while claiming the new version.
+- **A failed required rebuild undoes the update (#21).** If the pull touched a
+  build input and `bootstrap.sh` fails, is missing or cannot start, re-executing
+  would run the new code against the old venv or native extension — turning a
+  working installation into a startup failure just before a recovery. The
+  checkout is reset to the full pre-update SHA (`--hard`, or `--keep` under
+  `allow_dirty`, which keeps local edits), nothing is re-executed, and the run
+  continues on the code it started with; a partly run bootstrap may still have
+  changed the venv, and the message says so. If the reset fails, the tree no
+  longer matches the process — which imports modules lazily from it — so the
+  run stops (exit 2). The `UpdateResult` goes into the run's provenance
+  (`version.selfupdate`).
+
+### The run lock
+
+A second concurrent run would drive the same BMCs from two directions. The
+start script's PID file could not prevent that safely: `exec` discards the
+shell's EXIT trap, so every normal run left the file behind, and a bare integer
+survives its process — after pid reuse `stop` would have signalled whatever now
+had that number (#12). The driver now holds an OS lock itself (`runlock.py`:
+`flock(LOCK_EX|LOCK_NB)` on POSIX, `msvcrt.locking` on Windows) from before
+phase 0 to the end of the run. Acquisition is atomic, so two simultaneous
+starts cannot both win, and the kernel drops the lock however the process ends,
+so nothing stale needs cleaning. The JSON record written into the file
+(`pid`, `started_at`, `cmdline`, `host`) is information, not authority:
+`runlock pid` prints it only while the lock is held, and the stop scripts
+re-check the process's command line before each signal. The file is never
+deleted — unlinking a lock file lets a second process lock the old inode while
+a third creates a new one. Only invocations that can reach hardware take it
+(phases 1–3, not `--simulate`); rehearsals, listings and report regeneration
+must stay usable during a real run. The lock is dropped immediately before the
+phase-0 `execve` and re-taken by the new process, which keeps the pid; the
+instant between is accepted rather than relying on descriptor inheritance
+across `exec`, which `msvcrt` cannot provide.
 
 ### Phase 1 — assess
 
@@ -363,6 +505,51 @@ run the stage's profile → evaluate `require:` (`all` / `majority` / `any`).
 - After a power-on, the node's context carries `expect_recent_boot`, so
   `host.uptime` can flag a machine that reports days of uptime — which means
   the IPMI command reached a different chassis than the operator thought.
+- **Scope is planned before credentials.** `plan_sequence()` turns
+  `--from`/`--until`, `--location` and `--node` into a `SequencePlan` of
+  stages with roles (`full`, `target`, `predecessor`, `out_of_scope`) and an
+  `allowed_power` host set, or raises `SequenceSelectionError` (exit 2).
+  Unknown or reversed stage names, duplicate stage names, invalid hostnames
+  anywhere in the sequence, and a `--node` host in no usable stage are all
+  errors: a bound on a power operation that silently widens is worse than
+  none. Every stage's node list is validated at planning time, so a bad name
+  cannot surface mid-sequence after earlier stages were powered.
+- **Predecessors are verify-only.** With `--node`, the stages before the
+  target (from the start of the range) have their power state read, are waited
+  for and checked, and are never powered — the operator asked for one node, so
+  the run must not decide to power a dependency. A predecessor stage that is
+  not up (a node off or silent, or its `require:` missed) stops the run before
+  the target, regardless of `--continue-on-error`, with the stage to run
+  explicitly. Chosen over auto-powering predecessors (which widens the
+  operator's request) and over refusing a partial selection outright (which
+  makes single-node recovery impossible).
+- **`_power_stage` re-checks `allowed_power`** and records any other host as
+  `out_of_scope` without calling `ensure_on` — defence in depth against a plan
+  bug.
+- **One IPMI client per location**, each on a gateway of its own location
+  (`Orchestrator.ipmi_for`); the IPMI subnets are per site. Each takes its
+  location's `CredentialBreaker` (the BMC account differs between sites) and
+  keeps the protected-host check.
+- **Boot waits are concurrent.** Every node of a stage is waited for at once
+  under one stage deadline, `now + min(boot_timeout, phase time left)`, with
+  ssh attempts bounded by a semaphore of `ssh.max_sessions` and starts
+  staggered by 0.5 s. Power commands stay serial (the breaker serialises them
+  until proven, and it spreads the inrush).
+
+### Time budget
+
+`run.phase_timeout` is a `Deadline` (phases/base.py) on the orchestrator's
+injectable monotonic clock. `Orchestrator.budget()` installs it for phases 1–3;
+while set, the orchestrator starts no node and no check once it has expired,
+phase 2 checks it before each stage and each power command, and every
+`SSHTransport` built by the factory caps each call's timeout at
+`min(configured, remaining)` (and refuses to start a call once it is spent).
+The nesting is phase budget ⊇ stage boot deadline ⊇ per-call
+`ssh.command_timeout` / `connect_timeout + 5`; overrun is bounded by the one
+call in flight at expiry. Work never reached is UNKNOWN with `not run:
+phase_timeout expired` — distinct from FAIL (looked, broken) and from
+unreachable (could not look). Tests drive this with a fake clock whose sleep
+advances it.
 
 ### Phase 3 — network
 
@@ -370,12 +557,41 @@ Phases 1 and 2 prove each node is reachable *from a gateway*. This proves the
 nodes reach *each other*, which a switch that came back with a missing VLAN or
 the wrong MTU will fail while every node still looks healthy alone.
 
-- **Full mesh on the data network**, sampled against anchors on the lab and
-  IPMI networks. A full mesh is O(N²); on the network the DAQ actually uses,
+- **Full mesh on the data network**, sampled against anchors on the lab
+  network. A full mesh is O(N²); on the network the DAQ actually uses,
   and which is small, that is affordable, and elsewhere it is not worth it.
+  Each `mesh.networks` entry names its `origin` (`nodes` or `gateways`) and
+  its `targets` (`all` or `anchors`, defaulting from `full_mesh`); `anchors`
+  may be a flat list or keyed by location.
+- **The IPMI network is probed from the gateways** (`origin: gateways,
+  targets: all`). A node's `ipmi` entry is its BMC, on a private subnet the
+  host OS has no route to — the reason `ipmitool` runs on a gateway — so
+  probing it from node OSes would fail on a healthy network (#19). Each of a
+  location's gateways, over a direct session, pings every BMC of the probed
+  nodes there, and the edge names the gateway as source. What it proves:
+  every BMC answers ICMP from the hosts that will drive it.
+- **An untested path is UNKNOWN, not FAIL** (#20). `MeshEdge.tested` is false
+  when the source could not be reached, the probe raised, or the output lacks
+  the target's BEGIN/END markers. A network is FAIL only on a tested failure,
+  else UNKNOWN if any path is untested. Isolation analysis uses tested edges
+  only; sources that tested nothing are reported as unreachable sources.
+  For `origin: gateways` the UNKNOWN test is per *target*
+  (`MeshResult.uncovered_targets()`): a location has two gateways precisely so
+  that one can be dark, and a BMC the partner reached is tested. The dark
+  gateway stays in `unreachable_sources` and `MeshResult.notes` says its
+  targets were covered. A location with BMC targets but no gateway gets
+  untested edges from the pseudo-source `(no gateway: <loc>)` (kept in
+  `pseudo_sources`, not reported as an unreachable host) and a note, so it can
+  never read as OK.
+- **Hostnames are validated and quoted** (#9). `topology.valid_hostname()` —
+  DNS labels or an IP literal, no leading `-`, no whitespace or
+  metacharacters — is applied to every expanded topology name at load and to
+  every `--node` name in `resolve()`; the probe script shell-quotes each target
+  and marker as well (valid names are unchanged, so markers parse), and ssh
+  argv ends option parsing with `--` before the destination.
 - **One SSH session per source**, not per pair. The shipped topology has 49
   nodes on the data network, so the mesh is 49x48 = 2352 ordered pairs — a
-  simulated run reports `data: 2352/2352 paths ok`. As 2352 SSH sessions that
+  simulated run reports `data: 2352/2352 tested paths ok`. As 2352 SSH sessions that
   would take longer than the rest of the recovery; as 49 sessions, one per
   source, it is affordable. The probe script brackets each target's output with
   markers and the results are split back apart.
@@ -399,6 +615,57 @@ The narrative is derived entirely from stored rows, so it cannot disagree with
 the evidence tables beside it. Follow-ups are derived too: a check that failed
 on three or more nodes is called out as one likely shared cause rather than as
 three separate problems.
+
+**Report data flow.** `cli.main` runs phases 1-3 (`run_phases`), persists each
+returned `PhaseResult`'s verdict, title, notes and duration into its phase row
+(`data._result`), and then *finishes the run* — status and `finished_at` —
+before anything is assembled, rendered or posted (#4). On the error and
+interrupt paths the terminal status is written first too, and the bundle is
+still rendered, never posted or published. Then:
+
+1. `phase4_report.assemble(store, run_id)` records the `report` phase row and
+   an event against `run_id` explicitly (`RunStore.start_phase/record_event/
+   finish_phase` take an explicit run or phase id) and builds the narrative
+   from the final `export_run(run_id)`.
+2. `ReportWriter.render_run(export, narrative, version)` renders
+   `runs/<rid>/` (pages + `data/`) from that export only, emptying the
+   directory first; a phase absent from the run has no page, no data file and
+   no nav link (`present`). When `rid` is the newest run the same set is
+   rendered at the top level — the latest view — and the top-level pages and
+   data of phases it lacks are removed. `report.keep_runs` then prunes old
+   bundles — never the one just rendered (it is about to be attached), and
+   never a newer one because an older run was regenerated. It returns a
+   `Bundle` whose `paths` are the bundle's HTML pages.
+3. `phase4_report.post(orch, rid, narrative, bundle.paths)` posts to the ECL.
+   Vault is created lazily here (`make_vault`), never by
+   `prepare_credentials` for this purpose; under `--simulate` nothing is
+   posted. The outcome is an event on `rid` and goes into the bundle's
+   `data/report.json`; a failure leaves the local report complete (#18).
+4. `Publisher.publish()` runs once, with the bundle final.
+
+Report-only invocations (`--phase report`, optional `--run-id N`) validate
+the run before anything else touches credentials, `RunStore.attach(N)` it
+without inserting a row, never call `prepare_credentials`, and never change
+its status (#3). The latest view is rendered again rather than copied because
+its one cross-run link (run history) has a different relative path from
+`runs/<id>/`; the JSON is identical.
+
+**Reconciliation (#5).** `phase4_report.reconcile` takes the newest result
+per `(hostname, check_id)` across phases 1-3. A superseded failure whose
+current result is good goes to `resolved` (the original rows stay in the
+evidence and the timeline); only current bad results are `outstanding`.
+Phase-2 profiles re-check subsets, so a phase-1 failure of a check phase 2 did
+not run stays outstanding. A node's status is the roll-up of its current
+checks, or UNKNOWN if its latest assessment could not reach it. The headline,
+counts, verdict, next steps, ECL body and the driver's exit status all derive
+from this one table plus the latest phase-3 verdict — so a node that failed
+phase 1 and passed phase 2 exits 0.
+
+**`--json` (#24).** stdout is reserved for one document: all human-readable
+output is written to stderr (`out`), `sys.stdout` is redirected to stderr for
+the duration so stray prints cannot leak, and the self-update rebuild's
+output is sent to stderr. The document is written last, on the error and
+interrupt paths too (with `error`).
 
 ## 5. State
 
@@ -424,6 +691,13 @@ attached to a logbook entry, and any of those rules out a running application.
 Every page has a JSON companion, so the report is consumable by the next tool
 and not only by a human. The heavy full run export is a separate file from the
 readable narrative, so `data/report.json` stays small enough to read.
+
+Every file under `runs/<id>/` is derived from run `<id>`'s stored rows: the
+pages are rendered from the store, not copied from the shared top level
+(the old `archive_run` copied every existing page and all of `data/`, so a
+network-only run's archive inherited an earlier run's assessment). The top
+level is a latest view, the newest run's bundle; it is not a merge of the most
+recent page of each phase across runs.
 
 Per-class and per-area tables are compact roll-ups rather than repeats of the
 all-nodes table — rendering the full per-check detail twice doubled the page
@@ -495,8 +769,12 @@ needs an answer that does not involve reading four files.
 
 | Mechanism | What it stops |
 |---|---|
-| `run.dry_run` default true, `--execute` required | A power command issued by accident |
-| `--simulate` overrides `--execute` | A rehearsal that turns out not to be one |
+| Live runs need per-invocation authorisation: `--execute`, or `MU2E_POWER_RECOVERY_ARM` = configured `run.label` with `run.dry_run: false`; config `dry_run: false` alone exits 2 for any invocation that includes phase 2 (read-only phases always run dry and are not refused); the token is refused in `config/.env` (`cli.authorize_live`) | A power command armed by a persistent file, or issued by accident |
+| `--simulate` overrides everything, including `--execute` and the token | A rehearsal that turns out not to be one |
+| Phase-2 plan (`plan_sequence`) made before credentials; unknown/reversed stage names and out-of-scope `--node` are errors | A typo or a scoped command widening a power-on |
+| `--node` predecessors verify-only; `_power_stage` refuses hosts outside `allowed_power` | Powering nodes the operator did not name |
+| Per-location IPMI clients | Driving a BMC through another site's gateway |
+| `run.phase_timeout` enforced; per-call timeouts capped | An outage run that never ends |
 | `protected:` host list, checked before the command is built | Cutting off access to the cluster being recovered |
 | Gateway stage is `power_on: false` | Power-cycling the jump host mid-sequence |
 | Attempt recorded before it is issued | Losing the audit trail to a crash |
@@ -507,6 +785,9 @@ needs an answer that does not involve reading four files.
 | Startup *warning* on the default credential cache (it does not stop the run) | A whole run attempted as `mu2eraw`, with nothing to say why |
 | A credential rejection stops IPMI for the run | Locking out 45 BMC accounts with one wrong password |
 | `Publisher` refuses to publish under `--simulate` | A rehearsal overwriting the live report |
+| `runs.simulated` stored with the run; regenerating a stored rehearsal with posting or publishing requested exits 2, and `phase4_report.post` / `write_report` re-check the stored flag | `--simulate` followed by `mu2e-power-report --post-ecl` filing scripted results as a real dry run |
+| Run lock held by the driver; stop scripts signal only a held lock's pid after checking its command line | Two runs interleaving power commands; a stale pid file killing an unrelated process |
+| A failed required rebuild rolls the checkout back and does not re-exec | New code started against an old environment just before a recovery |
 
 The protected-host refusal is not overridable by any flag. That is the one
 place where the tool declines to do what it is told, and it is deliberate:

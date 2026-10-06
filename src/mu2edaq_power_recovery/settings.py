@@ -34,6 +34,13 @@ DEFAULT_ENV_FILE = CONFIG_DIR / ".env"
 
 ENV_PREFIX = "MU2E_POWER_RECOVERY_"
 
+#: The per-invocation live-run token (cli.authorize_live). It is read from the
+#: process environment only and is deliberately *not* a configuration key:
+#: :func:`load` never ingests it, and finding it in config/.env is an error,
+#: because a persistent file that arms every later run is exactly what the
+#: token exists to prevent.
+ARM_ENV = ENV_PREFIX + "ARM"
+
 _TRUE = {"1", "true", "yes", "on"}
 _FALSE = {"0", "false", "no", "off"}
 
@@ -58,6 +65,8 @@ DEFAULTS: Dict[str, Any] = {
         "phase_timeout": 7200,
         "from_stage": None,
         "until_stage": None,
+        # The single-run lock (runlock.py), relative to the project root.
+        "lock_file": "logs/power-recovery.lock",
     },
     "topology": {
         "file": "topology.yaml",
@@ -107,6 +116,10 @@ DEFAULTS: Dict[str, Any] = {
         # rejects it will be rejected by all of them. Stop rather than send
         # the same bad username to another sixty-four controllers.
         "stop_on_auth_failure": True,
+        # Ping each BMC from the gateway before an unproven ipmitool call, so
+        # a dark BMC neither takes the credential gate nor costs an ipmitool
+        # timeout. Turn off for BMCs that filter ICMP.
+        "reachability_precheck": True,
     },
     "kerberos": {
         "principal": None,
@@ -423,7 +436,7 @@ def load(config_file: Optional[Path] = None,
 
     def _apply_env(pairs: Mapping[str, str], source: str) -> None:
         for name, raw in pairs.items():
-            if not name.startswith(ENV_PREFIX):
+            if not name.startswith(ENV_PREFIX) or name == ARM_ENV:
                 continue
             entry = lookup.get(name)
             if entry is None:
@@ -437,7 +450,13 @@ def load(config_file: Optional[Path] = None,
             settings.set(path, coerce(raw, template), source=source)
 
     if env_file and Path(env_file).exists():
-        _apply_env(parse_env_file(Path(env_file)), source=str(env_file))
+        dotenv = parse_env_file(Path(env_file))
+        if ARM_ENV in dotenv:
+            raise ConfigError(
+                f"{env_file} sets {ARM_ENV}. The live-run token must be given "
+                f"per invocation, in the process environment, never in a file "
+                f"that would arm every later run; remove it from {env_file}")
+        _apply_env(dotenv, source=str(env_file))
         sources.append(Path(env_file))
     _apply_env(environ, source="environment")
 

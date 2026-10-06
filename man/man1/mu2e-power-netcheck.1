@@ -1,4 +1,4 @@
-.TH MU2E-POWER-NETCHECK 1 "2026-09-18" "mu2edaq-power-recovery 0.1.0" "Mu2e DAQ Operations"
+.TH MU2E-POWER-NETCHECK 1 "2026-09-29" "mu2edaq-power-recovery 0.2.0" "Mu2e DAQ Operations"
 .SH NAME
 mu2e-power-netcheck \- phase 3: inter-node connectivity across the DAQ networks
 .SH SYNOPSIS
@@ -31,9 +31,22 @@ section of
 Full mesh, with a jumbo-frame probe. This is the network the DAQ actually uses
 and it is small enough to afford O(N^2) probes.
 .TP
-.BR lab ", " ipmi
+.B lab
 Sampled: each node is probed against a small set of anchor hosts, which is O(N)
 and sufficient to find a segment that has not come back.
+.TP
+.B ipmi
+Probed from the gateways, not from the nodes. A node's
+.I ipmi
+entry is its BMC, on a private subnet that only the gateways route to (which is
+why
+.BR ipmitool
+runs there), so a node's own OS cannot ping it on a healthy network. Each of a
+location's gateways pings every BMC of the probed nodes in that location, and
+the result names the gateway as the source. What this proves: every BMC answers
+ICMP from the hosts that phase 2 will drive it from. It does not prove IPMI
+authentication works, and it says nothing about host-to-BMC reachability, which
+the design does not need.
 .PP
 Probes for one source are packed into a single remote shell invocation rather
 than one SSH session per pair \(em the shipped topology has 49 nodes on the data
@@ -45,6 +58,42 @@ The results are interpreted, not merely tabulated. A node that reached nothing
 is reported separately from a node that nobody could reach: the first is a node
 or switch-port problem, the second suggests a one-way path, an ARP problem or a
 host firewall, and they need different responses.
+.PP
+FAIL and UNKNOWN are kept apart. A path is FAIL when the ping ran and got no
+reply, when the target name does not resolve on the source, or when the source
+has no route to it; it is UNKNOWN when it was never tested \(em the source
+could not be logged into, the probe raised, the output had no result for that
+target, or ping printed no statistics summary because it never ran
+.RI ( "ping: not found" ,
+.IR "Operation not permitted" ,
+a BusyBox ping rejecting
+.BR "\-M do" ).
+Such a path's detail quotes ping's first line. The same applies to the
+jumbo-frame probe: one that produced no summary leaves the path's MTU result
+unset rather than failed.
+A source that tested nothing is reported as an unreachable source, and its
+paths are left out of the isolated-node and unreachable-target analysis, so an
+SSH failure on one source is not presented as a broken switch. On the
+.B ipmi
+network coverage is judged per BMC: if one of a location's gateways is dark
+but the other tested every BMC, the network's status comes from those tested
+results, the dark gateway is still listed, and a note says its targets were
+covered. A location with BMCs but no gateway in the topology gives UNKNOWN
+paths from
+.I "(no gateway: <location>)"
+and a note, never OK. The summary line
+reads, per network,
+.IR "ok/tested paths ok, N untested (K source(s) unreachable)" .
+.PP
+Every host and interface name placed in the probe script has already passed
+the hostname check applied when the topology is loaded and to each
+.B \-\-node
+name, and is shell-quoted as well. A
+.B \-\-node
+value that is not a DNS name or an IPv4/IPv6 literal (whitespace, quotes,
+shell metacharacters, a leading
+.BR \- )
+is refused with exit status 2.
 .PP
 The probes run on the nodes, so they use those nodes' own
 .BR ping (8)
@@ -62,9 +111,15 @@ which is fixed to
 .SS Phase 3 control
 .TP
 .B \-\-include\-failed
-Probe nodes that failed an earlier phase. By default they are skipped, because
-probing a node already known to be down costs a full timeout per pair and tells
-the operator nothing new.
+Probe nodes that failed an earlier phase. By default they are left out of
+the node-to-node networks
+.RB ( "origin: nodes" ),
+because probing a node already known to be down costs a full timeout per pair
+and tells the operator nothing new. They are never left out of an
+.B "origin: gateways"
+network: their BMCs are still probed from the gateways, since a BMC does not
+depend on the host OS and those are the BMCs the operator needs after an
+outage.
 .SS Run control
 .TP
 .BI \-\-label " TEXT"
@@ -136,7 +191,7 @@ Print the option summary and exit.
 .TP
 .B \-\-version
 Print
-.I mu2edaq-power-recovery 0.1.0
+.I mu2edaq-power-recovery 0.2.0
 and exit.
 .TP
 .BI \-\-config " FILE"
@@ -160,7 +215,12 @@ Print every registered check and exit.
 Print the node inventory and exit.
 .TP
 .B \-\-json
-Print the mesh results as JSON on stdout instead of tables.
+Reserve stdout for exactly one JSON document; every human-readable line
+(banner, mode notice, phase tables, notes, report and self-update messages, and
+a self-update rebuild's output) goes to stderr. See
+.B JSON OUTPUT
+in
+.BR mu2e-power-recovery (1).
 .TP
 .BR \-v ", " \-\-verbose
 Debug logging, including one line per credential attempted against each source
@@ -177,13 +237,33 @@ against the same two hosts.
 .SH EXIT STATUS
 .TP
 .B 0
-Every probed path works.
+Every probed path works. Packet loss or a path that cannot carry a full jumbo
+frame is a warning and still exits 0.
 .TP
 .B 1
-At least one path failed, or a path could not carry a full jumbo frame.
+At least one path failed (FAIL), or at least one path could not be tested
+(UNKNOWN).
 .TP
 .B 2
-The probe could not start.
+The probe could not start, or a
+.B \-\-node
+name is not a valid hostname.
+.I run.dry_run: false
+in configuration does
+.I not
+exit 2 here: this command cannot issue a power command, so it always runs as
+a dry run, whatever the configuration,
+.B \-\-execute
+or
+.B MU2E_POWER_RECOVERY_ARM
+say (an info line in the log notes what was ignored). The live-run gate
+applies to invocations that include phase 2
+(see
+.BR mu2e-power-recovery (1),
+.BR "LIVE RUNS" ).
+Another run holds the run lock
+.RI ( run.lock_file )
+also exits 2, naming the holder.
 .SH EXAMPLES
 .RS
 .EX

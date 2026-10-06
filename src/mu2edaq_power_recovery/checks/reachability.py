@@ -1,6 +1,7 @@
 """Reachability and login checks -- the ones whose failure explains the rest."""
 from __future__ import annotations
 
+import shlex
 import time
 from typing import Any, Optional
 
@@ -35,7 +36,13 @@ def _ping_command(target: str, count: int, timeout: int,
     The payload/DF options are iputils-only.  Only the phase-3 MTU probe asks
     for them and that always runs on a gateway, so the other dialects are
     never asked to express them.
+
+    *target* is shell-quoted: the command is a string run through a shell,
+    locally or on a remote host.  A name that passed
+    :func:`~mu2edaq_power_recovery.topology.valid_hostname` comes out
+    unchanged; anything else is at worst a literal argument, never code.
     """
+    target = shlex.quote(target)
     if dialect == "windows":
         # -w is milliseconds here too, and there is no quiet mode.
         return f"ping -n {count} -w {timeout * 1000} {target}"
@@ -156,6 +163,10 @@ def ssh_login_root(ctx: CheckContext) -> CheckResult:
                   {"uid": uid}, started)
 
 
+#: Printed by the login.users probe before its own output.
+LOGIN_MARKER = "===MU2E-LOGIN==="
+
+
 @register("login.users", "the mu2edaq and mu2eshift accounts can log in", needs_root=True)
 def login_users(ctx: CheckContext) -> CheckResult:
     """Verify the service accounts can actually start a session.
@@ -174,13 +185,21 @@ def login_users(ctx: CheckContext) -> CheckResult:
     failures = []
     for user in users:
         try:
-            res = ctx.run(["su", "-", user, "-c", "pwd && id -un"], root=True, timeout=45)
+            res = ctx.run(["su", "-", user, "-c",
+                           f"echo {LOGIN_MARKER} && pwd && id -un"],
+                          root=True, timeout=45)
         except TransportError as exc:
             outcomes[user] = f"error: {exc}"
             failures.append(user)
             continue
-        lines = res.lines()
-        if res.ok and len(lines) >= 2 and lines[0].startswith("/"):
+        # Only what follows the marker is ours. Live: mu2eshift's login
+        # scripts print "Configuring Git ...: Pass" lines first and a kdestroy
+        # complaint on stderr, which read as a failed login on seven nodes.
+        out = res.stdout
+        lines = [ln.strip() for ln in out.split(LOGIN_MARKER, 1)[1].splitlines()
+                 if ln.strip()] if LOGIN_MARKER in out else []
+        if res.ok and len(lines) >= 2 and lines[0].startswith("/") \
+                and lines[1] == user:
             outcomes[user] = f"ok (home {lines[0]})"
         else:
             outcomes[user] = (res.stderr.strip() or res.stdout.strip()

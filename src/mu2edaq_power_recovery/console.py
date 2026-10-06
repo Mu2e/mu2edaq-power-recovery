@@ -129,7 +129,8 @@ def node_table(assessments: Sequence[Any], show_power: bool = False,
     return table(rows, headers)
 
 
-def failure_detail(assessments: Sequence[Any], limit: int = 40) -> str:
+def failure_detail(assessments: Sequence[Any], limit: int = 40,
+                   enabled: Optional[bool] = None) -> str:
     """The failing checks, node by node -- what the operator acts on."""
     lines: List[str] = []
     shown = 0
@@ -142,7 +143,7 @@ def failure_detail(assessments: Sequence[Any], limit: int = 40) -> str:
             if shown >= limit:
                 lines.append(f"    ... more failures suppressed; see the report page")
                 return "\n".join(lines)
-            lines.append(f"    {status_label(r.status)} {r.check_id:<18} {r.summary}")
+            lines.append(f"    {status_label(r.status, enabled)} {r.check_id:<18} {r.summary}")
             if r.detail:
                 for detail_line in r.detail.strip().splitlines()[:3]:
                     lines.append(f"             {detail_line}")

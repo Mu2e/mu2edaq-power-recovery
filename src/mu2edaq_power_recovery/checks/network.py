@@ -197,6 +197,12 @@ def net_ipmi_reach(ctx: CheckContext) -> CheckResult:
     if not cidr:
         return result(ctx, "net.ipmi_reach", Status.SKIP,
                       "no IPMI subnet recorded for this location", "", {}, started)
+    if ctx.topology is not None:
+        ipmi_gws = ctx.topology.ipmi_gateways(ctx.node.location)
+        if ipmi_gws and ctx.node.hostname not in ipmi_gws:
+            return result(ctx, "net.ipmi_reach", Status.SKIP,
+                          f"not an IPMI gateway for {ctx.node.location} "
+                          f"(ipmi_gateways: {', '.join(ipmi_gws)})", "", {}, started)
 
     ifaces = _interfaces(ctx)
     iface = _iface_on_subnet(ifaces, cidr)

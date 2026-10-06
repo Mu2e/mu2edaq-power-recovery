@@ -1,0 +1,96 @@
+.TH MU2EDAQ-RUNLOCK 1 "2026-09-29" "mu2edaq-power-recovery 0.2.0" "Mu2e DAQ Operations"
+.SH NAME
+mu2edaq-runlock \- report on the power-recovery run lock
+.SH SYNOPSIS
+.B python \-m mu2edaq_power_recovery.runlock
+.RB { status | pid }
+.RB [ \-\-lock\-file
+.IR PATH ]
+.RB [ \-\-config
+.IR FILE ]
+.RB [ \-\-env\-file
+.IR FILE ]
+.RB [ \-\-json ]
+.SH DESCRIPTION
+Every
+.BR mu2e-power-recovery (1)
+invocation that can act on hardware (phases 1\(en3 without
+.BR \-\-simulate )
+holds an exclusive operating-system lock on
+.I run.lock_file
+for its lifetime
+.RB ( flock (2)
+on Linux and macOS,
+.B msvcrt.locking
+on Windows) and writes a JSON record
+.RI { pid ", " started_at ", " cmdline ", " host }
+into the file. This helper reads that state. It never signals, deletes or
+rewrites anything.
+.PP
+The record is believed only while the lock is held. The kernel releases the
+lock when the holder exits, however it exits, so a free lock with a record in
+the file means the recorded pid is stale \(em possibly already reused by an
+unrelated process \(em and it is not reported as a pid.
+.PP
+To find out whether the lock is free the helper takes it for an instant and
+releases it; a run starting in that instant would exit 2 as if busy.
+.SH COMMANDS
+.TP
+.B status
+Print
+.I "running: pid N on host H, started T, command: ..."
+or
+.IR "not running (stale record: ...)" .
+.TP
+.B pid
+Print the holder's pid and nothing else, only while the lock is held. This is
+what the stop scripts signal, after checking the process's command line.
+.SH OPTIONS
+.TP
+.BI \-\-lock\-file " PATH"
+Lock file. Default:
+.I run.lock_file
+from the layered configuration, normally
+.IR logs/power-recovery.lock .
+.TP
+.BI \-\-config " FILE" "\fR, \fP" \-\-env\-file " FILE"
+Configuration used to find
+.IR run.lock_file .
+.TP
+.B \-\-json
+.BR status :
+one object
+.RI { running ", " lock_file ", " holder ", " stale_record }.
+.SH EXIT STATUS
+.TP
+.B 0
+.BR status :
+a run holds the lock.
+.BR pid :
+the pid was printed.
+.TP
+.B 1
+The lock is free (any recorded pid is stale), or for
+.BR pid ,
+it is held from another host and cannot be signalled from here.
+.TP
+.B 2
+The lock could not be examined, or it is held with no readable record.
+.SH EXAMPLES
+.RS
+.EX
+python \-m mu2edaq_power_recovery.runlock status
+python \-m mu2edaq_power_recovery.runlock pid \-\-lock\-file /tmp/test.lock
+\&./stop\-mu2edaq\-power\-recovery.sh \-\-status
+.EE
+.RE
+.SH FILES
+.TP
+.I logs/power-recovery.lock
+The default lock file.
+.SH SEE ALSO
+.BR mu2e-power-recovery (1),
+.BR mu2edaq-power-recovery-bootstrap (1),
+.BR mu2edaq-power-recovery.yaml (5)
+.SH AUTHOR
+A. Norman <anorman@fnal.gov>, Mu2e DAQ Operations.

@@ -1,4 +1,4 @@
-.TH MU2EDAQ-POWER-RECOVERY 7 "2026-09-17" "mu2edaq-power-recovery 0.1.0" "Overview"
+.TH MU2EDAQ-POWER-RECOVERY 7 "2026-09-29" "mu2edaq-power-recovery 0.2.0" "Overview"
 .SH NAME
 mu2edaq-power-recovery \- overview of the Mu2e DAQ power-outage recovery tools
 .SH DESCRIPTION
@@ -105,9 +105,14 @@ No corrective action is taken. Produces the "initial state" pages.
 .TP
 .B Phase 2 \(em power on
 The dependency-ordered power-on sequence, verifying each stage before starting
-the next. Dry run unless
-.B \-\-execute
-is given. Produces the "power on" pages.
+the next. Dry run unless this invocation authorises it
+.RB ( \-\-execute ,
+or the
+.B MU2E_POWER_RECOVERY_ARM
+token); with
+.BR \-\-node ,
+only the named nodes are powered and the stages before them are verified.
+Produces the "power on" pages.
 .TP
 .B Phase 3 \(em network
 Node-to-node connectivity across the segments, with a jumbo-frame probe on the
@@ -137,9 +142,21 @@ Not applicable to this host \(em a node with no BMC, a host with no PCIe card.
 A node whose every applicable check passed is OK, not n/a.
 .SH SAFETY MODEL
 .IP \(bu 2
-Power actions are a dry run unless
-.B \-\-execute
-is given; a simulated run cannot be armed at all.
+Power actions are a dry run unless the invocation authorises them
+.RB ( \-\-execute ,
+or
+.B MU2E_POWER_RECOVERY_ARM
+equal to the configured
+.IR run.label );
+.I run.dry_run: false
+in configuration alone is refused for any invocation that includes phase 2;
+the read-only phases always run as a dry run. A simulated run cannot be armed
+at all.
+.IP \(bu 2
+Phase 2 powers only what
+.BR \-\-node / \-\-location / \-\-from / \-\-until
+select; a selection that cannot be honoured exactly is an error before any
+credential is acquired.
 .IP \(bu 2
 .BR "chassis power off" ", " cycle " and " reset
 are refused for the gateways,
@@ -161,23 +178,46 @@ to copy the report anywhere, reporting
 The publisher needs a refusal of its own because it copies with the filesystem
 rather than through a transport, so scripting the transports does not reach it.
 .IP \(bu 2
-The first IPMI credential rejection stops IPMI for the rest of the run. All the
-BMCs share one credential set, so the first refusal settles the matter, and
+A simulated run is marked as one in the run store, and a later
+.B mu2e-power-report
+refuses (exit 2) to post it to the logbook or publish it, whatever its own
+options, so scripted results can never be filed as a real dry run.
+.IP \(bu 2
+The first IPMI credential rejection stops IPMI to that location for the rest of
+the run. The BMCs of a location share one credential set, so the first refusal
+settles the matter there (other locations are judged separately), and
 repeating it only walks the BMC accounts towards lockout; the run reports one
 diagnosis naming the username that was refused. Only an RAKP failure or an
 .I "unauthorized name"
 counts.
 .I "Unable to establish IPMI v2 / RMCP+ session"
 deliberately does not: that is what a dark chassis says, and after an outage a
-dark chassis is the expected case. Set
+dark chassis is the expected case. Until one BMC has accepted the credential
+IPMI commands are issued one at a time, so this holds under concurrent
+assessment as well; each is preceded by a ping of the BMC from the gateway, so a
+dark BMC neither waits its turn nor gets an ipmitool invocation, and two BMCs
+that answer the ping but cannot open a session also count as a refusal
+.RI ( ipmi.reachability_precheck ).
+Set
 .I ipmi.stop_on_auth_failure
 false to carry on regardless.
 .SH REPORTS
-Each phase writes a static HTML page and a JSON companion into
+Every run is rendered, from its own stored rows only, into
+.I html/runs/<id>/
+\(em static HTML pages plus JSON in
+.IR data/ ,
+no server, no build step, readable from a laptop or copied to a web area. A run
+gets a page only for the phases it contains, and its navigation links only
+those. The top level of
 .I html/
-\(em no server, no build step, readable from a laptop or copied to a web area.
-Re-running a phase refreshes its page in place; each run is also archived under
-.IR html/runs/<id>/ .
+is the newest run's view plus the run history; regenerating an older run
+rewrites that run's bundle only. The report is rendered after the run is
+finished, so it carries the final status, and its current state is reconciled:
+a failure a later phase re-checked and passed is resolved, not outstanding
+(see
+.B REPORT LIFECYCLE
+in
+.BR mu2e-power-recovery (1)).
 The pages are overview, initial state, power on, network, detailed report, run
 history, about, API and site map.
 .SH ENVIRONMENT
@@ -316,7 +356,10 @@ Configuration: the main file, the topology, the power sequence, the checks.
 The run store: runs, phases, nodes, check results, actions and events.
 .TP
 .I html/
-The generated report site.
+The report site: the newest run's view,
+.IR runs.html ,
+and one bundle per run under
+.IR html/runs/<id>/ .
 .TP
 .I logs/power-recovery.log
 Rotating log.

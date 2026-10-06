@@ -199,13 +199,29 @@ def test_the_nfs_server_does_not_check_its_own_export(make_context):
 
 def test_nfs_from_the_wrong_server_fails(make_context, fake_transport):
     # Passes 'mountpoint' and fails the moment anything reads a file.
-    fake_transport.expect_first(r"\bdf\b", ScriptedResponse(stdout=(
-        "Filesystem            Type 1024-blocks   Used Available Capacity Mounted on\n"
-        "old-server:/home      nfs4     1000000 200000    800000      20% /home\n"
-        "mu2e-mgr-01:/daqlogs  nfs4     1000000 100000    900000      10% /daqlogs")))
+    fake_transport.expect_first(r"cat /proc/mounts", ScriptedResponse(stdout=(
+        "old-server:/home /home nfs4 rw,relatime 0 0\n"
+        "mu2e-mgr-01.fnal.gov:/daqlogs /daqlogs nfs4 rw,relatime 0 0")))
     result = run_check("disk.nfs_from_mgr", make_context("mu2e-dcs-01.fnal.gov"))
     assert result.status is Status.FAIL
     assert any("old-server" in entry for entry in result.data["wrong"])
+
+
+def test_nfs_from_the_manager_passes_on_live_proc_mounts(make_context):
+    """Live dcs-01: both mounts present; 'df -l' had reported them absent."""
+    result = run_check("disk.nfs_from_mgr", make_context("mu2e-dcs-01.fnal.gov"))
+    assert result.status is Status.OK, result.detail
+    assert result.data["sources"] == {"/home": "mu2e-mgr-01.fnal.gov:/home",
+                                      "/daqlogs": "mu2e-mgr-01.fnal.gov:/daqlogs"}
+
+
+def test_a_local_filesystem_where_nfs_is_expected_fails(make_context, fake_transport):
+    fake_transport.expect_first(r"cat /proc/mounts", ScriptedResponse(stdout=(
+        "/dev/sda3 /home xfs rw 0 0\n"
+        "mu2e-mgr-01.fnal.gov:/daqlogs /daqlogs nfs4 rw 0 0")))
+    result = run_check("disk.nfs_from_mgr", make_context("mu2e-dcs-01.fnal.gov"))
+    assert result.status is Status.FAIL
+    assert any("local xfs" in e for e in result.data["wrong"])
 
 
 def test_raid_degradation_fails(make_context, fake_transport):
@@ -322,8 +338,9 @@ def test_uptime_flags_a_node_that_did_not_actually_reboot(make_context):
 
 
 def test_a_tainted_kernel_warns(make_context, fake_transport):
+    # 4096 (O) alone is the expected DAQ driver; 4096|128 adds M, a machine check.
     fake_transport.expect_first(r"/proc/sys/kernel/tainted",
-                                ScriptedResponse(stdout="4096"))
+                                ScriptedResponse(stdout="4224"))
     assert run_check("host.kernel", make_context()).status is Status.WARN
 
 
@@ -360,3 +377,191 @@ def test_missing_nfs_exports_fail(make_context, fake_transport):
                                 ScriptedResponse(stdout="", rc=1))
     result = run_check("svc.nfs_export", make_context("mu2e-mgr-01.fnal.gov"))
     assert result.status is Status.FAIL
+
+
+# ---------------------------------------------------------------------------
+# power.* against the BMC (#8, #10)
+# ---------------------------------------------------------------------------
+
+from mu2edaq_power_recovery.checks.parsers import (parse_sel_list,  # noqa: E402
+                                                   sel_baseline)
+from mu2edaq_power_recovery.transport import IPMIClient  # noqa: E402
+
+RAKP = "Error: Unable to establish IPMI v2 / RMCP+ session\nRAKP 2 HMAC is invalid"
+
+
+def _ipmi(fake_transport, **kwargs):
+    return IPMIClient(gateway=fake_transport.clone("mu2egateway01.fnal.gov"),
+                      username="MU2E", password="x", retries=0, **kwargs)
+
+
+def _rows(first, last, event="Power Supply AC lost"):
+    return "\n".join(f"{i:4x} | 09/18/2026 | 14:00:00 | Power Supply #0x51 | "
+                     f"{event} | Asserted" for i in range(first, last + 1))
+
+
+def _sel_check(make_context, fake_transport, now, before=None):
+    fake_transport.expect_first(r"sel list", ScriptedResponse(stdout=now))
+    baseline = ({"sel": sel_baseline(parse_sel_list(before))}
+                if before is not None else None)
+    return run_check("power.sel", make_context(ipmi=_ipmi(fake_transport),
+                                               baseline=baseline))
+
+
+@pytest.mark.parametrize("check_id", ["power.status", "power.sensors", "power.sel"])
+def test_a_refused_credential_is_unknown_not_a_dark_bmc(make_context,
+                                                        fake_transport, check_id):
+    fake_transport.expect_first(r"ipmitool", ScriptedResponse(stderr=RAKP, rc=1))
+    result = run_check(check_id, make_context(ipmi=_ipmi(fake_transport)))
+    assert result.status is Status.UNKNOWN
+    assert "credentials refused" in result.summary
+    assert "does not answer" not in result.summary
+    assert "rejected the IPMI credentials" in result.detail
+
+
+def test_a_bmc_that_does_not_answer_still_fails_power_status(make_context,
+                                                             fake_transport):
+    fake_transport.expect_first(r"chassis power status", ScriptedResponse(
+        stderr="Error: Unable to establish IPMI v2 / RMCP+ session", rc=1))
+    fake_transport.expect_first(r"^ping |ping -c", ScriptedResponse(
+        stdout="1 packets transmitted, 0 received, 100% packet loss", rc=1))
+    result = run_check("power.status", make_context(ipmi=_ipmi(fake_transport)))
+    assert result.status is Status.FAIL and "does not answer" in result.summary
+
+
+def test_a_bmc_that_pings_but_will_not_open_a_session_is_unknown(make_context,
+                                                                  fake_transport):
+    """Live: the teststand BMCs answer ping from the MC-2 gateways and refuse
+    the MC-2 account. Not "no standby power"; we could not look."""
+    fake_transport.expect_first(r"chassis power status", ScriptedResponse(
+        stderr="Error: Unable to establish IPMI v2 / RMCP+ session", rc=1))
+    result = run_check("power.status", make_context(ipmi=_ipmi(fake_transport)))
+    assert result.status is Status.UNKNOWN
+    assert "answers ping but will not open" in result.summary
+
+
+def test_an_unresolvable_bmc_name_is_unknown_not_dark(make_context, fake_transport):
+    fake_transport.expect_first(r"chassis power status", ScriptedResponse(
+        stderr="Address lookup for mu2e-trk-01-ipmi.fnal.gov failed\n"
+               "Could not open socket!\n"
+               "Error: Unable to establish IPMI v2 / RMCP+ session", rc=1))
+    result = run_check("power.status", make_context(ipmi=_ipmi(fake_transport)))
+    assert result.status is Status.UNKNOWN and "does not resolve" in result.summary
+
+
+def test_sel_empty_log_is_clean(make_context, fake_transport):
+    result = _sel_check(make_context, fake_transport, "SEL has no entries")
+    assert result.status is Status.OK
+    assert result.data["records"] == {}          # an empty baseline, recorded
+
+
+def test_sel_failed_read_is_unknown_and_records_nothing(make_context, fake_transport):
+    fake_transport.expect_first(r"sel list", ScriptedResponse(
+        stderr="Error: timed out", rc=1))
+    result = run_check("power.sel", make_context(ipmi=_ipmi(fake_transport)))
+    assert result.status is Status.UNKNOWN
+    assert "records" not in result.data
+
+
+def test_sel_short_log_reports_only_what_is_new(make_context, fake_transport):
+    result = _sel_check(make_context, fake_transport, _rows(1, 7), before=_rows(1, 5))
+    assert result.status is Status.WARN
+    assert "2 new event(s)" in result.summary
+    assert result.data["new"] == [line.strip() for line in
+                                  _rows(6, 7).splitlines()]
+
+
+def test_sel_full_rotated_tail_finds_the_new_critical_event(make_context,
+                                                            fake_transport):
+    now = _rows(0x42, 0x54) + ("\n  55 | 09/18/2026 | 15:10:02 | "
+                               "Processor #0x04 | IERR | Asserted | Critical")
+    result = _sel_check(make_context, fake_transport, now,
+                        before=_rows(0x41, 0x54))
+    assert result.data["count"] == result.data["baseline_count"] == 20
+    assert result.status is Status.FAIL
+    assert "IERR" in result.detail
+
+
+def test_sel_identical_history_is_not_reported_again(make_context, fake_transport):
+    history = _rows(0x41, 0x54, event="Power Supply Failure detected")
+    result = _sel_check(make_context, fake_transport, history, before=history)
+    assert result.status is Status.OK
+    assert "no new events" in result.summary
+    assert "pre-existing" in result.detail
+
+
+def test_sel_cleared_with_reused_ids_warns(make_context, fake_transport):
+    now = ("   1 | 09/18/2026 | 15:00:00 | Event Logging Disabled #0x07 | "
+           "Log area reset/cleared | Asserted\n"
+           "   2 | Pre-Init  |0000000029| Power Supply #0x51 | Power Supply AC "
+           "lost | Deasserted")
+    result = _sel_check(make_context, fake_transport, now, before=_rows(1, 6))
+    assert result.status is Status.WARN
+    assert result.summary == "SEL cleared since survey"
+    assert result.data["cleared"] and result.data["reused_ids"] == ["1", "2"]
+
+
+def test_sel_all_new_full_tail_notes_possible_truncation(make_context,
+                                                          fake_transport):
+    result = _sel_check(make_context, fake_transport, _rows(0x30, 0x43),
+                        before=_rows(1, 20))
+    assert result.data["possibly_truncated"] is True
+    assert "scrolled out" in result.detail
+
+
+def test_login_script_noise_does_not_fail_a_good_login(make_context, fake_transport):
+    """Live cfo-01: mu2eshift logs in fine; its profile prints status lines
+    first and a kdestroy complaint on stderr."""
+    from mu2edaq_power_recovery.checks.reachability import LOGIN_MARKER
+    fake_transport.expect_first(r"su - mu2eshift", ScriptedResponse(
+        stdout=("Configuring Git User Information: \x1b[32mPass\x1b[0m\n"
+                "Configuring Git SSH Command: \x1b[31mFail\x1b[0m\n"
+                f"{LOGIN_MARKER}\n/home/mu2eshift\nmu2eshift\n"),
+        stderr="kdestroy: No credentials cache found while destroying cache\n"))
+    result = run_check("login.users", make_context("mu2e-cfo-01.fnal.gov"))
+    assert result.status is Status.OK, result.detail
+
+
+def test_a_login_without_a_home_still_fails(make_context, fake_transport):
+    from mu2edaq_power_recovery.checks.reachability import LOGIN_MARKER
+    fake_transport.expect_first(r"su - mu2eshift", ScriptedResponse(
+        stdout=f"{LOGIN_MARKER}\n", stderr="su: warning: cannot change directory to /home/mu2eshift",
+        rc=1))
+    result = run_check("login.users", make_context("mu2e-cfo-01.fnal.gov"))
+    assert result.status is Status.FAIL
+
+
+def test_smart_unreadable_is_unknown(make_context, fake_transport):
+    from tests.unit.test_parsers import TRK11_SDC
+    fake_transport.expect_first(r"smartctl -H /dev/nvme0n1",
+                                ScriptedResponse(stdout=TRK11_SDC, rc=4))
+    result = run_check("disk.smart", make_context("mu2e-trk-11.fnal.gov"))
+    assert result.status is Status.UNKNOWN
+    assert result.data["unreadable"] == ["nvme0n1"]
+
+
+@pytest.mark.parametrize("word, status, letters", [
+    (12288, Status.OK, ""),          # O|E: mu2e and TRACE modules, live
+    (12292, Status.WARN, "S"),       # plus S: CPU out of spec, live on calo-02
+    (512, Status.WARN, "W"),         # a kernel WARN since boot
+    (0, Status.OK, ""),
+])
+def test_kernel_taint_ignores_only_the_configured_flags(make_context, fake_transport,
+                                                        word, status, letters):
+    fake_transport.expect_first(r"/proc/sys/kernel/tainted",
+                                ScriptedResponse(stdout=str(word)))
+    result = run_check("host.kernel", make_context())
+    assert result.status is status
+    if letters:
+        assert f"tainted {letters} " in result.summary
+
+
+@pytest.mark.parametrize("reason", ["gateway", "timeout", "unclassified"])
+def test_a_bmc_that_was_not_judged_is_unknown(make_context, fake_transport, reason):
+    from mu2edaq_power_recovery.transport.ipmi import PowerState
+    """PR #32 review: these read as FAIL 'does not answer'."""
+    ipmi = _ipmi(fake_transport)
+    ipmi.power_status = lambda host: (ipmi.unreachable_reason.__setitem__(host, reason)
+                                      or PowerState.UNREACHABLE)
+    result = run_check("power.status", make_context(ipmi=ipmi))
+    assert result.status is Status.UNKNOWN and "not read" in result.summary

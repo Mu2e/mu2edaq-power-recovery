@@ -40,9 +40,10 @@ import logging
 import shlex
 import threading
 import time
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-from .base import Command, CommandResult, TimeoutExpired, Transport, TransportError, as_string
+from .base import (Command, CommandResult, TimeoutExpired, Transport, TransportError,
+                   as_string, is_deadline_exempt)
 from .local import LocalTransport
 
 log = logging.getLogger(__name__)
@@ -146,7 +147,8 @@ class SSHTransport(Transport):
                  local: Optional[LocalTransport] = None,
                  credentials: Optional[Sequence[Any]] = None,
                  on_success: Optional[Callable[[Any], None]] = None,
-                 max_capture: int = 65536):
+                 max_capture: int = 65536,
+                 deadline_source: Optional[Callable[[], Any]] = None):
         self.host = host
         self.user = user
         self.jump = jump
@@ -168,6 +170,10 @@ class SSHTransport(Transport):
         self._runners: Dict[str, LocalTransport] = {}
         #: What each credential was tried and rejected for, for the report.
         self.attempts: List[Dict[str, Any]] = []
+        #: Returns the running phase's Deadline (or None). Every call's
+        #: timeout is capped at what it has left, so no single ssh call can
+        #: carry a phase far past run.phase_timeout.
+        self.deadline_source = deadline_source
 
     # -- command construction ---------------------------------------------
 
@@ -212,6 +218,10 @@ class SSHTransport(Transport):
         login = user
         if login is None and credential is not None:
             login = getattr(credential, "login", None)
+        # "--" ends ssh's option parsing, so a destination can never be read
+        # as an option (a host beginning with '-', e.g. "-oProxyCommand=...").
+        # Every option -- config options, ConnectTimeout, -J -- precedes it.
+        argv.append("--")
         argv.append(self._target(login))
         # The remote side runs this through its login shell, so it must be a
         # single string; as_string() quotes a sequence safely.
@@ -219,6 +229,21 @@ class SSHTransport(Transport):
         return argv
 
     # -- execution ---------------------------------------------------------
+
+    def _capped(self, timeout: Optional[float]) -> float:
+        """*timeout* (or command_timeout) capped at the phase budget left.
+
+        Raises TimeoutExpired, without starting ssh, when the budget is
+        already spent.
+        """
+        wanted = float(timeout or self.command_timeout)
+        deadline = self.deadline_source() if self.deadline_source else None
+        if deadline is None or is_deadline_exempt():
+            return wanted
+        if deadline.expired():
+            raise TimeoutExpired(f"{self.host}: run.phase_timeout expired; "
+                                 f"command not started")
+        return max(1.0, min(wanted, deadline.remaining()))
 
     def _run_once(self, command: Command, timeout: Optional[float],
                   user: Optional[str], input_text: Optional[str],
@@ -228,7 +253,7 @@ class SSHTransport(Transport):
         started = time.monotonic()
         try:
             result = self._runner(credential).run(
-                argv, timeout=timeout or self.command_timeout,
+                argv, timeout=self._capped(timeout),
                 input_text=input_text)
         except TimeoutExpired as exc:
             raise TimeoutExpired(f"{self.host}: {exc}") from exc
@@ -322,28 +347,55 @@ class SSHTransport(Transport):
             return False
 
     def wait_for_ssh(self, budget: float, interval: float = 15.0,
-                     user: Optional[str] = None) -> bool:
-        """Poll until the host answers SSH or *budget* seconds elapse.
+                     user: Optional[str] = None, deadline: Any = None,
+                     clock: Optional[Callable[[], float]] = None,
+                     sleep: Optional[Callable[[float], None]] = None,
+                     gate: Any = None) -> bool:
+        """Poll until the host answers SSH, *budget* runs out, or *deadline*.
 
         Used after an IPMI power-on.  Returns True as soon as a session opens;
         the caller is responsible for the post-boot settle wait, because
         "sshd is listening" is earlier than "the machine has finished booting".
+
+        *deadline* is a shared stage deadline (anything with ``expires_at``):
+        phase 2 waits for a whole stage's nodes concurrently under one, so N
+        nodes that never answer cost one boot_timeout, not N. The wait ends
+        at whichever of ``now + budget`` and ``deadline.expires_at`` comes
+        first. Each attempt's timeout is capped at the time left, so the wait
+        overruns by at most the capped attempt in flight. *clock* and *sleep*
+        default to ``time.monotonic`` / ``time.sleep``; tests pass a fake pair.
+
+        *gate*, when given, is a context manager held around each attempt
+        (phase 2 passes a semaphore of ``ssh.max_sessions``), so many nodes
+        can be waited for at once while only that many ssh sessions exist;
+        the sleeps between attempts hold nothing.
         """
-        deadline = time.monotonic() + budget
+        clock = clock or time.monotonic
+        sleep = sleep or time.sleep
+        end = clock() + float(budget)
+        if deadline is not None:
+            end = min(end, float(deadline.expires_at))
         attempt = 0
-        while time.monotonic() < deadline:
+        while clock() < end:
             attempt += 1
+            per_try = min(float(self.connect_timeout + 5), max(1.0, end - clock()))
             try:
-                if self.run("true", timeout=self.connect_timeout + 5, user=user).ok:
+                if gate is not None:
+                    with gate:
+                        ok = self.run("true", timeout=per_try, user=user).ok
+                else:
+                    ok = self.run("true", timeout=per_try, user=user).ok
+                if ok:
                     log.info("%s answered ssh after %d attempt(s)", self.host, attempt)
                     return True
             except TransportError:
                 pass
-            remaining = deadline - time.monotonic()
+            remaining = end - clock()
             if remaining <= 0:
                 break
-            time.sleep(min(interval, remaining))
-        log.warning("%s did not answer ssh within %.0fs", self.host, budget)
+            sleep(min(interval, remaining))
+        log.warning("%s did not answer ssh within %.0fs (%d attempt(s))",
+                    self.host, budget, attempt)
         return False
 
 
@@ -369,7 +421,7 @@ class SSHFactory:
         #: the operator's ticket, then the Mu2e service identities that
         #: mu2edaq-kerberos can mint from Vault.
         self.kerberos = kerberos
-        self._gateway_cache: Dict[str, Optional[str]] = {}
+        self._gateway_cache: Dict[Tuple[str, str], Optional[str]] = {}
         #: Serialises gateway selection. Nodes are assessed a thread apiece,
         #: and every one of them asks for its location's gateway before its
         #: first command, so an unguarded cache miss means sixteen threads
@@ -381,11 +433,20 @@ class SSHFactory:
         #: host -> the credential that worked there, so a transport rebuilt for
         #: the same node does not repeat the search.
         self._working: Dict[str, Any] = {}
+        #: The running phase's Deadline, set by Orchestrator.budget(). Read
+        #: at call time by every transport built here, including the IPMI
+        #: gateway transports built before the phase started.
+        self.deadline: Any = None
 
     # -- gateway selection -------------------------------------------------
 
-    def gateway_for(self, location: str) -> Optional[str]:
+    def gateway_for(self, location: str, role: str = "ssh") -> Optional[str]:
         """First responsive gateway for *location*, or None if none answer.
+
+        *role* ``ipmi`` chooses among :meth:`Topology.ipmi_gateways` -- the
+        hosts that can reach the location's BMCs -- instead of the ssh jump
+        hosts. An ``ssh.proxy`` override applies to the ssh role only when the
+        location names its own ``ipmi_gateways``.
 
         The result is cached for the life of the run: re-probing the gateways
         before every one of several hundred node commands would dominate the
@@ -396,23 +457,28 @@ class SSHFactory:
         for the answer. Without that, the whole worker pool arrives here at
         once on a cold cache and every thread probes the gateways for itself.
         """
+        explicit_ipmi = role == "ipmi" and \
+            (self.topology.location_info(location) or {}).get("ipmi_gateways")
         configured = self.settings.get("ssh.proxy", "auto")
-        if configured and configured not in ("auto", "none"):
-            return configured
-        if configured == "none":
-            return None
-        if location in self._gateway_cache:
-            return self._gateway_cache[location]
+        if not explicit_ipmi:
+            if configured and configured not in ("auto", "none"):
+                return configured
+            if configured == "none":
+                return None
+        key = (location, "ipmi" if explicit_ipmi else "ssh")
+        if key in self._gateway_cache:
+            return self._gateway_cache[key]
 
         with self._gateway_lock:
             # Re-check: another thread may have filled it while we queued.
-            if location in self._gateway_cache:
-                return self._gateway_cache[location]
-            return self._select_gateway(location)
+            if key in self._gateway_cache:
+                return self._gateway_cache[key]
+            return self._select_gateway(location, key[1])
 
-    def _select_gateway(self, location: str) -> Optional[str]:
-        """Probe *location*'s gateways and cache the first that answers."""
-        candidates = self.topology.gateways(location)
+    def _select_gateway(self, location: str, role: str = "ssh") -> Optional[str]:
+        """Probe *location*'s gateways for *role* and cache the first that answers."""
+        candidates = self.topology.ipmi_gateways(location) if role == "ipmi" \
+            else self.topology.gateways(location)
         # Pre-filter on TCP/22 before attempting a full SSH handshake.  A
         # gateway whose chassis is dark costs the whole ssh ConnectTimeout to
         # discover, and during an outage that is the likely case for at least
@@ -453,8 +519,9 @@ class SSHFactory:
                 log.warning("    (no credential chain configured; ssh used the "
                             "ambient ticket and its own default login)")
         if chosen is None:
-            log.error("no gateway answered for location %s", location)
-        self._gateway_cache[location] = chosen
+            log.error("no %sgateway answered for location %s",
+                      "IPMI " if role == "ipmi" else "", location)
+        self._gateway_cache[(location, role)] = chosen
         return chosen
 
     # -- transports --------------------------------------------------------
@@ -502,6 +569,7 @@ class SSHFactory:
             max_capture=self.settings.get("logging.max_capture_bytes", 65536),
             credentials=chain,
             on_success=lambda credential: self._note_success(host, credential),
+            deadline_source=lambda: self.deadline,
         )
 
     def for_node(self, node: Any, user: Optional[str] = None,

@@ -11,24 +11,38 @@
 
 run:
   # Human label for this recovery campaign; appears in the report header and
-  # in the ECL entry subject.  Defaults to "<user>@<host> <ISO date>".
+  # in the ECL entry subject.  Defaults to "<user>@<host> <ISO date>".  Also
+  # the value MU2E_POWER_RECOVERY_ARM must equal to arm an unattended run.
   label: null
-  # Never issue a state-changing command (IPMI power on/off, remote writes)
-  # while this is true.  --execute is the supported way to set it false, but it
-  # is NOT a second, independent gate: setting dry_run false here, in
-  # config/.env, or as MU2E_POWER_RECOVERY_RUN_DRY_RUN=false arms live power
-  # commands on its own, with no flag on the command line.  The run prints
-  # "LIVE RUN -- power commands WILL be issued." when that is the case.
-  # --simulate is the gate no config file can open: it forces this back to
-  # true whatever else was asked for.
+  # Never issue a state-changing command (IPMI power on/off) unless THIS
+  # INVOCATION authorises it:
+  #   --execute                             on the command line, or
+  #   MU2E_POWER_RECOVERY_ARM=<run.label>   in the process environment, which
+  #                                         arms only when this key is false
+  #                                         and run.label is set and matches.
+  # Setting this false (here, in config/.env, or MU2E_POWER_RECOVERY_RUN_DRY_RUN)
+  # only PERMITS the token path; on its own it arms nothing and the run exits 2.
+  # The token is never read from config/.env (that is an error).  --simulate
+  # always wins: it forces this back to true whatever else was asked for.
   dry_run: true
   # Stop the phase-2 sequence at the first stage that fails its require:.
   stop_on_stage_failure: true
-  # Overall wall-clock budget for one phase, in seconds.  0 disables.
+  # Wall-clock budget for each of phases 1-3, in seconds; 0 disables.  Checked
+  # before every stage/node/check, and every ssh call's timeout is capped at
+  # the time left, so a phase overruns by at most the one call in flight.
+  # What it never reached is UNKNOWN "not run: phase_timeout expired".
   phase_timeout: 7200
   # Where the sequence starts/stops, by stage name.  null = the whole thing.
+  # A name that is not a stage (or a reversed range) is an error, exit 2.
   from_stage: null
   until_stage: null
+  # The single-run lock. Every run that can act on hardware (phases 1-3, not
+  # --simulate) takes an exclusive OS lock on this file before phase 0; a
+  # second such run exits 2 naming the holder. The JSON record inside
+  # ({pid, started_at, cmdline, host}) is only believed while the lock is
+  # held, and the file is left in place afterwards. Relative to the project
+  # root. Inspect with:  python -m mu2edaq_power_recovery.runlock status
+  lock_file: logs/power-recovery.lock
 
 topology:
   file: topology.yaml
@@ -123,16 +137,30 @@ ipmi:
 
   # Stop issuing IPMI commands once a BMC has answered and rejected the
   # credentials (an RAKP failure, or "unauthorized name"). One credential set
-  # serves all 45 BMCs (the nodes with an ipmi: interface, of 65 nodes in
-  # topology.yaml), so the next one will reject it too -- and each attempt
+  # serves the BMCs of a location (45 BMCs in all: the nodes with an ipmi:
+  # interface, of 65 nodes in topology.yaml), so the next one there will
+  # reject it too -- and each attempt
   # is three invocations here with four ipmitool retries inside each. Set this
   # false only to gather evidence from several BMCs at once; the run then
   # sends the same bad username to every controller in the cluster.
   #
   # A BMC that simply does not answer is *not* this: "Unable to establish IPMI
   # v2 / RMCP+ session" is what a dark chassis says too, and after an outage a
-  # dark chassis is the expected case.
+  # dark chassis is the expected case -- unless the BMC has just answered the
+  # reachability ping below: two such live BMCs failing the session while no
+  # BMC of that location has yet accepted the credential also stop it (likely
+  # a wrong username). The stop is per location: the teststand's BMCs refuse
+  # the account MC-2's accept, so one site's refusal leaves the other running.
   stop_on_auth_failure: true
+
+  # While the credential is unproven, ping each BMC from the gateway
+  # (ping -c 3 -i 0.2 -W 1) before ipmitool; any reply counts, because a cold
+  # ARP entry after an outage loses the first echo. A BMC that answers none is
+  # reported unreachable without an ipmitool invocation and without waiting
+  # behind the one-at-a-time credential gate, so forty dark BMCs do not cost
+  # forty serialised ipmitool timeouts. Set false for BMCs that filter ICMP: every
+  # unproven call then goes straight to ipmitool, one at a time.
+  reachability_precheck: true
 
 kerberos:
   # Principals the tools will use.  Leave null to take whatever is in the

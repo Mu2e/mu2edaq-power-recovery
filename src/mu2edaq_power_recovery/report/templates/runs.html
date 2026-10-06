@@ -4,8 +4,8 @@
 {% block content %}
 <h2 class="mb-1 text-lg font-semibold">Run history</h2>
 <p class="mb-4 text-sm text-slate-600 dark:text-slate-300">
-  Each run's pages are archived under <code>runs/&lt;id&gt;/</code> exactly as
-  they were read at the time.
+  Each run's pages are rendered under <code>runs/&lt;id&gt;/</code> from that
+  run's stored data alone; phases a run did not contain have no page there.
 </p>
 <div class="overflow-x-auto rounded-lg border border-slate-200 dark:border-slate-800">
 <table data-sortable class="min-w-full divide-y divide-slate-200 text-sm dark:divide-slate-800">
@@ -22,7 +22,7 @@
       <td class="px-3 py-2">{{ r.operator }}</td>
       <td class="px-3 py-2 font-mono text-xs">{{ r.started_at }}</td>
       <td class="px-3 py-2">{{ r.status }}</td>
-      <td class="px-3 py-2">{{ 'dry run' if r.dry_run else 'live' }}</td>
+      <td class="px-3 py-2">{% if r.simulated %}<span class="font-semibold text-violet-800 dark:text-violet-300">simulated</span>{% elif r.dry_run %}dry run{% else %}live{% endif %}</td>
       <td class="px-3 py-2"><a class="text-sky-700 underline dark:text-sky-400" href="runs/{{ r.id }}/index.html">open</a></td>
     </tr>
     {% else %}

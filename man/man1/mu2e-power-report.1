@@ -1,4 +1,4 @@
-.TH MU2E-POWER-REPORT 1 "2026-09-18" "mu2edaq-power-recovery 0.1.0" "Mu2e DAQ Operations"
+.TH MU2E-POWER-REPORT 1 "2026-09-29" "mu2edaq-power-recovery 0.2.0" "Mu2e DAQ Operations"
 .SH NAME
 mu2e-power-report \- phase 4: the consolidated recovery report
 .SH SYNOPSIS
@@ -11,8 +11,18 @@ mu2e-power-report \- phase 4: the consolidated recovery report
 .SH DESCRIPTION
 Runs phase 4 of
 .BR mu2e-power-recovery (1):
-it reads a run back out of the run store, renders the detailed report page, and
-optionally posts it to the Fermilab Electronic Logbook.
+it reads a finished run back out of the run store, renders that run's report
+bundle, and optionally posts it to the Fermilab Electronic Logbook.
+.PP
+Run on its own it
+.I regenerates
+the report of an existing run \(em the one named by
+.BR \-\-run\-id ,
+or the newest. It attaches to that run rather than opening a new one: the
+.B report
+phase row and its events are recorded against the selected run, every page and
+JSON file names that run, and the run's status and finish time are never
+changed. It needs neither Kerberos nor Vault unless it posts.
 .PP
 This phase probes nothing, which is what makes it repeatable. An operator can
 regenerate a report hours after the event, or repost it after fixing the
@@ -20,7 +30,14 @@ logbook credentials, without touching the cluster.
 .PP
 The narrative is derived entirely from stored rows, in the order a reader who
 was not present needs them: what the run did, what is still wrong, and what has
-to happen next. Follow-ups are derived rather than generic \(em a check that
+to happen next. Current state is reconciled per node and check: the newest
+result wins, a failure a later phase re-checked and passed is listed as
+resolved rather than outstanding, and a failure nothing re-checked stays
+outstanding (see
+.B REPORT LIFECYCLE
+in
+.BR mu2e-power-recovery (1)).
+Follow-ups are derived rather than generic \(em a check that
 failed on three or more nodes is called out as one likely shared cause rather
 than as three separate problems.
 .PP
@@ -41,15 +58,46 @@ ECL credentials are read from Vault at the path given by
 .I ecl.credential_path
 under
 .IR vault.base_path .
+The Vault client is created only when posting, never by a report that is not
+posted.
 .PP
-The HTML pages are attached only when they were written earlier in the same
-invocation \(em that is, under
-.BR "mu2e-power-recovery \-\-phase all" ,
-where the pages for phases 1 to 3 exist by the time phase 4 posts. Running
-.B mu2e-power-report
-on its own posts the narrative with no attachments, because this phase renders
-its pages after it posts. The narrative itself is complete either way; the
-entry simply carries no HTML.
+The post happens after the run's bundle,
+.IR html/runs/<id>/ ,
+has been rendered. With
+.I ecl.attach_html
+(the default) the entry carries that bundle's HTML pages \(em the detail page
+included \(em and never a page from the shared top level, which may belong to a
+newer run. The outcome is recorded as an event on the run and written into the
+bundle's
+.IR data/report.json .
+A failed post leaves the complete local report in place and does not change the
+exit status. Under
+.B \-\-simulate
+nothing is posted.
+.PP
+.B A simulated run stays simulated.
+Whether a run was a
+.B \-\-simulate
+rehearsal is stored with the run, and a stored rehearsal is never posted or
+published, whatever this invocation's options say: asking to
+.RB ( \-\-post\-ecl ,
+.BR \-\-publish ,
+.BR \-\-publish\-target ,
+or
+.I ecl.enabled
+/
+.I report.publish.enabled
+in the configuration) exits 2 naming the run, before anything is written.
+Without
+.BR \-\-run\-id
+the latest run is the target, so a rehearsal made after the real run must be
+stepped past with
+.BR "\-\-run\-id N" .
+A rehearsal regenerates locally as usual; its pages, and the run-history row,
+are marked
+.BR SIMULATED .
+Runs stored before the flag existed are recognised by the note every simulated
+run recorded.
 .SH OPTIONS
 Every option of
 .BR mu2e-power-recovery (1)
@@ -61,9 +109,13 @@ which is fixed to
 .TP
 .BI \-\-run\-id " N"
 Report on this run rather than the most recent one. Run ids are shown on the
-report's run-history page and by
-.BR "mu2e-power-report \-\-json" .
-This is the only phase that reads the flag.
+report's run-history page and in the
+.I run_id
+field of
+.BR "\-\-json" .
+A run id not in the store exits 2 with a message on stderr; nothing is
+written. The general driver accepts the flag only with
+.BR "\-\-phase report" .
 .TP
 .B \-\-post\-ecl
 Post the entry to the logbook.
@@ -85,21 +137,21 @@ Where the report pages are written. Default:
 .TP
 .B \-\-no\-report
 Do not write the HTML pages. The phase still assembles the narrative, still
-posts it if asked, and still returns its exit status; only the site on disk is
-skipped.
+posts it if asked (with no attachments, since nothing was rendered), and still
+returns its exit status; only the site on disk is skipped.
 .SS Run control
 .TP
 .BI \-\-label " TEXT"
-Label for this run, shown in the report header and the logbook subject. It
-labels the new run this invocation opens, not the run named by
-.BR \-\-run\-id .
+Accepted, and has no effect here: a regeneration opens no run, and the
+report and logbook subject use the label stored with the selected run.
 .TP
 .B \-\-execute
 Accepted, and has no effect: this phase issues no power command.
 .TP
 .B \-\-simulate
-Contact nothing at all. The pages are written locally and the publisher refuses
-before trying anything, reporting that nothing was published.
+Contact nothing at all. The pages are written locally, nothing is posted to the
+logbook, and the publisher refuses before trying anything, reporting that
+nothing was published.
 .TP
 .BI \-\-location " NAME"
 Repeatable. Accepted; it narrows the inventory page rather than any probe,
@@ -143,7 +195,7 @@ Print the option summary and exit.
 .TP
 .B \-\-version
 Print
-.I mu2edaq-power-recovery 0.1.0
+.I mu2edaq-power-recovery 0.2.0
 and exit.
 .TP
 .BI \-\-config " FILE"
@@ -168,7 +220,12 @@ Print every registered check and exit.
 Print the node inventory and exit.
 .TP
 .B \-\-json
-Print the phase result as JSON on stdout instead of tables.
+Reserve stdout for exactly one JSON document; every human-readable line
+(banner, mode notice, phase tables, notes, report and self-update messages, and
+a self-update rebuild's output) goes to stderr. See
+.B JSON OUTPUT
+in
+.BR mu2e-power-recovery (1).
 .TP
 .BR \-v ", " \-\-verbose
 Debug logging.
@@ -181,15 +238,34 @@ Warnings and errors only.
 The report was generated and, if requested, posted.
 .TP
 .B 1
-The report was generated but the run it describes contains failures.
+The report was generated but the run's reconciled current state contains
+failures or unreachable nodes (or no node was assessed at all).
 .TP
 .B 2
-No run could be found to report on.
+No run could be found to report on: the store is empty, or
+.B \-\-run\-id
+names a run it does not hold.
+.I run.dry_run: false
+in configuration does
+.I not
+exit 2 here: this command cannot issue a power command, so it always runs as
+a dry run, whatever the configuration,
+.B \-\-execute
+or
+.B MU2E_POWER_RECOVERY_ARM
+say (an info line in the log notes what was ignored). The live-run gate
+applies to invocations that include phase 2
+(see
+.BR mu2e-power-recovery (1),
+.BR "LIVE RUNS" ).
+A report-only run does not take the run lock, so it can be run while a
+recovery is in progress.
 .SH EXAMPLES
 .RS
 .EX
 mu2e-power-report
 mu2e-power-report \-\-run\-id 17 \-\-post\-ecl
+mu2e-power-report \-\-run\-id 17 \-\-json | jq .report.pages
 mu2e-power-report \-\-publish \-\-publish\-target mu2edaq@mu2egateway01:/web/recovery/
 .EE
 .RE

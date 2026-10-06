@@ -9,6 +9,9 @@
   <em>from a gateway</em>; this page proves the nodes can reach
   <em>each other</em>, which a switch that came back with a missing VLAN or the
   wrong MTU will fail while every node still looks healthy on its own.
+  The IPMI network is probed from the gateways, the only hosts routed to the
+  BMC subnet. A path that could not be tested &mdash; its source unreachable,
+  or no result returned &mdash; is <strong>unknown</strong>, not failed.
 </p>
 
 {{ m.run_header(run, version) }}
@@ -19,20 +22,26 @@
   <div class="mb-3 flex flex-wrap items-baseline gap-3">
     <h3 class="font-semibold">{{ net.network }} network</h3>
     {{ m.pill(net.status) }}
+    {% set c = net.counts or {} %}
     <span class="text-sm text-slate-500">
-      {{ net.edge_count }} path(s) probed,
-      {{ 'full mesh' if net.full_mesh else 'sampled against anchors' }}
+      {{ c.tested if c else net.edge_count }} of {{ net.edge_count }} path(s) tested,
+      {% if net.origin == 'gateways' %}from the gateways to every
+      {{ 'BMC' if net.network == 'ipmi' else 'target' }}{% else %}{{ 'full mesh' if net.full_mesh else 'sampled against anchors' }}{% endif %}
     </span>
   </div>
 
-  <div class="mb-3 grid gap-3 sm:grid-cols-4 text-sm">
+  <div class="mb-3 grid gap-3 sm:grid-cols-5 text-sm">
     <div class="rounded-lg border border-slate-200 bg-white p-3 dark:border-slate-800 dark:bg-slate-900">
-      <div class="text-xl font-semibold">{{ net.edge_count - net.failures|length }}</div>
+      <div class="text-xl font-semibold">{{ c.ok if c else net.edge_count - net.failures|length }}</div>
       <div class="text-slate-500">paths working</div>
     </div>
     <div class="rounded-lg border border-slate-200 bg-white p-3 dark:border-slate-800 dark:bg-slate-900">
       <div class="text-xl font-semibold {% if net.failures %}text-rose-700 dark:text-rose-400{% endif %}">{{ net.failures|length }}</div>
       <div class="text-slate-500">paths failing</div>
+    </div>
+    <div class="rounded-lg border border-slate-200 bg-white p-3 dark:border-slate-800 dark:bg-slate-900">
+      <div class="text-xl font-semibold {% if c and c.unknown %}text-slate-700 dark:text-slate-300{% endif %}">{{ c.unknown if c else 0 }}</div>
+      <div class="text-slate-500">paths untested (unknown)</div>
     </div>
     <div class="rounded-lg border border-slate-200 bg-white p-3 dark:border-slate-800 dark:bg-slate-900">
       <div class="text-xl font-semibold {% if net.mtu_failures %}text-amber-700 dark:text-amber-400{% endif %}">{{ net.mtu_failures|length }}</div>
@@ -48,15 +57,19 @@
   <p class="mb-2 text-sm"><strong>Isolated (reached nothing):</strong>
     <span class="font-mono text-xs text-rose-700 dark:text-rose-400">{{ net.isolated_nodes|join(', ') }}</span></p>
   {% endif %}
+  {% if net.unreachable_sources %}
+  <p class="mb-2 text-sm"><strong>Probe source unreachable (paths unknown, not failed):</strong>
+    <span class="font-mono text-xs">{{ net.unreachable_sources|join(', ') }}</span></p>
+  {% endif %}
   {% if net.unreachable_targets %}
   <p class="mb-2 text-sm"><strong>Unreachable by anyone:</strong>
     <span class="font-mono text-xs text-rose-700 dark:text-rose-400">{{ net.unreachable_targets|join(', ') }}</span></p>
   {% endif %}
 
-  {% if net.failures or net.mtu_failures %}
+  {% if net.failures or net.mtu_failures or net.untested %}
   <button data-toggle="fail-{{ net.network }}"
           class="mb-2 rounded border border-slate-300 px-2 py-1 text-xs hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800">
-    show failing paths
+    show failing and untested paths
   </button>
   <div id="fail-{{ net.network }}" class="overflow-x-auto rounded-lg border border-slate-200 dark:border-slate-800">
     <table class="min-w-full divide-y divide-slate-200 text-xs dark:divide-slate-800" data-sortable>
@@ -66,7 +79,7 @@
             <th class="px-3 py-2">RTT</th><th class="px-3 py-2">Jumbo</th><th class="px-3 py-2">Detail</th></tr>
       </thead>
       <tbody class="divide-y divide-slate-100 bg-white dark:divide-slate-800 dark:bg-slate-950">
-        {% for e in net.failures + net.mtu_failures %}
+        {% for e in net.failures + net.mtu_failures + (net.untested or []) %}
         <tr>
           <td class="px-3 py-1 font-mono">{{ e.source|shorthost }}</td>
           <td class="px-3 py-1 font-mono">{{ e.target|shorthost }}</td>

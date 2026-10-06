@@ -29,7 +29,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, List, Optional, Sequence
+from typing import Any, List, Optional, Sequence, Tuple
 
 log = logging.getLogger(__name__)
 
@@ -45,6 +45,75 @@ SIBLING_CHECKOUT = Path("..") / "mu2edaq-kerberos"
 
 class TicketSourceError(RuntimeError):
     """mu2edaq-kerberos is unavailable, or could not mint a ticket."""
+
+
+class TicketTimeout(TicketSourceError):
+    """``get-kerberos-ticket`` ran and did not finish in time.
+
+    Its own type because the command *ran*: unlike an ordinary failure it may
+    have minted a ticket before it hung, which on macOS lands in the API:
+    collection under a name only a collection lookup can recover. The caller
+    records that name for cleanup on this type, not on the message.
+    """
+
+
+class DefaultCacheGuardError(TicketSourceError):
+    """The operator's default credential cache cannot be protected.
+
+    Distinct from an ordinary per-identity failure (no keytab, a failed kinit)
+    because it is a statement about the *run*, not about one identity: every
+    further mint would carry the same risk. Callers decide what to do on the
+    exception type, never on its message -- the message is for the operator
+    and may be reworded freely.
+    """
+
+    #: Short machine-readable kind, for notes and events.
+    kind = "guard"
+
+
+class DefaultCacheDisplaced(DefaultCacheGuardError):
+    """A mint repointed the default cache and it could not be put back."""
+
+    kind = "displaced"
+
+    def __init__(self, before: Optional[str], after: Optional[str],
+                 message: Optional[str] = None):
+        self.before = before
+        self.after = after
+        super().__init__(message or (
+            f"minting a service ticket repointed the default credential "
+            f"cache from {before!r} to {after!r}, and it could not be "
+            f"restored"))
+
+
+class DefaultCacheUnverifiable(DefaultCacheGuardError):
+    """The default cache could not be read, so a mint could not be guarded.
+
+    Raised *before* any mint command runs: without the principal that was in
+    the default cache beforehand there is nothing to compare against
+    afterwards and nothing to restore, so the mint would be unguarded in
+    exactly the case the guard exists for.
+    """
+
+    kind = "unverifiable"
+
+    def __init__(self, reason: str, message: Optional[str] = None):
+        self.reason = reason
+        super().__init__(message or (
+            f"the default credential cache could not be read ({reason}), so "
+            f"a service-ticket mint could not be checked for displacing it"))
+
+
+class NoDefaultCache(str):
+    """A :meth:`TicketSource.default_principal_status` reason meaning "klist
+    ran, and there is simply no default credential cache".
+
+    A ``str`` so it reads as the reason it is, and a distinct *type* so a
+    caller can tell it apart from "klist is missing" or "klist output did not
+    parse" without matching on the wording. It matters because it is the one
+    unreadable state a mint can safely proceed from -- when the run's primary
+    credentials do not use the default at all (see ``ticket(private_primary=)``).
+    """
 
 
 #: Lines from here on are a usage hint, not the failure. get-kerberos-ticket
@@ -172,18 +241,44 @@ class TicketSource:
 
         Read with KRB5CCNAME removed from the environment, so this reports the
         operator's own cache rather than whichever one a caller has selected.
+        None when it cannot be read; :meth:`default_principal_status` says why.
+        """
+        return TicketSource.default_principal_status()[0]
+
+    @staticmethod
+    def default_principal_status() -> Tuple[Optional[str], Optional[str]]:
+        """``(principal, None)``, or ``(None, reason)`` when it cannot be read.
+
+        The reason distinguishes the three ways the read fails, because they
+        need different fixes: klist is missing (install the Kerberos client
+        tools), there is no default cache (kinit), or klist answered in a form
+        this parser does not recognise (a bug here, to be reported).
         """
         env = {k: v for k, v in os.environ.items() if k != "KRB5CCNAME"}
         try:
             result = subprocess.run(["klist"], env=env, stdout=subprocess.PIPE,
-                                    stderr=subprocess.DEVNULL, timeout=20,
+                                    stderr=subprocess.PIPE, timeout=20,
                                     check=False)
-        except (OSError, subprocess.SubprocessError):
-            return None
-        for line in result.stdout.decode("utf-8", "replace").splitlines():
+        except FileNotFoundError:
+            return None, "klist is not installed or not on PATH"
+        except subprocess.TimeoutExpired:
+            return None, "klist did not answer within 20s"
+        except (OSError, subprocess.SubprocessError) as exc:
+            return None, f"klist could not be run: {exc}"
+        text = result.stdout.decode("utf-8", "replace")
+        for line in text.splitlines():
             if "principal:" in line.lower():
-                return line.split(":", 1)[1].strip()
-        return None
+                principal = line.split(":", 1)[1].strip()
+                if principal:
+                    return principal, None
+        if result.returncode != 0 or not text.strip():
+            detail = result.stderr.decode("utf-8", "replace").strip()
+            detail = detail.splitlines()[-1] if detail else \
+                f"klist exited {result.returncode}"
+            return None, NoDefaultCache(
+                f"there is no default credential cache ({detail})")
+        return None, ("klist listed a default cache but named no principal "
+                      "in a form this tool can parse")
 
     @staticmethod
     def _python_env() -> dict:
@@ -224,14 +319,26 @@ class TicketSource:
                 in result.stdout.decode("utf-8", "replace").splitlines()
                 if line.strip() and not line.startswith(" ")]
 
-    def ticket(self, identity: str, cache: Path,
-               timeout: int = 120) -> ServiceTicket:
+    def ticket(self, identity: str, cache: Path, timeout: int = 120,
+               private_primary: bool = False) -> ServiceTicket:
         """Mint a ticket for *identity* into *cache*.
 
         Delegates entirely to ``get-kerberos-ticket``, which handles the keytab
         -- fetching it, writing it out with restrictive permissions, running
         kinit, and removing it. Nothing in this project ever sees the keytab
         bytes, which is the point of going through the package.
+
+        The default credential cache must be readable first, so a displacement
+        can be detected and undone -- with one exception. *private_primary*
+        says every primary role of the run (general and root) is served by a
+        private cache the run created, so nothing of the run's depends on the
+        default. Then, and only when klist reports that there is *no* default
+        (:class:`NoDefaultCache`, not a tool or parse failure), the mint may
+        proceed; afterwards a default that has appeared naming this service
+        identity is destroyed, and :class:`DefaultCacheDisplaced` raised if it
+        cannot be. That is the fresh macOS login whose operator ticket was
+        minted by ``--principal`` into a FILE: cache, so the collection has no
+        default at all.
         """
         command = self.resolve(TICKET_COMMAND)
         if command is None:
@@ -253,10 +360,24 @@ class TicketSource:
         # the flag. Neither alone is enough to guarantee the default cache is
         # left alone, and that guarantee is the point.
         env = {**os.environ, "KRB5CCNAME": target, **self._python_env()}
-        before = self.default_principal()
+        # The guard's precondition. Without the principal that is in the
+        # default cache now, a displacement can be neither detected nor
+        # undone -- so refuse before get-kerberos-ticket runs, rather than
+        # minting unguarded in exactly the case the guard exists for.
+        before, why = self.default_principal_status()
         if before is None:
-            log.debug("the default credential cache reports no principal; the "
-                      "displacement check cannot run for this mint")
+            if not (private_primary and isinstance(why, NoDefaultCache)):
+                raise DefaultCacheUnverifiable(why or "no principal reported")
+            log.info("no default credential cache, and every primary "
+                     "credential of this run is a private cache: minting %s, "
+                     "then checking that no service default was left behind",
+                     identity)
+
+        def settle() -> None:
+            if before:
+                self._restore_default_if_displaced(identity, before)
+            else:
+                self._clear_service_default(identity)
 
         timed_out: Optional[TicketSourceError] = None
         try:
@@ -267,7 +388,7 @@ class TicketSource:
             # have repointed the default cache before it hung -- and returning
             # a bare timeout would leave the pointer moved and let the chain
             # try the next six identities under the wrong identity.
-            timed_out = TicketSourceError(
+            timed_out = TicketTimeout(
                 f"get-kerberos-ticket timed out after {timeout}s for {identity}")
             timed_out.__cause__ = exc
             result = None
@@ -275,8 +396,20 @@ class TicketSource:
             # Never started, so nothing can have been repointed.
             raise TicketSourceError(
                 f"could not run {command} for {identity}: {exc}") from exc
+        except BaseException:
+            # Interrupted mid-mint -- in practice KeyboardInterrupt, which is
+            # also what the SIGTERM handler raises. The command was running,
+            # so it may already have repointed the default: put it back before
+            # the interrupt propagates. A failed restore is logged, never
+            # raised, so it cannot replace the interrupt the caller is
+            # unwinding for.
+            try:
+                settle()
+            except DefaultCacheGuardError as exc:
+                log.error("%s", exc)
+            raise
 
-        self._restore_default_if_displaced(identity, before)
+        settle()
         if timed_out is not None:
             raise timed_out
 
@@ -298,12 +431,13 @@ class TicketSource:
         # after: a cache for this identity very likely already exists from an
         # earlier run, in which case the mint refreshes it in place and nothing
         # "appears".
-        for principal, name in self.collection().items():
-            if principal.split("/")[0] == identity:
-                log.debug("%s is in the credential collection as %s",
-                          identity, name)
-                return ServiceTicket(identity=identity, cache=name,
-                                     principal=principal)
+        found = self.collection_cache_for(identity)
+        if found:
+            principal, name = found
+            log.debug("%s is in the credential collection as %s",
+                      identity, name)
+            return ServiceTicket(identity=identity, cache=name,
+                                 principal=principal)
 
         raise TicketSourceError(
             f"get-kerberos-ticket reported success for {identity} but the "
@@ -314,7 +448,8 @@ class TicketSource:
                                       before: Optional[str]) -> None:
         """Put the default credential cache back if minting moved it.
 
-        Expected on macOS. Heimdal keeps credential caches in a *collection*
+        Raises :class:`DefaultCacheDisplaced` when it cannot. Expected on
+        macOS. Heimdal keeps credential caches in a *collection*
         and makes a freshly minted one the collection default, whatever
         KRB5CCNAME or --cache said -- so minting a service ticket silently
         repoints "the default ticket" at it and every later login runs as that
@@ -333,13 +468,62 @@ class TicketSource:
             log.debug("default credential cache moved to %s while minting "
                       "%s; restored to %s", after, identity, before)
             return
-        raise TicketSourceError(
+        raise DefaultCacheDisplaced(before, after,
             f"minting a ticket for {identity} repointed the default "
             f"credential cache from {before!r} to {after!r}, and it "
             f"could not be restored. Every later login would run as "
             f"the wrong identity. Run 'kswitch -p {before}' (or "
             f"'kinit {before}') and re-run with "
             f"kerberos.use_service_keytabs: false.")
+
+    def _clear_service_default(self, identity: str) -> None:
+        """After a mint from no default: remove a service default it created.
+
+        There was no default before, so there is nothing to switch back to;
+        undoing the mint's side effect means destroying the cache it made the
+        default. Only a default naming *identity* is touched -- anything else
+        that appeared (the operator running kinit in another terminal) is not
+        ours. Raises :class:`DefaultCacheDisplaced` when it cannot be undone.
+        """
+        after = self.default_principal()
+        if not after:
+            return
+        if after.split("@")[0].split("/")[0] != identity:
+            log.info("a default credential cache for %s appeared while minting "
+                     "%s; not ours, left alone", after, identity)
+            return
+        if self.destroy_default(after):
+            log.info("minting %s made it the default credential cache where "
+                     "there was none; destroyed it", identity)
+            return
+        raise DefaultCacheDisplaced(None, after,
+            f"minting a ticket for {identity} left {after!r} as the default "
+            f"credential cache where there was none, and it could not be "
+            f"destroyed. Anything using the default cache would run as that "
+            f"identity. Run 'kdestroy -p {after}' and re-run with "
+            f"kerberos.use_service_keytabs: false.")
+
+    def destroy_default(self, principal: str) -> bool:
+        """Destroy the collection cache holding *principal*, by name.
+
+        Always ``kdestroy -c <name>``, never a bare kdestroy: naming the cache
+        is what makes this unable to hit the operator's. Returns whether the
+        default no longer names *principal*.
+        """
+        name = self.collection().get(principal)
+        if not name:
+            log.warning("cannot find %s in the credential collection to "
+                        "destroy it", principal)
+            return False
+        env = {k: v for k, v in os.environ.items() if k != "KRB5CCNAME"}
+        try:
+            subprocess.run(["kdestroy", "-c", name], env=env,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=20, check=False)
+        except (OSError, subprocess.SubprocessError) as exc:
+            log.warning("kdestroy -c %s failed: %s", name, exc)
+            return False
+        return self.default_principal() != principal
 
     @staticmethod
     def collection() -> dict:
@@ -365,6 +549,19 @@ class TicketSource:
             if len(parts) >= 2 and "@" in parts[0] and ":" in parts[1]:
                 caches[parts[0]] = parts[1]
         return caches
+
+    def collection_cache_for(self, identity: str) -> Optional[Tuple[str, str]]:
+        """``(principal, ccache name)`` of *identity*'s cache in the collection.
+
+        Matched on the principal's first component (``mu2edaq/mu2e@FNAL.GOV``
+        is ``mu2edaq``), so only a cache for that service identity is ever
+        returned -- never the operator's. None when there is none, or when
+        ``klist -l`` cannot be read.
+        """
+        for principal, name in self.collection().items():
+            if principal.split("/")[0] == identity:
+                return principal, name
+        return None
 
     def restore_default(self, principal: str) -> bool:
         """Point the default credential cache back at *principal*.

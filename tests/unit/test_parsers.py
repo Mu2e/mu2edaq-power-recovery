@@ -187,3 +187,223 @@ def test_find_disk_errors_matches_real_kernel_messages():
 def test_find_disk_errors_is_quiet_on_a_normal_boot():
     assert P.find_disk_errors("kernel: Linux version 5.14.0\n"
                               "systemd: Reached target Multi-User System.\n") == []
+
+
+# ---------------------------------------------------------------------------
+# ipmitool sel list (#10)
+# ---------------------------------------------------------------------------
+
+#: The layout ipmitool prints for ``sel list``: hex record id (``%4x``),
+#: date, time, sensor, event, direction. ``Pre-Init`` replaces the date for
+#: events logged before the BMC's clock was set -- the case after an outage --
+#: and the time column is then a raw counter. The clear record is what a BMC
+#: writes as record 1 after ``sel clear``.
+SEL_LIST = """   1 | 09/18/2026 | 13:55:02 | Event Logging Disabled #0x07 | Log area reset/cleared | Asserted
+   2 | Pre-Init  |0000000029| Power Supply #0x51 | Power Supply AC lost | Asserted
+   3 | Pre-Init  |0000000031| System ACPI Power State #0x0a | S0/G0: working | Asserted
+   4 | 09/18/2026 | 14:02:11 | Power Unit #0x01 | Power off/down | Asserted
+  1a | 09/18/2026 | 14:07:45 | Memory #0x53 | Correctable ECC | Asserted
+  1b | 09/18/2026 | 14:09:30 | Temperature #0x30 | Upper Critical going high | Asserted
+  1c | 09/18/2026 | 14:10:00 | OEM record df | 040320
+"""
+
+
+def test_parse_sel_list_reads_ids_as_hex():
+    rows = P.parse_sel_list(SEL_LIST)
+    assert [r.record_id for r in rows] == ["1", "2", "3", "4", "1a", "1b", "1c"]
+    assert rows[4].sensor == "Memory #0x53"
+    assert rows[4].event == "Correctable ECC"
+    assert rows[4].direction == "Asserted"
+
+
+def test_parse_sel_list_keeps_pre_init_rows():
+    # Pre-Init is precisely what a BMC logs across an outage.
+    row = P.parse_sel_list(SEL_LIST)[1]
+    assert row.date == "Pre-Init" and row.time == "0000000029"
+    assert row.event == "Power Supply AC lost"
+
+
+def test_parse_sel_list_accepts_a_row_without_a_direction():
+    row = P.parse_sel_list(SEL_LIST)[-1]
+    assert row.sensor == "OEM record df" and row.direction == ""
+
+
+def test_parse_sel_list_recognises_the_clear_record():
+    rows = P.parse_sel_list(SEL_LIST)
+    assert rows[0].is_clear and not any(r.is_clear for r in rows[1:])
+
+
+def test_parse_sel_list_skips_the_empty_log_message():
+    assert P.parse_sel_list("SEL has no entries\n") == []
+    assert P.parse_sel_list("") == []
+
+
+def test_parse_sel_list_normalises_leading_zeros():
+    rows = P.parse_sel_list("001A | 09/18/2026 | 14:07:45 | Memory #0x53 | "
+                            "Correctable ECC | Asserted")
+    assert rows[0].record_id == "1a"
+
+
+def test_a_sel_fingerprint_ignores_the_timestamp():
+    # BMC clocks are what an outage resets; the same record must fingerprint
+    # the same however its time is rendered.
+    a, = P.parse_sel_list("  1a | 09/18/2026 | 14:07:45 | Memory #0x53 | "
+                          "Correctable ECC | Asserted")
+    b, = P.parse_sel_list("  1a | 01/01/1970 | 00:00:07 | Memory  #0x53 | "
+                          "correctable ECC | Asserted")
+    assert a.fingerprint == b.fingerprint
+
+
+def _sel(first, last, event="Power Supply AC lost"):
+    return P.parse_sel_list("\n".join(
+        f"{i:4x} | 09/18/2026 | 14:00:00 | Power Supply #0x51 | {event} | Asserted"
+        for i in range(first, last + 1)))
+
+
+def test_diff_sel_empty_baseline_and_empty_log():
+    diff = P.diff_sel({}, [])
+    assert diff.new == [] and not diff.cleared and not diff.possibly_truncated
+
+
+def test_diff_sel_short_log_that_grew():
+    diff = P.diff_sel(P.sel_baseline(_sel(1, 5)), _sel(1, 8))
+    assert [e.record_id for e in diff.new] == ["6", "7", "8"]
+    assert not diff.cleared and not diff.possibly_truncated
+
+
+def test_diff_sel_full_rotated_tail():
+    # 20 rows before, 20 rows after: the length comparison saw nothing here.
+    before, after = _sel(0x41, 0x54), _sel(0x44, 0x57)
+    assert len(before) == len(after) == 20
+    diff = P.diff_sel(P.sel_baseline(before), after)
+    assert [e.record_id for e in diff.new] == ["55", "56", "57"]
+    assert not diff.cleared and not diff.possibly_truncated
+
+
+def test_diff_sel_identical_history_is_not_new():
+    rows = _sel(0x41, 0x54)
+    diff = P.diff_sel(P.sel_baseline(rows), rows)
+    assert diff.new == [] and not diff.cleared
+
+
+def test_diff_sel_cleared_with_reused_ids():
+    before = _sel(1, 6)
+    after = _sel(1, 3, event="Power Supply Failure detected")
+    diff = P.diff_sel(P.sel_baseline(before), after)
+    assert diff.cleared and diff.reused == ["1", "2", "3"]
+    assert len(diff.new) == 3
+
+
+def test_diff_sel_cleared_by_a_new_clear_record():
+    before = _sel(0x30, 0x34)
+    after = P.parse_sel_list("   1 | 09/18/2026 | 15:00:00 | Event Logging "
+                             "Disabled #0x07 | Log area reset/cleared | Asserted")
+    diff = P.diff_sel(P.sel_baseline(before), after)
+    assert diff.cleared and diff.reused == []
+
+
+def test_diff_sel_a_pre_existing_clear_record_is_history():
+    rows = P.parse_sel_list(SEL_LIST)
+    assert not P.diff_sel(P.sel_baseline(rows), rows).cleared
+
+
+def test_diff_sel_every_row_new_in_a_full_tail_may_be_truncated():
+    diff = P.diff_sel(P.sel_baseline(_sel(1, 20)), _sel(0x30, 0x43))
+    assert len(diff.new) == 20 and diff.possibly_truncated
+    # A short reading cannot have lost anything off its front.
+    assert not P.diff_sel({}, _sel(1, 3)).possibly_truncated
+
+
+# Rows captured live on 2026-10-01 (ipmitool sel list, from mu2egateway01)
+# from three BMC generations: a padded-id log, a decimal-looking id log and
+# a 4-digit hex log. Replaces the modelled sample the #10 parser was built on.
+LIVE_SEL = {
+    "mu2e-trk-01": [
+        "b240 | 09/11/2026 | 06:01:01 | System Event #0xff | Timestamp Clock Sync | Asserted",
+        "b35f | 09/17/2026 | 05:02:18 | System Event | OEM System boot event | Asserted",
+        "b62e | 10/01/2026 | 14:01:01 | System Event #0xff | Timestamp Clock Sync | Asserted",
+    ],
+    "mu2e-calo-02": [
+        "   4 | 06/09/2016 | 10:22:20 | Session Audit #0xff |  | Asserted",
+        "  29 | 10/10/2018 | 17:40:50 | Physical Security #0xaa | General Chassis intrusion () | Asserted",
+        " 203 | 07/18/2024 | 18:53:47 | Physical Security #0xaa | General Chassis intrusion () | Deasserted",
+    ],
+    "mu2e-dl-01": [
+        "   1 | 10/18/2024 | 12:38:41 | Unknown #0xff |  | Asserted",
+        "   4 | 10/18/2024 | 12:41:49 | Power Supply #0xc8 | Presence detected () | Asserted",
+        "  db | 09/17/2026 | 15:55:11 | Power Supply #0xc9 | Presence detected () | Asserted",
+    ],
+}
+
+
+@pytest.mark.parametrize("node", sorted(LIVE_SEL))
+def test_parse_sel_list_on_live_rows(node):
+    from mu2edaq_power_recovery.checks.parsers import parse_sel_list
+    rows = LIVE_SEL[node]
+    entries = parse_sel_list("\n".join(rows))
+    assert len(entries) == len(rows)
+    assert [e.record_id for e in entries] == [format(int(r.split("|")[0], 16), "x")
+                                              for r in rows]
+    assert all(e.direction in ("Asserted", "Deasserted") for e in entries)
+
+
+def test_a_capture_cut_mid_row_drops_only_the_fragments():
+    """What the 64 KiB cap produced on a full trk-01 listing."""
+    from mu2edaq_power_recovery.checks.parsers import parse_sel_list
+    text = (LIVE_SEL["mu2e-trk-01"][0] + "\nb3c7 | 0\n...[output truncated]...\nsserted\n"
+            + LIVE_SEL["mu2e-trk-01"][2])
+    assert [e.record_id for e in parse_sel_list(text)] == ["b240", "b62e"]
+
+
+# /proc/mdstat on mu2e-dl-01, 2026-10-01: a healthy Intel RST (IMSM) RAID1
+# and its metadata container, which is always "inactive" with (S) members.
+DL01_MDSTAT = """Personalities : [raid1]
+md126 : active raid1 nvme0n1[1] nvme1n1[0]
+      927916032 blocks super external:/md127/0 [2/2] [UU]
+
+md127 : inactive nvme1n1[1](S) nvme0n1[0](S)
+      10402 blocks super external:imsm
+
+unused devices: <none>
+"""
+
+
+def test_an_imsm_container_is_not_a_degraded_array():
+    from mu2edaq_power_recovery.checks.parsers import parse_mdstat
+    arrays = {a.name: a for a in parse_mdstat(DL01_MDSTAT)}
+    assert arrays["md126"].healthy and arrays["md127"].healthy
+    assert arrays["md127"].detail == "metadata container"
+
+
+def test_mdstat_lookahead_stops_at_the_next_array():
+    from mu2edaq_power_recovery.checks.parsers import parse_mdstat
+    text = ("md0 : active raid1 sda1[0] sdb1[1]\n"
+            "md1 : active raid1 sdc1[0] sdd1[1]\n"
+            "      100 blocks [2/1] [U_]\n")
+    arrays = {a.name: a for a in parse_mdstat(text)}
+    assert arrays["md0"].healthy and not arrays["md1"].healthy
+
+
+# smartctl -H on mu2e-trk-11 /dev/sdc, 2026-10-01.
+TRK11_SDC = """smartctl 7.2 2020-12-30 r5155 [x86_64-linux-5.14.0-687.31.1.el9_8.x86_64] (local build)
+
+Read SMART Data failed: scsi error aborted command
+
+=== START OF READ SMART DATA SECTION ===
+SMART Status command failed: scsi error aborted command
+SMART overall-health self-assessment test result: UNKNOWN!
+SMART Status, Attributes and Thresholds cannot be read.
+"""
+
+
+def test_an_unreadable_smart_verdict_is_not_a_failure():
+    from mu2edaq_power_recovery.checks.parsers import smart_unreadable
+    assert smart_unreadable(TRK11_SDC)
+    assert not smart_unreadable("SMART overall-health self-assessment test result: FAILED!")
+    assert not smart_unreadable("SMART overall-health self-assessment test result: PASSED")
+
+
+def test_proc_mounts_decodes_octal_escapes():
+    from mu2edaq_power_recovery.checks.parsers import parse_proc_mounts
+    m = parse_proc_mounts("srv:/a\\040b /mnt/a\\040b nfs4 rw 0 0\n")
+    assert m == {"/mnt/a b": ("srv:/a b", "nfs4")}

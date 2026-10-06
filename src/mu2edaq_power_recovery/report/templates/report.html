@@ -13,7 +13,12 @@
 
 <section class="mb-8 rounded-lg border-l-4 border-sky-500 bg-sky-50 p-4 dark:bg-sky-950/40">
   <h3 class="text-base font-semibold">{{ narrative.headline }}</h3>
-  {% if narrative.dry_run %}
+  {% if narrative.simulated %}
+  <p class="mt-1 text-sm font-medium text-violet-800 dark:text-violet-300">
+    SIMULATED RUN &mdash; no host was contacted; every result on these pages
+    is scripted. It is never posted to the logbook or published.
+  </p>
+  {% elif narrative.dry_run %}
   <p class="mt-1 text-sm font-medium text-amber-800 dark:text-amber-300">
     This was a dry run &mdash; no chassis was switched on.
   </p>
@@ -92,10 +97,42 @@
   </table>
   </div>
   {% else %}
-  <p class="text-sm text-emerald-700 dark:text-emerald-400">None &mdash; every check passed.</p>
+  <p class="text-sm text-emerald-700 dark:text-emerald-400">None &mdash; every current check passed.</p>
   {% endif %}
 </section>
 
+{% if narrative.resolved %}
+<section class="mb-8">
+  <h3 class="mb-2 font-semibold">Resolved during the run ({{ narrative.resolved|length }})</h3>
+  <p class="mb-2 text-sm text-slate-600 dark:text-slate-300">
+    Failures a later phase re-checked and found healthy. They stay in the
+    evidence and the timeline; they are not outstanding.
+  </p>
+  <div class="overflow-x-auto rounded-lg border border-slate-200 dark:border-slate-800">
+  <table id="resolved-table" data-sortable class="min-w-full divide-y divide-slate-200 text-sm dark:divide-slate-800">
+    <thead class="bg-slate-100 text-left text-xs uppercase text-slate-600 dark:bg-slate-900 dark:text-slate-400">
+      <tr><th data-sort class="px-3 py-2">Node</th><th data-sort class="px-3 py-2">Check</th>
+          <th data-sort class="px-3 py-2">Was</th><th data-sort class="px-3 py-2">In phase</th>
+          <th data-sort class="px-3 py-2">Now</th><th data-sort class="px-3 py-2">Re-checked in</th>
+          <th class="px-3 py-2">Original summary</th></tr>
+    </thead>
+    <tbody class="divide-y divide-slate-100 bg-white dark:divide-slate-800 dark:bg-slate-950">
+      {% for item in narrative.resolved %}
+      <tr>
+        <td class="px-3 py-2 font-mono text-xs">{{ item.node|shorthost }}</td>
+        <td class="px-3 py-2 font-mono text-xs">{{ item.check }}</td>
+        <td class="px-3 py-2">{{ m.pill(item.status) }}</td>
+        <td class="px-3 py-2">{{ item.phase }}</td>
+        <td class="px-3 py-2">{{ m.pill(item.current_status) }}</td>
+        <td class="px-3 py-2">{{ item.resolved_by }}</td>
+        <td class="px-3 py-2">{{ item.summary }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  </div>
+</section>
+{% endif %}
 <section class="mb-8">
   <h3 class="mb-2 font-semibold">Next steps</h3>
   <ul class="list-disc space-y-1 pl-5 text-sm">

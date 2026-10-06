@@ -1,4 +1,4 @@
-.TH MU2EDAQ-POWER-RECOVERY.YAML 5 "2026-09-18" "mu2edaq-power-recovery 0.1.0" "File Formats"
+.TH MU2EDAQ-POWER-RECOVERY.YAML 5 "2026-09-29" "mu2edaq-power-recovery 0.2.0" "File Formats"
 .SH NAME
 power-recovery.yaml \- main configuration for the Mu2e DAQ power-recovery tools
 .SH SYNOPSIS
@@ -102,30 +102,46 @@ that pattern will appear in the report and in the logbook entry.
 .SS run
 .TP
 .I label
-Label for the recovery, shown in the report and the logbook subject.
+Label for the recovery, shown in the report and the logbook subject. It is also
+the value the
+.B MU2E_POWER_RECOVERY_ARM
+token must equal to arm an unattended live run (see
+.IR dry_run ).
 .TP
 .I dry_run
 Default
 .BR true .
-While true, no power command is issued.
-.B \-\-execute
-sets it false \(em but it is
-.I not
-a second, independent gate. This is an ordinary configuration key, so setting it
-false here, in
+Setting it
+.B false
+here, in
 .IR config/.env ,
 or as
 .B MU2E_POWER_RECOVERY_RUN_DRY_RUN=false
-arms the destructive path on its own, with no flag on the command line. Nothing
-re-checks that
+does
+.I not
+arm a live run. It only
+.I permits
+the token path: a run is live when the invocation passes
+.BR \-\-execute ,
+or when the process environment carries
+.BI MU2E_POWER_RECOVERY_ARM= label
+equal to a non-empty
+.IR run.label .
+With this key false and neither of those, a run that includes phase 2 exits 2
+and says both ways to authorise; the read-only phases (assess, network,
+report) cannot issue a power command and run as a dry run regardless. A token given while this key is true, with no label, or with the
+wrong label, also exits 2.
 .B \-\-execute
-was given. The run prints
-.B "LIVE RUN \-\- power commands WILL be issued."
-when it is armed.
+works whatever this key says. The token is never a configuration key and is a
+configuration error in
+.IR config/.env .
+The run prints
+.B "LIVE RUN \-\- power commands WILL be issued (authorised by ...)"
+when it is armed, and records what armed it.
 .IP
 .B \-\-simulate
-is the gate no configuration file can open: it forces this key back to true
-whatever else was asked for, including
+is the gate nothing can open: it forces this key back to true whatever else was
+asked for, including
 .B \-\-execute
 on the same command line.
 .TP
@@ -135,17 +151,53 @@ Default
 Stop phase 2 at the first stage that does not meet its requirement.
 .TP
 .I phase_timeout
-Intended wall-clock budget for one phase, in seconds; 0 disables.
-.B Not currently enforced:
-the value is read from the file and carried in the run record, but no phase
-consults it. The effective bounds on a run are the per-command ones,
-.I ssh.command_timeout
-and
-.IR ipmi.timeout .
+Wall-clock budget for each of phases 1, 2 and 3, in seconds; 0 or null
+disables. Default 7200. Enforced on a monotonic clock: it is checked before
+every phase-2 stage, before each node's power command and before every node and
+check the orchestrator runs, and every ssh call's timeout (checks, IPMI through
+a gateway, mesh probes) is capped at the time left. A phase-2 stage's boot wait
+ends at now +
+.RI min( boot_timeout ", time left)."
+The phase therefore overruns by at most the one call in flight when the budget
+expires. Everything it never reached is recorded UNKNOWN,
+.IR "not run: phase_timeout expired" ,
+distinct from a failed check and from an unreachable node. Phase 4 probes
+nothing and is not bounded.
 .TP
 .IR from_stage ", " until_stage
 Default stage range for phase 2; normally set with
 .BR \-\-from / \-\-until .
+A name that is not a stage of the sequence, or a reversed range, exits 2 before
+any credential is acquired, listing the valid names.
+.TP
+.I lock_file
+The single-run lock. Default
+.IR logs/power-recovery.lock ,
+relative to the project root. Every invocation that can act on hardware
+(phases 1, 2 or 3 without
+.BR \-\-simulate )
+takes an exclusive, non-blocking operating-system lock on this file before the
+phase-0 update:
+.BR flock (2)
+on Linux and macOS,
+.B msvcrt.locking
+on Windows. A second such run exits 2 naming the holder's pid, start time,
+host and command line.
+.BR \-\-simulate ,
+.BR \-\-list\-checks ,
+.B \-\-list\-nodes
+and report-only runs do not take it. After locking, the holder writes the JSON
+record
+.RI { pid ", " started_at ", " cmdline ", " host }
+into the file. The record is only believed while the lock is held: the kernel
+releases the lock when the process ends, however it ends, so a free lock means
+the recorded pid is stale and it is never signalled. The file itself is left in
+place. The lock is released immediately before the phase-0 re-exec and taken
+again by the re-executed process. Inspect it with
+.BR "python \-m mu2edaq_power_recovery.runlock status" ;
+.B pid
+prints the holder's pid only while the lock is held (exit 1 otherwise), which
+is what the stop scripts use.
 .SS topology
 .TP
 .IR file ", " sequence_file ", " checks_file
@@ -292,15 +344,53 @@ before the first SSH attempt.
 .I stop_on_auth_failure
 Stop issuing IPMI commands once a BMC has answered and rejected the
 credentials \(em an RAKP failure, or "unauthorized name". One credential set
-serves every BMC, so the next one rejects it too, and each attempt is
+serves the BMCs of a location, so the next one there rejects it too, and each attempt is
 .I retries
 invocations here with four ipmitool retries inside each. Defaults to
 .BR true .
+While it is true, IPMI commands are also issued one at a time until a first
+BMC accepts the credential, so under concurrent assessment a wrong credential
+reaches exactly one BMC; after that first success they run concurrently. The
+state is kept per location and shared by that location's IPMI clients: the
+BMC account differs between sites (the teststand's BMCs refuse the account
+MC-2's accept), so a refusal at one location does not stop IPMI at another. A refusal is reported as
+.BR unknown ,
+not as a BMC that does not answer.
 Set it false only to gather evidence from several BMCs deliberately; the run
-then sends the same rejected username to every controller in the cluster.
+then neither serialises nor stops, and sends the same rejected username to
+every controller in the cluster.
 A BMC that simply does not answer is not this \(em a dark chassis reports
 "Unable to establish IPMI v2 / RMCP+ session" as well, and after an outage
 that is the expected case.
+The exception is a BMC that has just answered the
+.I reachability_precheck
+ping: two distinct such BMCs of a location failing with "Unable to establish"
+while no BMC there has yet accepted the credential trip the stop as well, because a live BMC that
+refuses the session is most likely being sent the wrong username. An RAKP
+failure or "unauthorized name" still trips it on the first occurrence.
+.TP
+.I reachability_precheck
+While the credential is unproven, send
+.B ping \-c 3 \-i 0.2 \-W 1
+to the BMC from the gateway before each ipmitool invocation. Any reply counts:
+right after an outage the gateway's ARP entry for the BMC is cold and the
+first echo is often lost. A BMC that answers none is reported unreachable at
+once: ipmitool is not run, and the call
+does not wait behind the one-at-a-time credential gate, so dark BMCs are
+assessed concurrently rather than each costing a serialised ipmitool timeout.
+In phase 1, a node whose
+.B power.status
+is unreachable or refused then reports
+.BR power.sensors " and " power.sel
+as
+.B unknown
+without asking the BMC again. A gateway without
+.B ping
+(exit 126/127) skips the pre-check with a warning. Defaults to
+.BR true ;
+set it false for BMCs that filter ICMP. Has no effect with
+.I stop_on_auth_failure
+false, which bypasses the gate altogether.
 .SS kerberos
 .TP
 .IR principal ", " root_principal
@@ -325,6 +415,15 @@ refused by a host. Default
 .BR true .
 The operator's own principal is always tried first regardless; these are only
 ever fallbacks, and the run returns to the personal ticket after each node.
+When on, each identity is minted once before the worker threads start. The run
+turns it off for itself, with an error event and a phase note, when the default
+credential cache cannot be read before a mint or cannot be restored after one
+\(em except that with both
+.I principal
+and
+.I root_principal
+designated, "there is no default cache" is not a reason to refuse: the run uses
+no default, and a service default left by the mint is destroyed.
 .TP
 .I root_fallback
 Apply the same fallback to root sessions. Default
@@ -440,8 +539,14 @@ is null.
 Where the static site is written, and its heading.
 .TP
 .I keep_runs
-How many archived runs to keep under
-.IR output_dir/runs/ .
+How many per-run report bundles to keep under
+.IR output_dir/runs/ ;
+each is rendered from that run's stored data alone. Pruning keeps the newest
+.I keep_runs
+by run id and, in addition, the bundle just rendered, so regenerating an old
+run neither deletes its own bundle nor a newer one.
+.I 0
+keeps every bundle.
 .TP
 .I publish
 .IR enabled ", " method

@@ -48,7 +48,7 @@ cd mu2edaq-power-recovery
 ./bootstrap.sh
 . venv/bin/activate
 
-mu2e-power-recovery --version        # mu2edaq-power-recovery 0.1.0
+mu2e-power-recovery --version        # mu2edaq-power-recovery 0.2.0
 mu2e-power-recovery --list-checks    # the 25 registered checks
 mu2e-power-recovery --list-nodes     # what the tools think exists
 
@@ -83,9 +83,9 @@ commands each *are* their phase. Every driver takes `--version` and `--help`.
 
 | Phase | Command | What happens |
 |---|---|---|
-| 0 | *(automatic)* | Check GitHub for a newer revision, fast-forward, rebuild if needed, restart, print the version and config digest. |
+| 0 | *(automatic)* | Check GitHub for a newer revision, fast-forward, rebuild if needed, restart, print the version and config digest. A required rebuild that fails rolls the checkout back and the run continues on the old code. |
 | 1 | `mu2e-power-state` | **Read-only** survey of every node: reachability, logins, disks, mounts, interfaces, link speeds, services, PCIe, and chassis power from the BMC. Nothing is changed. |
-| 2 | `mu2e-power-on` | Power the cluster on in dependency order, verifying each stage before starting the next. Dry run unless `--execute`. |
+| 2 | `mu2e-power-on` | Power the cluster on in dependency order, verifying each stage before starting the next. Dry run unless this invocation authorises it (`--execute`). `--node` powers only the named nodes. |
 | 3 | `mu2e-power-netcheck` | Node-to-node connectivity across the lab, data and IPMI segments, with a jumbo-frame probe on the data network. |
 | 4 | `mu2e-power-report` | The consolidated narrative, optionally posted to the ECL. |
 
@@ -109,23 +109,41 @@ Each stage: read power state → power on what is off → wait for SSH → settl
 run the stage's check profile → decide whether it met its `require:`
 (`all`, `majority` or `any`). A stage that fails stops the sequence, because
 every later stage depends on the services the earlier ones provide. Resume with
-`--from <stage>` after fixing it.
+`--from <stage>` after fixing it. A stage name that is not in the sequence, or a
+reversed `--from`/`--until` range, exits 2 before anything is contacted.
+
+A scoped run powers only what it names. `--location` drops stages in other
+locations. `--node mu2e-trk-01` cuts `readout` to that node, and runs the
+stages before it **verify-only**: their power state is read, they are waited
+for and checked, but they are never sent a power command. If one of them is
+not up, the run stops before `readout` and tells you which stage to run
+explicitly. Later stages are not run. `--from readout --node mu2e-trk-01`
+touches that one node only.
+
+Each stage waits for all its nodes at once under one deadline, so 28 dead
+readout nodes cost one `boot_timeout`, not 28. `run.phase_timeout` bounds each
+of phases 1–3; anything it never reached is UNKNOWN, `not run: phase_timeout
+expired`.
 
 ## Safety
 
 This tool can switch machines off, so the destructive path is gated and fenced:
 
-- **Dry run by default.** `run.dry_run` starts true and nothing is switched
-  until it is false. `--execute` is the *supported* way to set it — but it is
-  only one way. `run.dry_run` is an ordinary configuration key, so
-  `run: {dry_run: false}` in `config/power-recovery.yaml`, a line in
-  `config/.env`, or `MU2E_POWER_RECOVERY_RUN_DRY_RUN=false` in the environment
-  arms the destructive path on its own, with no flag on the command line. The
-  run says which it is — it prints `LIVE RUN -- power commands WILL be issued.`
-  before the first phase — but read that banner rather than trusting that the
-  absence of `--execute` means a dry run.
-- **`--simulate` is inert, and is the one gate no configuration file can
-  open.** It forces `run.dry_run` back to true whatever else was asked for,
+- **Dry run unless this invocation says otherwise.** Live power commands need
+  a per-invocation authorisation: `--execute` on the command line, or, for an
+  unattended run, `MU2E_POWER_RECOVERY_ARM=<run.label>` in the process
+  environment together with `run.dry_run: false` and a matching `run.label` in
+  the configuration. `run.dry_run: false` on its own — in the YAML,
+  `config/.env` or the environment — arms nothing: a run that includes phase 2
+  exits 2 and says how to authorise (the read-only drivers cannot power
+  anything and always run as a dry run). The token is never read from `config/.env` (that is a
+  configuration error), so no persistent file can arm a later bare invocation.
+  A live run prints `LIVE RUN -- power commands WILL be issued (authorised by
+  ...)` and records what armed it.
+- **Scope is enforced twice.** The phase-2 plan decides which hosts may be
+  powered before any credential is acquired; the power step independently
+  refuses any other host and records it as `out_of_scope`.
+- **`--simulate` is inert, and is the one gate nothing can open.** It forces `run.dry_run` back to true whatever else was asked for,
   including `--execute` on the same command line, and contacts nothing — the
   local transport is scripted too, so even a `ping` is answered from the
   script, and the publisher refuses to copy a rehearsal's report to the live web
@@ -162,8 +180,19 @@ JSON files (`inventory`, `assess`, `poweron`, `network`, `report`, `summary`,
 browser. They are data files rather than per-page companions: the four phase
 pages each have one, `about`/`api`/`sitemap` have none, and the run history and
 detail pages are covered indirectly by `summary.json` and `report.json`. The
-generated `api.html` lists exactly what is there. Re-running a phase refreshes
-its page in place; each run is archived under `html/runs/<id>/`.
+generated `api.html` lists exactly what is there.
+
+Each run is rendered into `html/runs/<id>/` from that run's stored rows alone,
+with pages only for the phases it contains; the top level of `html/` is the
+newest run's view plus the run history. The report is rendered after the run is
+finished (so it carries its final status), and current state is reconciled: a
+failure a later phase re-checked and passed is listed as *resolved*, not
+outstanding. `mu2e-power-report --run-id N` regenerates run N in place — no new
+run, no credentials unless it posts to the logbook — and with `--post-ecl`
+attaches run N's rendered pages. With `--json`, stdout is exactly one JSON
+object (`{version, run_id, status, exit_code, phases, report}`), so
+`mu2e-power-recovery --phase all --simulate --json | jq .status` works; all
+human-readable output goes to stderr.
 
 ## Credentials
 
@@ -275,15 +304,28 @@ that works — capped at nine attempts, because every failure counts towards the
 BMC's account lockout.
 
 If a BMC *answers and rejects* the credentials, the run stops issuing IPMI
-entirely and reports one diagnosis naming the refused username. All 45 BMCs
-share one credential set, so the first rejection settles the matter and retrying
-it against the other 44 only advances lockout counters. (45 is the number of
-nodes carrying an `ipmi:` interface in `config/topology.yaml` — 37 at MC-2 and
-8 at the teststand — out of 65 nodes in total. `mu2e-node-inventory -n ipmi`
-lists them.)
+to that location and reports one diagnosis naming the refused username. The
+BMCs of a location share one credential set, so the first rejection settles the
+matter there and retrying it against the rest only advances lockout counters.
+Locations are independent: the teststand's BMCs refuse the account MC-2's
+accept, so a refusal at one does not stop IPMI at the other. (45 nodes carry an
+`ipmi:` interface in `config/topology.yaml` — 37 at MC-2 and 8 at the
+teststand — out of 65 nodes in total. `mu2e-node-inventory -n ipmi` lists
+them.)
+That holds under concurrency: until one BMC of a location has accepted the
+credential, IPMI commands to that location are issued one at a time, so a wrong credential reaches exactly one BMC
+however many workers are assessing, and every waiting check reports the shared
+diagnosis as UNKNOWN without invoking ipmitool. There is one breaker per
+location, shared by that location's IPMI clients.
 `ipmi.stop_on_auth_failure: false` overrides that. A BMC that does not answer at
 all is deliberately *not* treated this way: after an outage a dark chassis is
-the expected case, and it says much the same thing.
+the expected case, and it says much the same thing. To tell them apart, each
+unproven call first pings the BMC from the gateway (three echoes; any reply
+counts, since a cold ARP entry after an outage loses the first): a dark BMC is
+reported unreachable without ipmitool and without waiting its turn, and two
+BMCs that answer ping but still cannot open a session (likely a wrong username)
+stop that location's IPMI too. `ipmi.reachability_precheck: false` disables
+the ping for BMCs that filter ICMP.
 
 If Vault is unreachable — plausible during a site-wide power event — the tools
 fall back to `~/.ipmipasswd`, the file the existing `mu2edaq-operations`
@@ -329,17 +371,16 @@ is how the probe could succeed against a host the recovery itself could not
 reach — exactly the confusion it exists to prevent. `--no-chain` restores the
 ambient-only behaviour, which is worth having when you want to compare the two.
 
-One divergence remains, and it matters when you have set
-`kerberos.principal`. The probe builds the same *list* of credentials, but it
-does not mint tickets: it never calls `KerberosManager.prepare()`, so the
-operator credential it uses carries your configured principal's **name** while
-pointing at the **ambient** cache, and the chain's service identities are
-listed rather than acquired. A real run kinits each principal into a private
-cache and hands `ssh` a `KRB5CCNAME` for it. So `would try: login … ticket
-you@FNAL.GOV [ambient cache]` names the principal from your config, not
-necessarily the one actually in the default cache — check that with `klist`
-(`klist -l` on macOS) rather than reading it off the probe. There is no
-`--principal` flag to make the probe mint one.
+With `--run` the probe also acquires what a run acquires, through the same
+bootstrap (`creds/bootstrap.py`): a configured `kerberos.principal` (or
+`--principal` / `--root-principal`) is kinit'd into a private cache and `ssh` is
+handed a `KRB5CCNAME` for it, the service identities are minted once up front,
+and every private cache is destroyed on exit — including Ctrl-C and SIGTERM.
+Without `--run` nothing is acquired or minted, and the listing says so: an
+unacquired credential reads `would try (not acquired): … [not acquired: …]`,
+never `[ambient cache]`. `mu2e-ipmi-tool` opens its gateway session the same
+way, so it too leads with your principal and falls back to the service
+identities exactly as a run does.
 
 `mu2e-ipmi-tool --show-command` prints the invocation without running it, for
 comparison against a known-working one. It contains no password.
@@ -353,12 +394,12 @@ Two things to know about `mu2e-ipmi-tool` before using it to judge access:
   would take a real run somewhere else. It tests the *BMC* credentials well; it
   is not a test of the run's SSH access. Use `mu2e-ssh-probe … --run true` for
   that.
-- **Naming only BMC-less hosts silently widens the target list.** Targets are
-  filtered to nodes that have a BMC, but if that filter empties the list the
-  tool falls back to the unfiltered one rather than stopping — so
+- **Only nodes with a BMC are addressed.** Every other selected node is named
+  on stderr as an *unknown host* or as having *no BMC*, and when none remains
+  the tool exits 2 before Vault or a gateway is touched — so
   `mu2e-ipmi-tool -n mu2e-dcs-03 chassis power status` (no `ipmi:` interface in
-  the topology) runs `ipmitool -H None …` on the gateway instead of saying so.
-  `--diagnose` gets this right and reports "has no BMC in the topology".
+  the topology) says so instead of running anything. A state-changing verb
+  lists every target by hostname before the confirmation prompt.
   `mu2e-node-inventory -n ipmi --hostnames` lists which hosts actually have one.
 
 If a check reports **the host key has CHANGED**, no credential can get past it:
@@ -402,7 +443,27 @@ no data network, but **its node list is empty** — MC-1 is not carried in
 `mu2edaq-operations/scripts/nodes_config.yaml`, which is the authoritative
 upstream inventory, so nothing could be imported. Add the hostnames and every
 phase picks MC-1 up with no code change. Until then the tools report it as
-having no nodes configured rather than as healthy.
+having no nodes configured rather than as healthy, and a phase run with
+`--location mc1` says so in its notes. `config/topology.yaml` carries commented
+templates and `inventory_source` / `owner` / `status: pending` metadata, and
+`config/power-sequence.yaml` a commented `location: mc1` stage. After filling it
+in, check it:
+
+```sh
+mu2e-node-inventory --validate          # exit 1 on errors, 0 with warnings; --json
+```
+
+On the shipped file that reports four warnings — mc1 empty, the IPMI subnet
+mc1 shares with mc2, the data subnet the teststand shares with mc2, and twelve
+MC-2 nodes (trk-15..18 among them) that no power-sequence stage covers.
+
+### One run at a time
+
+Every run that can act on hardware (phases 1–3 without `--simulate`) holds an
+exclusive OS lock on `logs/power-recovery.lock` (`run.lock_file`); a second one
+exits 2 naming the first. `python -m mu2edaq_power_recovery.runlock status`
+shows the holder. `stop-mu2edaq-power-recovery.sh` signals only the pid the
+held lock names, after checking its command line.
 
 ## Installation
 
@@ -446,7 +507,7 @@ between two runs has an explanation. See `man 3 libmu2eprobe`.
 ## Testing
 
 ```sh
-pytest                                              # 309 tests, no cluster needed
+pytest                                              # the full suite; no cluster needed
 mu2e-power-recovery --phase all --simulate          # end-to-end rehearsal
 ctest --test-dir build --output-on-failure          # all four ctest entries
 ```

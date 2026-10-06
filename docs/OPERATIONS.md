@@ -10,7 +10,7 @@ write the tools, at an hour when they would rather not be.
 ```sh
 cd mu2edaq-power-recovery
 git pull && ./bootstrap.sh
-pytest                                          # 309 tests, should be all green
+pytest                                          # the full suite, should be all green
 mu2e-power-recovery --phase all --simulate      # full rehearsal, contacts nothing
 open html/index.html                            # check the report looks right
 ```
@@ -41,16 +41,17 @@ the cheapest command that actually logs in.
 With `--run`, the probe builds the same credential chain a real run builds and
 names the credential that got in. (It did not always: an earlier version tested
 only your ambient ticket, which is how probing a gateway could succeed while the
-recovery failed against it.) One difference survives: the probe does not mint
-tickets, so it uses whatever is in your **ambient** cache even when
-`kerberos.principal` names something else, and lists the service identities
-rather than acquiring them. That makes `klist` below the authority on which
-ticket you actually hold, not the probe's output.
+recovery failed against it.) It also acquires what a run acquires: a
+configured `kerberos.principal` (or `--principal`) is kinit'd into a private
+cache that `ssh` is pointed at, and the service identities are minted up front
+and destroyed on exit. Without `--run` nothing is acquired, and any credential
+that has no ticket yet is listed as `would try (not acquired)`.
 
-`mu2e-ipmi-tool` tests the *BMC* credentials, not the run's SSH access: it
-reaches the gateway with your ambient ticket only, with no credential chain and
-no check of the default cache. Do not read a working `mu2e-ipmi-tool` as
-evidence that the recovery can log in.
+`mu2e-ipmi-tool` opens its gateway session through the same credential
+bootstrap as a run (your principal first, then the service identities, with
+the default-cache check), so a gateway it cannot reach is one the run cannot
+reach either. It still tests the *BMC* credentials first and foremost; whether
+the run can log in to the *nodes* is `mu2e-ssh-probe --run true`.
 
 `klist` matters more than it looks. If the default credential cache holds a
 service identity rather than you, every login in the run is attempted as that
@@ -187,6 +188,16 @@ expect, stop and find out why.
 mu2e-power-on --execute --label "Sept 2026 outage"
 ```
 
+`--execute` is this invocation's authorisation; nothing else on the command
+line or in the configuration arms a run by itself. An unattended run that
+cannot pass the flag sets `run.dry_run: false` and `run.label: <label>` in its
+configuration and `MU2E_POWER_RECOVERY_ARM=<label>` in its own environment
+(never in `config/.env`, which is refused). `run.dry_run: false` with neither
+exits 2 with instructions. That gate applies to invocations that include phase
+2; `mu2e-power-state`, `mu2e-power-netcheck` and `mu2e-power-report` cannot
+issue a power command and always run as a dry run, so a site that sets
+`run.dry_run: false` for the token path can still use them.
+
 It will work through the stages in order and stop at the first one that does
 not meet its requirement.
 
@@ -203,14 +214,50 @@ mu2e-power-state --node mu2e-mgr-01 -v
 mu2e-power-on --execute --from manager
 ```
 
-**Spell the stage name right, and check the stage list it prints before you
-walk away.** An unmatched `--from` or `--until` is silently ignored, not
-rejected: `--from manger` does not error, it starts from the *first* stage and
-powers on the whole sequence, readout included. The stage names are the `name:`
-keys in `config/power-sequence.yaml` — `gateways`, `manager`, `dataloggers`,
-`dcs`, `cfo`, `readout`. A dry run (`mu2e-power-on --from <stage>`, no `--execute`)
-lists the stages it would act on, which is the cheap way to confirm the name
-took.
+Stage names are the `name:` keys in `config/power-sequence.yaml` —
+`gateways`, `manager`, `dataloggers`, `dcs`, `cfo`, `readout`. A misspelt
+`--from`/`--until` (or `run.from_stage`/`run.until_stage`), or a reversed range,
+exits 2 before any password prompt, listing the valid names; nothing is
+contacted.
+
+### Powering on only some nodes
+
+```sh
+# one readout node; everything it depends on is VERIFIED, never powered
+mu2e-power-on --execute --node mu2e-trk-01
+
+# that node and nothing else at all (no predecessor checks)
+mu2e-power-on --execute --from readout --node mu2e-trk-01
+```
+
+With `--node`, the stages holding the named nodes are cut down to them; the
+stages before them (from `--from`, or the start of the sequence) are
+**verify-only**: their power state is read, they are waited for and checked,
+but no power command is sent to them. The run prints the plan as `scope:` lines
+before it starts. If a predecessor is off or never answers, the run stops
+before the requested nodes — even with `--continue-on-error` — and names the
+stage. Bring that stage up explicitly and re-run:
+
+```sh
+mu2e-power-on --execute --from manager --until manager
+mu2e-power-on --execute --node mu2e-trk-01
+```
+
+Stages after the requested nodes are not run. A node in no stage (for example
+`mu2e-trk-15`, which is in the inventory but not in `readout`), or in a stage
+outside `--from`/`--until`/`--location`, is an error naming its stage.
+`--location teststand` alone is an error with the shipped sequence, whose
+stages are all MC-2.
+
+### How long a stage can take
+
+Each stage waits for all its nodes at once, under one deadline of
+`boot_timeout` (600 s by default) — at most `ssh.max_sessions` ssh attempts at a
+time — so a stage of dead nodes costs one `boot_timeout`, not one per node.
+`run.phase_timeout` (7200 s) bounds the whole phase: every ssh call is capped at
+the time left, and stages the budget never reached are UNKNOWN, `not run:
+phase_timeout expired` (not FAIL — nothing was looked at). Resume with
+`--from <stage>` as the note says.
 
 If you know a node is dead and want the rest of the cluster up anyway:
 
@@ -267,8 +314,25 @@ later.
 To regenerate or repost afterwards:
 
 ```sh
-mu2e-power-report --run-id 17 --post-ecl
+mu2e-power-report --run-id 17              # re-render run 17 only
+mu2e-power-report --run-id 17 --post-ecl   # ...and post it
 ```
+
+What regeneration does and does not do:
+
+- It works on run 17 itself. No new run is created, run 17's status and
+  finish time are not changed, and a `report` phase plus events are added to
+  run 17's timeline. `html/runs/17/` is re-rendered from the store; the top
+  level of `html/` changes only if 17 is the newest run.
+- It needs no Kerberos ticket. Vault is contacted only for `--post-ecl`, to
+  read the ECL credentials. A run id that is not in the store exits 2 and
+  writes nothing — check `html/runs.html` for the ids.
+- The logbook entry carries run 17's own pages, `detail.html` included. If the
+  post fails, the local report is still complete; the failure is an `error`
+  event in run 17's timeline and in `html/runs/17/data/report.json` (`ecl`).
+  Fix the credential or the network and run the same command again.
+- "Outstanding problems" lists only what is still wrong. A failure that a
+  later phase re-checked and passed is under "Resolved during the run".
 
 ---
 
@@ -367,12 +431,15 @@ you are least able to notice.
 
 ## When the run stops issuing IPMI
 
-If a BMC *answers and rejects* the credentials, the run stops issuing IPMI
-altogether and reports one diagnosis naming the refused username. That is
-deliberate: all 45 BMCs share one credential set, so the first rejection settles
-the matter, and retrying it against the other 44 only advances lockout counters
-on every BMC in the building. (45 nodes of the 65 in the topology carry an
-`ipmi:` interface: 37 at MC-2, 8 at the teststand.)
+If a BMC *answers and rejects* the credentials, the run stops issuing IPMI to
+that location's BMCs and reports one diagnosis naming the refused username and
+the location. That is deliberate: a location's BMCs share one credential set,
+so the first rejection settles the matter there, and retrying it against the
+rest only advances lockout counters. (45 nodes of the 65 in the topology carry
+an `ipmi:` interface: 37 at MC-2, 8 at the teststand.) Locations are judged
+separately because their accounts differ: on 2026-10-01 the teststand's BMCs
+answered ping and refused the account MC-2's BMCs accepted. A teststand refusal
+leaves MC-2's IPMI running, and the other way round.
 
 ```sh
 mu2e-vault-ipmi --fields                              # what the secret holds now
@@ -386,8 +453,30 @@ username; `vault.ipmi_user_field` / `vault.ipmi_password_field` fix a renamed
 field. To carry on regardless — for instance when you believe only one BMC is
 misconfigured — set `ipmi.stop_on_auth_failure: false`.
 
+The refusal shows as **UNKNOWN** on `power.status`, `power.sensors` and
+`power.sel` ("IPMI credentials refused"), not as FAIL "BMC does not answer",
+and phase 2 records `credentials_refused` for each node rather than
+`unreachable`. Phase 1's readiness block says phase 2 is not ready. Only one
+BMC per location was actually asked: until a credential has worked once at a
+location, IPMI commands to it are issued one at a time.
+
+Each of those unproven commands is preceded by `ping -c 3 -i 0.2 -W 1 <bmc>`
+from the gateway, and any one reply counts: right after an outage the gateway's
+ARP entry for the BMC is cold and the first echo is often lost. A BMC that
+answers none of the three is reported **FAIL** "does not answer"
+on `power.status` straight away, without ipmitool and without waiting its turn,
+and its `power.sensors` / `power.sel` are **UNKNOWN** ("not read: the BMC did
+not answer"). If the BMCs filter ICMP, every one will look dark: set
+`ipmi.reachability_precheck: false`.
+
+Two BMCs that *do* answer ping and then fail with `Unable to establish IPMI v2 /
+RMCP+ session`, before any BMC of that location has accepted the credential,
+also stop that location's IPMI — the diagnosis says "likeliest cause is a wrong username". Check the
+username first (`mu2e-ipmi-tool --diagnose`, above), then the cipher suite.
+
 A BMC that simply does **not answer** is not treated this way, and says much the
-same thing (`Unable to establish IPMI v2 / RMCP+ session`). After an outage a
+same thing (`Unable to establish IPMI v2 / RMCP+ session`) — the ping pre-check
+is what tells the two apart. After an outage a
 chassis with no standby power is the expected case, not a credential problem.
 
 ---
@@ -429,14 +518,43 @@ mu2e-power-state --node mu2e-trk-03 -v
 On Windows the equivalents are `stop-mu2edaq-power-recovery.ps1 -Status`,
 `-Force` and `-Grace <seconds>` (default 30).
 
-**Stopping a run is not clean, and you have to tidy up after it.** The stop
-script sends SIGTERM, but nothing in the driver installs a SIGTERM handler, so
-the process dies where it stands. Two consequences, neither of which the run
-can report for itself:
+**One hardware-facing run at a time.** Phases 1–3 run for real (not
+`--simulate`) take an exclusive lock on `logs/power-recovery.lock`
+(`run.lock_file`) before phase 0. A second such run exits 2 with
+`another recovery run holds the run lock ...: pid N on host H, started T,
+command: ...`. A rehearsal, `--list-*` and `mu2e-power-report` never take it,
+so they work while a recovery is in progress. There is no PID file to clean
+up: the kernel releases the lock however the run ends, and the file with its
+last record is left in place on purpose.
+
+```sh
+python -m mu2edaq_power_recovery.runlock status   # holder, or "not running (stale record: ...)"
+```
+
+The stop scripts signal only the pid that command reports *while the lock is
+held*, and only if that process's command line is still the driver's. A stale
+record naming a live process (a reused pid) is reported as "no recovery run is
+active" and nothing is signalled; a holder whose command line is not the
+driver's is refused with exit 1.
+
+**SIGTERM is a clean stop; SIGKILL is not.** The driver's SIGTERM handler
+raises the same KeyboardInterrupt as Ctrl-C. Mid-phase, the worker pool is shut
+down without waiting (`cancel_futures`): queued nodes and mesh sources are
+never started, the interruption is recorded, the run is marked `interrupted`,
+and the private Kerberos caches are destroyed straight away — including one a
+service mint was writing when the signal arrived, and with the default cache
+restored if that mint had displaced it. Nodes already mid-command finish that
+command in the background before the process exits, which can take up to
+`ssh.command_timeout`; if the stop script's grace period expires first it
+sends SIGKILL, by which time cleanup has already run.
+
+Only after SIGKILL (`--force`, or a grace period that expired *before* the
+interrupt was handled) do these apply:
 
 - **The run is left as `running` in the store.** It is never marked
   `interrupted`, and the phase in progress records no end. `mu2e-power-report
-  --run-id <id>` still builds a report from the evidence already stored.
+  --run-id <id>` still builds a report from the evidence already stored; it
+  shows the run as `not finished (running)` and does not change that status.
 - **The run's private Kerberos caches are not destroyed.** Cleanup never
   executes, so the caches it created — including any root-capable service
   tickets — survive the process. On macOS one of them may also still be the
@@ -448,11 +566,7 @@ can report for itself:
   kdestroy -c <cache>             # destroy each cache the run left behind
   ```
 
-Ctrl-C (SIGINT) *is* handled: it records the interruption, marks the run
-`interrupted` and runs cleanup. If you are at the terminal the run is on,
-interrupt it there rather than using the stop script. `--force` is documented
-as the path where the store may not record the interruption; in practice
-neither path records it.
+Ctrl-C (SIGINT) takes the same clean path as SIGTERM.
 
 ## What the tools will refuse to do
 
@@ -461,19 +575,26 @@ neither path records it.
   to power-cycle one of those, do it deliberately from a session on the gateway
   itself, having thought about how you will get back in.
   (`mu2e-node-inventory --protected` lists them.) Powering one *on* is allowed.
-- Any power command at all while `run.dry_run` is true, which is the default.
-  Note what this does *not* say: `--execute` is one way to set `run.dry_run`
-  false, not a second independent gate. `run: {dry_run: false}` in
-  `config/power-recovery.yaml` or `config/.env`, or
-  `MU2E_POWER_RECOVERY_RUN_DRY_RUN=false` in the environment, arms live power
-  commands with no flag on the command line. The run prints `LIVE RUN -- power
-  commands WILL be issued.` when that is the case; read the banner.
+- Any power command at all unless this invocation authorised it: `--execute`,
+  or `MU2E_POWER_RECOVERY_ARM` equal to the configured `run.label` with
+  `run.dry_run: false`. `run.dry_run: false` alone is refused (exit 2) for any
+  invocation that includes phase 2, and the
+  token is refused in `config/.env`. A live run prints `LIVE RUN -- power
+  commands WILL be issued (authorised by ...)`.
+- A power command to a node outside `--node`/`--location`, or to a
+  predecessor stage of a `--node` run: those are verified only.
+- Running a `--from`/`--until` typo: it exits 2 instead of widening the run.
 - Anything whatsoever under `--simulate`, which overrides `--execute`. The local
   transport is scripted too, so even a `ping` in a rehearsal is answered from
   the script.
 - Publishing the report during a `--simulate` run: it is written locally and the
   publisher stops before touching the live web area. A rehearsal must not
   overwrite the real report.
+- Posting or publishing a stored rehearsal later. The run store records that a
+  run was simulated; `mu2e-power-report --post-ecl` (or `--publish`) on it exits
+  2, whatever the invocation's flags. With no `--run-id` the latest run is the
+  target, so after a rehearsal name the real run: `mu2e-power-report --run-id 12
+  --post-ecl`.
 - Continuing past a stage that did not meet its requirement, unless you pass
   `--continue-on-error`.
 - Destroying a credential cache the run did not create. Cleanup names each of
@@ -482,8 +603,9 @@ neither path records it.
 
 ## Afterwards
 
-- `html/` holds the report; `html/runs/<id>/` holds this run's copy as you read
-  it at the time.
+- `html/` holds the newest run's report; `html/runs/<id>/` holds each run's
+  own pages and data, rendered from the store — they never contain another
+  run's evidence, and `mu2e-power-report --run-id <id>` rebuilds them.
 - `data/power-recovery.db` holds everything, including the full command output
   behind every check.
 - `logs/power-recovery.log` holds the run log, rotated.

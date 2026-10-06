@@ -94,7 +94,88 @@ def test_assess_reports_phase2_readiness(orch):
 
 def test_assess_records_a_sel_baseline_for_later_phases(orch):
     phase1_assess.run(orch, _nodes(orch, "mu2e-trk-01"))
-    assert "sel_count" in orch.baselines["mu2e-trk-01.fnal.gov"]
+    # The simulated log is empty: an empty baseline, which is not "none".
+    assert orch.baselines["mu2e-trk-01.fnal.gov"]["sel"] == {}
+
+
+def _sel_rows(first, last, event="Power Supply AC lost"):
+    return "\n".join(f"{i:4x} | 09/18/2026 | 14:{i % 60:02d}:00 | "
+                     f"Power Supply #0x51 | {event} | Asserted"
+                     for i in range(first, last + 1))
+
+
+def test_a_rotated_full_sel_still_shows_the_new_critical_event(orch):
+    """Both readings are twenty rows long; only the record ids tell them apart."""
+    node = _nodes(orch, "mu2e-trk-01")[0]
+    base = orch.ssh_factory.base
+    base.expect_first(r"sel list", ScriptedResponse(stdout=_sel_rows(0x41, 0x54),
+                                                    once=True))
+    phase1_assess.run(orch, [node])
+    assert len(orch.baselines[node.hostname]["sel"]) == 20
+
+    rotated = _sel_rows(0x42, 0x54) + ("\n  55 | 09/18/2026 | 15:10:02 | "
+                                       "Processor #0x04 | IERR | Asserted"
+                                       " | Critical")
+    base.expect_first(r"sel list", ScriptedResponse(stdout=rotated, once=True))
+    res = orch.assess_node(node, only=["power.sel"]).results[0]
+    assert res.status is Status.FAIL
+    assert "1 new critical event" in res.summary
+    # The survey stays the baseline; the later reading does not replace it.
+    assert "55" not in orch.baselines[node.hostname]["sel"]
+
+
+def test_a_failed_sel_read_records_no_baseline(orch):
+    node = _nodes(orch, "mu2e-trk-01")[0]
+    orch.ssh_factory.base.expect_first(r"sel list", ScriptedResponse(
+        stderr="Error: timed out", rc=1))
+    phase1_assess.run(orch, [node])
+    assert "sel" not in orch.baselines.get(node.hostname, {})
+
+
+def test_sensors_and_sel_are_not_asked_after_a_dark_bmc(orch):
+    node = _nodes(orch, "mu2e-trk-01")[0]
+    orch.ssh_factory.base.expect_first(
+        r"^ping -c 3 -i 0\.2 -W 1 -q " + node.ipmi_host.replace(".", r"\."),
+        ScriptedResponse(rc=1, stdout="1 packets transmitted, 0 received"))
+    result = phase1_assess.run(orch, [node])
+    by_id = {r.check_id: r for r in result.assessments[0].results}
+    assert by_id["power.status"].status is Status.FAIL      # it is dark
+    for check_id in ("power.sensors", "power.sel"):
+        assert by_id[check_id].status is Status.UNKNOWN     # we did not look
+        assert "power.status" in by_id[check_id].summary
+    asked = [c["command"] for c in orch.ssh_factory.base.calls
+             if node.ipmi_host in c["command"]]
+    # One pre-check ping; no ipmitool at all.
+    assert len(asked) == 1 and asked[0].startswith("ping ")
+
+
+def test_sensors_and_sel_are_not_asked_after_a_refused_credential(orch):
+    node = _nodes(orch, "mu2e-trk-01")[0]
+    orch.ssh_factory.base.expect_first(r"ipmitool", ScriptedResponse(
+        stderr="RAKP 2 HMAC is invalid", rc=1))
+    result = phase1_assess.run(orch, [node])
+    by_id = {r.check_id: r for r in result.assessments[0].results}
+    assert by_id["power.status"].status is Status.UNKNOWN
+    assert by_id["power.sensors"].status is Status.UNKNOWN
+    assert by_id["power.sel"].status is Status.UNKNOWN
+    assert "credential was refused" in by_id["power.sel"].summary
+
+
+def test_a_refused_credential_is_unknown_and_blocks_phase2(orch):
+    orch.ssh_factory.base.expect_first(r"ipmitool", ScriptedResponse(
+        stderr="RAKP 2 message indicates an error : unauthorized name", rc=1))
+    result = phase1_assess.run(orch, _nodes(orch, "mu2e-trk-01", "mu2e-trk-02"))
+    power = [r for a in result.assessments for r in a.results
+             if r.check_id.startswith("power.")]
+    assert power and all(r.status is Status.UNKNOWN for r in power)
+    assert not any("does not answer" in r.summary for r in power)
+    readiness = result.data["ready_for_phase2"]
+    assert readiness["ready"] is False
+    assert "rejected the IPMI credentials" in readiness["credentials_refused"]
+    assert any("IPMI credentials refused" in n for n in result.notes)
+    # One BMC was asked, once; everything else was stopped by the breaker.
+    asked = [c for c in orch.ssh_factory.base.calls if "ipmitool" in c["command"]]
+    assert len(asked) == 1
 
 
 def test_an_unreachable_node_is_unknown_not_failed(orch):
@@ -206,13 +287,48 @@ def test_a_healthy_fabric_passes(orch):
     assert data["failures"] == []
 
 
+def _no_replies(command):
+    """A completed probe in which every ping got nothing back."""
+    import re
+    parts = []
+    for target in re.findall(r"===BEGIN (\S+)===", command):
+        parts += [f"===BEGIN {target}===",
+                  "3 packets transmitted, 0 received, 100% packet loss, time 2040ms",
+                  f"===END {target}==="]
+    return ScriptedResponse(stdout="\n".join(parts))
+
+
 def test_an_isolated_node_is_identified(orch):
-    orch.ssh_factory.base.expect_first(r"===BEGIN ", ScriptedResponse(stdout=""))
+    # Marker-wrapped "0 received": the probe ran and the pings got no reply.
+    # Empty output would be an untested path (UNKNOWN), not an isolated node.
+    orch.ssh_factory.base.expect_first(r"===BEGIN ", _no_replies)
     result = phase3_network.run(orch, _nodes(orch, "mu2e-dl-01", "mu2e-dl-02"))
     assert result.status is Status.FAIL
     assert result.data["isolated_nodes"]
     # Notes are aggregated, not one per host.
     assert len(result.notes) < 10
+
+
+def test_a_probe_that_returns_nothing_is_unknown_not_failed(orch):
+    orch.ssh_factory.base.expect_first(r"===BEGIN ", ScriptedResponse(stdout=""))
+    result = phase3_network.run(orch, _nodes(orch, "mu2e-dl-01", "mu2e-dl-02"))
+    assert result.status is Status.UNKNOWN
+    assert result.data["isolated_nodes"] == []
+    for net in result.data["networks"]:
+        assert net["failures"] == []
+        assert net["counts"]["tested"] == 0
+        assert net["counts"]["unknown"] == net["edge_count"] > 0
+
+
+def test_ipmi_is_probed_from_the_gateways(orch):
+    result = phase3_network.run(orch, _nodes(orch, "mu2e-dl-01", "mu2e-dl-02"))
+    ipmi = next(n for n in result.data["networks"] if n["network"] == "ipmi")
+    assert ipmi["origin"] == "gateways"
+    assert {e["source"] for e in ipmi["edges"]} == set(
+        orch.topology.gateways("mc2"))
+    assert {e["target"] for e in ipmi["edges"]} == {
+        "mu2e-dl-01-ipmi.fnal.gov", "mu2e-dl-02-ipmi.fnal.gov"}
+    assert "[from gateways]" in result.summary
 
 
 def test_mesh_edges_come_back_in_a_stable_order(orch):
@@ -222,6 +338,25 @@ def test_mesh_edges_come_back_in_a_stable_order(orch):
     assert edges == sorted(edges)
 
 
+def test_failed_nodes_leave_the_node_mesh_but_their_bmcs_are_probed(orch):
+    """PR #28 review: a BMC is independent of the host OS, and the BMCs of the
+    nodes that did not come back are the ones the operator needs next."""
+    dead = "mu2e-dl-02.fnal.gov"
+    orch.store.start_phase("assess", 1)
+    orch.store.record_node(dead, "mc2", "readout", "fail", "did not boot")
+    orch.store.record_node("mu2e-dl-01.fnal.gov", "mc2", "readout", "ok")
+    orch.store.finish_phase("complete")
+    result = phase3_network.run(orch, _nodes(orch, "mu2e-dl-01", "mu2e-dl-02",
+                                             "mu2e-cfo-01"))
+    by_net = {n["network"]: n for n in result.data["networks"]}
+    for net in ("data", "lab"):
+        assert dead not in by_net[net]["sources"]
+        assert dead not in by_net[net]["targets"]
+    assert dead in by_net["ipmi"]["targets"]
+    assert "mu2e-dl-02-ipmi.fnal.gov" in {e["target"] for e in by_net["ipmi"]["edges"]}
+    assert any("BMCs are still probed" in n for n in result.notes)
+
+
 # ---------------------------------------------------------------------------
 # phase 4
 # ---------------------------------------------------------------------------
@@ -229,7 +364,7 @@ def test_mesh_edges_come_back_in_a_stable_order(orch):
 
 def test_report_summarises_the_stored_run(orch):
     phase1_assess.run(orch, _nodes(orch, "mu2egateway01", "mu2e-trk-01"))
-    result = phase4_report.run(orch, post=False)
+    result = phase4_report.run(orch)
     narrative = result.data["narrative"]
     assert narrative["counts"]["total"] == 2
     assert "verified healthy" in narrative["headline"]
@@ -241,7 +376,7 @@ def test_report_lists_outstanding_problems_and_next_steps(orch):
                                        ScriptedResponse(rc=1))
     phase1_assess.run(orch, _nodes(orch, "mu2e-trk-01", "mu2e-trk-02",
                                    "mu2e-trk-03"))
-    narrative = phase4_report.run(orch, post=False).data["narrative"]
+    narrative = phase4_report.run(orch).data["narrative"]
     assert narrative["counts"]["fail"] == 3
     outstanding = {item["check"] for item in narrative["outstanding"]}
     assert "disk.mounts" in outstanding
@@ -252,12 +387,102 @@ def test_report_lists_outstanding_problems_and_next_steps(orch):
 def test_report_probes_nothing(orch):
     phase1_assess.run(orch, _nodes(orch, "mu2e-trk-01"))
     before = len(orch.ssh_factory.base.calls)
-    phase4_report.run(orch, post=False)
+    phase4_report.run(orch)
     assert len(orch.ssh_factory.base.calls) == before
 
 
 def test_report_does_not_post_unless_asked(orch):
+    # Assembly never posts; the driver posts afterwards, and only when asked.
+    from mu2edaq_power_recovery import cli
     phase1_assess.run(orch, _nodes(orch, "mu2e-trk-01"))
-    result = phase4_report.run(orch, post=False)
-    assert any("not enabled" in note for note in result.notes)
+    result = phase4_report.run(orch)
     assert "ecl" not in result.data
+    skipped = cli._post_or_skip(orch, orch.store.run_id,
+                                result.data["narrative"], [], post=False)
+    assert skipped["posted"] is False and "not enabled" in skipped["reason"]
+
+
+# ---------------------------------------------------------------------------
+# an interrupt mid-phase does not wait for the queued nodes (S1)
+# ---------------------------------------------------------------------------
+
+import signal as _signal  # noqa: E402
+import threading as _threading  # noqa: E402
+import time  # noqa: E402
+
+from mu2edaq_power_recovery.orchestrator import NodeAssessment  # noqa: E402
+
+
+def _sigterm_main_when(event):
+    """Deliver a real SIGTERM to the main thread once *event* is set."""
+    def fire():
+        if event.wait(10):
+            _signal.pthread_kill(_threading.main_thread().ident, _signal.SIGTERM)
+    t = _threading.Thread(target=fire, daemon=True)
+    t.start()
+    return t
+
+
+@pytest.fixture
+def sigterm_handler():
+    from mu2edaq_power_recovery.cli import install_sigterm_handler
+    previous = _signal.getsignal(_signal.SIGTERM)
+    install_sigterm_handler()
+    yield
+    _signal.signal(_signal.SIGTERM, previous)
+
+
+@pytest.mark.skipif(not hasattr(_signal, "pthread_kill"), reason="POSIX only")
+def test_sigterm_mid_phase_cancels_the_queued_nodes(orch, monkeypatch,
+                                                    sigterm_handler):
+    nodes = orch.nodes()[:6]
+    started, running, release = [], _threading.Event(), _threading.Event()
+
+    def assess_node(node, *args, **kwargs):
+        started.append(node.hostname)
+        running.set()
+        release.wait(10)             # a slow node, still running at SIGTERM
+        return NodeAssessment(node=node)
+
+    monkeypatch.setattr(orch, "assess_node", assess_node)
+    _sigterm_main_when(running)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            orch.assess_nodes(nodes, concurrency=1)
+    finally:
+        release.set()
+    assert started == [nodes[0].hostname], "a queued node was started"
+
+
+def test_an_interrupt_from_a_worker_is_not_swallowed_or_waited_out(orch,
+                                                                   monkeypatch):
+    nodes = orch.nodes()[:8]
+    started = []
+
+    def assess_node(node, *args, **kwargs):
+        started.append(node.hostname)
+        if node is nodes[0]:
+            raise KeyboardInterrupt
+        time.sleep(0.2)          # busy enough for the main thread to cancel
+        return NodeAssessment(node=node)
+
+    monkeypatch.setattr(orch, "assess_node", assess_node)
+    with pytest.raises(KeyboardInterrupt):
+        orch.assess_nodes(nodes, concurrency=1)
+    # The one worker may already have taken the next node off the queue
+    # before the main thread saw the interrupt; nothing after that runs.
+    assert len(started) <= 2
+
+
+def test_a_node_summary_keeps_failed_and_unchecked_apart(topology):
+    """Live: mu2edaq13 read '3 of 17 checks failed' for three UNKNOWNs."""
+    from mu2edaq_power_recovery.checks.base import CheckResult
+    node = topology.resolve(["mu2edaq13"], ["teststand"])[0]
+    a = NodeAssessment(node=node)
+    a.results = [CheckResult(node.hostname, "power.status", Status.UNKNOWN),
+                 CheckResult(node.hostname, "power.sel", Status.UNKNOWN),
+                 CheckResult(node.hostname, "disk.local", Status.FAIL),
+                 CheckResult(node.hostname, "ssh.login", Status.OK)]
+    text = a.summary()
+    assert "1 of 4 checks failed: disk.local" in text
+    assert "2 could not be checked: power.status, power.sel" in text

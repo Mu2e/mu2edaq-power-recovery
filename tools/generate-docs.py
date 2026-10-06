@@ -253,7 +253,7 @@ def check_config_keys(root: Path) -> List[str]:
     the first dot; the ``.SS vault`` section is searched for the identifier
     ``addr`` as a font-macro argument.  The pages are written that way on
     purpose -- ``.SS vault`` then ``.B addr``, rather than repeating the full
-    path on every entry -- so only 12 of the 77 keys have their complete dotted
+    path on every entry -- so only 14 of the 78 keys have their complete dotted
     path written out verbatim anywhere in man/man5.
 
     The consequence is that a leaf documented under the wrong parent is not

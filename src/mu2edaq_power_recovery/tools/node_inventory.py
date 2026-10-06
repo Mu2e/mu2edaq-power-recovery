@@ -9,10 +9,13 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import textwrap
 from typing import List, Optional, Sequence
 
 from .. import console
-from ..topology import TopologyError
+import yaml
+
+from ..topology import LEVELS, Finding, TopologyError
 from ._common import add_common_arguments, bootstrap
 
 
@@ -26,6 +29,10 @@ examples
   mu2e-node-inventory -l mc2 -c tracker        # MC-2 tracker nodes only
   mu2e-node-inventory -n ipmi --hostnames      # BMC names, one per line
   mu2e-node-inventory --json > inventory.json  # machine readable
+  mu2e-node-inventory --validate               # gaps and inconsistencies
+
+--validate exits 1 when there is an error finding, 0 when there are only
+warnings or nothing; it checks every location, not only topology.locations.
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -45,11 +52,60 @@ examples
     parser.add_argument("--protected", action="store_true",
                         help="list only the hosts protected from destructive "
                              "IPMI commands")
+    parser.add_argument("--validate", action="store_true",
+                        help="check the inventory and power sequence (empty "
+                             "locations, BMCs with no lab host, invalid names, "
+                             "subnets shared between locations, gateways or "
+                             "protected hosts missing from the inventory, nodes "
+                             "in no power-sequence stage). Exit 1 on errors.")
     return add_common_arguments(parser)
+
+
+def validate(args: argparse.Namespace) -> int:
+    """--validate: findings as a table or JSON; exit 1 on any error."""
+    findings: List[Finding] = []
+    source = None
+    try:
+        settings, topology = bootstrap(args)
+        source = str(topology.source)
+    except TopologyError as exc:
+        findings.append(Finding("error", f"the topology does not load: {exc}"))
+    else:
+        sequence = None
+        path = settings.config_path("topology.sequence_file")
+        try:
+            with open(path) as fh:
+                sequence = yaml.safe_load(fh) or {}
+        except FileNotFoundError:
+            findings.append(Finding("info", f"no power sequence at {path}; stage "
+                                            f"checks skipped"))
+        except yaml.YAMLError as exc:
+            findings.append(Finding("error", f"{path} is not valid YAML: {exc}"))
+        findings.extend(topology.validate(sequence))
+
+    counts = {level: sum(1 for f in findings if f.level == level)
+              for level in LEVELS}
+    code = 1 if counts["error"] else 0
+    if args.json:
+        print(json.dumps({"topology": source, "findings":
+                          [f.as_dict() for f in findings],
+                          "counts": counts, "ok": code == 0}, indent=2))
+        return code
+    # One finding per wrapped paragraph: the messages are sentences, and a
+    # table column would truncate the part that names the hosts.
+    for finding in findings:
+        print(textwrap.fill(finding.message, width=100,
+                            initial_indent=f"  {finding.level.upper():<8} ",
+                            subsequent_indent=" " * 11))
+    print(f"\n  {counts['error']} error(s), {counts['warning']} warning(s), "
+          f"{counts['info']} note(s) in {source or 'the topology'}")
+    return code
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.validate:
+        return validate(args)
     try:
         settings, topology = bootstrap(args)
     except TopologyError as exc:

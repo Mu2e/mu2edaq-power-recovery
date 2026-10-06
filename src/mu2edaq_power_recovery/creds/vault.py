@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -32,6 +33,14 @@ from typing import Any, Dict, List, Optional
 from ..transport.local import LocalTransport
 
 log = logging.getLogger(__name__)
+
+
+def _stderr_fd() -> int:
+    """This process's stderr as a descriptor a child can write to."""
+    try:
+        return sys.stderr.fileno()
+    except (AttributeError, OSError, ValueError):
+        return 2
 
 try:
     import hvac
@@ -92,12 +101,17 @@ class VaultCredentials:
         if not self.auto_login:
             return None
         log.info("no usable Vault token; running 'vault login'")
-        print(f"\nA Vault token is needed for {self.addr}.")
+        print(f"\nA Vault token is needed for {self.addr}.", file=sys.stderr)
         try:
-            # inherit stdio so the CLI can prompt (password, MFA push, ...)
+            # stdin and stderr are inherited so the CLI can prompt (password,
+            # MFA push, ...). Its stdout -- the token details it prints on
+            # success -- goes to our stderr: under --json stdout carries one
+            # JSON document, and the child writes to descriptor 1 directly,
+            # past any Python-level redirect.
             import subprocess
             rc = subprocess.call(
                 ["vault", "login", "-method=ldap", f"-address={self.addr}"],
+                stdout=_stderr_fd(),
                 timeout=300,
             )
         except (OSError, Exception) as exc:  # vault CLI missing, or timeout

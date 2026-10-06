@@ -1,4 +1,4 @@
-.TH MU2EDAQ-TOPOLOGY.YAML 5 "2026-09-18" "mu2edaq-power-recovery 0.1.0" "File Formats"
+.TH MU2EDAQ-TOPOLOGY.YAML 5 "2026-09-29" "mu2edaq-power-recovery 0.2.0" "File Formats"
 .SH NAME
 topology.yaml \- Mu2e DAQ node inventory for the power-recovery tools
 .SH SYNOPSIS
@@ -73,6 +73,16 @@ falls back to the upper-cased location key when absent.
 Longer human name. Recorded for the reader of this file only \(em nothing
 reads it.
 .TP
+.IR inventory_source ", " owner ", " status
+Provenance metadata for an inventory that is not yet complete: where the node
+list comes from, who maintains it, and a free-text state (MC-1 ships with
+.BR "status: pending" ).
+Accepted and ignored by every phase;
+.B mu2e-node-inventory \-\-validate
+quotes them in its "no nodes configured" finding, and phases 1\(en3 print
+.I status
+in their per-location note.
+.TP
 .I aliases
 Alternative spellings accepted on the command line. The teststand accepts
 .BR heerc .
@@ -83,7 +93,29 @@ and
 are the same location.
 .TP
 .I gateways
-Jump hosts used to reach this location, in preference order.
+Jump hosts used to reach this location, in preference order. They are also the
+probe sources for any phase-3 mesh network with
+.B "origin: gateways"
+in
+.BR mu2edaq-checks.yaml (5)
+\(em the IPMI network in the shipped configuration \(em and every gateway
+listed is used there, not only the first that answers.
+.TP
+.I ipmi_gateways
+Optional. The hosts that run
+.B ipmitool
+for this location's BMCs, and the IPMI mesh's probe sources, when they are not
+the
+.IR gateways .
+Unset, the
+.I gateways
+are used. The shipped teststand sets it to the two MC-2 gateways: its BMCs are
+on the MC-2 IPMI segment, which
+.B mu2edaq-gateway
+has no interface on. A gateway that is not an IPMI gateway for its location
+reports
+.B net.ipmi_reach
+as skip.
 .TP
 .I subnets
 Network name to CIDR. These are what
@@ -147,6 +179,25 @@ is kept out of a list.
 .I fmt
 printf-style format for the number. Default
 .BR %02d .
+.SS Hostname validation
+Every expanded name \(em each network entry after NodeRange expansion, each
+.IR gateways " and " protected
+entry \(em must be a DNS hostname (labels of letters, digits and
+.BR \- ,
+neither starting nor ending with
+.BR \- ,
+separated by dots; a trailing dot is allowed) or an IPv4 or IPv6 literal
+(without a zone id). Anything else \(em whitespace, quotes, shell
+metacharacters, a leading
+.B \-
+\(em makes the file fail to load, naming the location and network the entry
+came from. The same rule, the one function
+.IR topology.valid_hostname ,
+is applied to each
+.B \-\-node
+name. These names become ssh destinations and are placed in the phase-3 probe
+scripts, so the check is the boundary between configuration text and shell
+source.
 .SH THE CURRENT INVENTORY
 65 hosts across three locations, as shipped.
 .BR "mu2e-node-inventory \-\-json"
@@ -189,7 +240,27 @@ absence of a data network, and the two MC-2 gateways, which is how it is
 reached until it has its own. Add hostnames to
 .I locations.mc1.networks
 and every phase picks MC-1 up with no code change; until then the tools report
-it as having no nodes configured rather than as healthy.
+it as having no nodes configured rather than as healthy, and each of phases
+1\(en3 run with
+.B \-\-location mc1
+carries a
+.I "no nodes configured for mc1"
+note. MC-1 is not in the default
+.IR topology.locations .
+The shipped file has commented templates for its networks, and
+.BR mu2edaq-power-sequence.yaml (5)
+a commented
+.B "location: mc1"
+stage. Run
+.B mu2e-node-inventory \-\-validate
+after filling it in; on the shipped file it reports the shared IPMI subnet, the
+data subnet the teststand shares with MC-2, and the MC-2 nodes no stage covers
+.RI ( mu2e-trk-15 .. 18 ,
+.IR mu2e-calo-12 .. 14 ,
+.IR mu2e-dcs-03 ,
+.IR mu2e-extmon-01 ,
+.IR mu2e-worker-01 .. 03 )
+as warnings.
 .TP
 .B teststand
 The Helen Edwards Engineering Center (HEERC) test stand, also accepted as

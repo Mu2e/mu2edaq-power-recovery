@@ -262,7 +262,21 @@ def parse_mdstat(text: str) -> List[MdArray]:
         name, state, _members = m.group(1), m.group(2), m.group(3)
         detail = ""
         healthy = state == "active"
+        block = []
         for follow in lines[idx + 1: idx + 4]:
+            # Stop at the next array: its counts and resync line are its own.
+            if re.match(r"^md\d+\s*:", follow.strip()):
+                break
+            block.append(follow)
+        if any(re.search(r"super external:(imsm|ddf)\b", f) for f in block):
+            # An Intel RST / DDF metadata container (members marked (S)) is
+            # always "inactive"; the arrays it holds are listed separately with
+            # "super external:/mdNNN/N". Live: dl-01's healthy RAID1 was
+            # reported degraded through its container.
+            arrays.append(MdArray(name=name, state=state, healthy=True,
+                                  detail="metadata container"))
+            continue
+        for follow in block:
             # mdstat writes [total/active], e.g. "[2/1] [U_]" for a two-disk
             # mirror with one disk missing.  The detail string echoes that
             # ordering verbatim -- printing it the other way round would have
@@ -283,8 +297,151 @@ def parse_mdstat(text: str) -> List[MdArray]:
 
 
 # ---------------------------------------------------------------------------
+# ipmitool sel list
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class SelEntry:
+    """One row of ``ipmitool sel list``.
+
+    The layout is ``id | date | time | sensor | event | direction``, where the
+    record id is hexadecimal (``%4x``, so ``   1``, ``  1a``) and the date is
+    ``Pre-Init`` with the time column a raw counter for events logged before
+    the BMC's clock was set. Some records (OEM, some discrete sensors) carry
+    no direction column.
+    """
+
+    record_id: str
+    date: str
+    time: str
+    sensor: str
+    event: str = ""
+    direction: str = ""
+    raw: str = ""
+
+    @property
+    def fingerprint(self) -> str:
+        """What identifies this event, apart from its id -- no timestamp.
+
+        The BMC's clock is exactly what an outage resets, and a timestamp is
+        rendered by the gateway's ipmitool, so it is not an identity: two
+        readings of one unchanged record must fingerprint identically.
+        """
+        return " | ".join(" ".join(part.lower().split())
+                          for part in (self.sensor, self.event, self.direction))
+
+    @property
+    def is_clear(self) -> bool:
+        """The record a BMC writes when its event log is cleared."""
+        return "log area reset/cleared" in " ".join(self.event.lower().split())
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {"id": self.record_id, "date": self.date, "time": self.time,
+                "sensor": self.sensor, "event": self.event,
+                "direction": self.direction}
+
+
+def parse_sel_list(text: str) -> List[SelEntry]:
+    """Parse ``ipmitool sel list [last N]`` output, oldest first.
+
+    ``SEL has no entries`` (an empty log) and anything whose first column is
+    not a hexadecimal record id are skipped. Record ids are normalised to
+    lower-case hex without leading zeros, so ``001A`` and ``1a`` are one id.
+    """
+    rows: List[SelEntry] = []
+    for line in (text or "").splitlines():
+        fields = [f.strip() for f in line.split("|")]
+        if len(fields) < 4:
+            continue
+        try:
+            record = int(fields[0], 16)
+        except ValueError:
+            continue
+        rows.append(SelEntry(
+            record_id=format(record, "x"),
+            date=fields[1], time=fields[2], sensor=fields[3],
+            event=fields[4] if len(fields) > 4 else "",
+            direction=" | ".join(fields[5:]),
+            raw=line.strip()))
+    return rows
+
+
+def sel_baseline(entries: List[SelEntry]) -> Dict[str, str]:
+    """``{record_id: fingerprint}``: what a later reading is compared to."""
+    return {e.record_id: e.fingerprint for e in entries}
+
+
+@dataclass
+class SelDiff:
+    """A SEL reading compared against a baseline taken earlier."""
+
+    new: List[SelEntry]
+    #: Ids in both readings whose event differs: the log was cleared and the
+    #: BMC started numbering again.
+    reused: List[str]
+    #: The log was cleared since the baseline: a new 'Log area reset/cleared'
+    #: record, or a reused id.
+    cleared: bool
+    #: Every row returned is new and the reading was a full tail, so more new
+    #: events may have scrolled out of it.
+    possibly_truncated: bool
+
+
+def diff_sel(baseline: Dict[str, str], entries: List[SelEntry],
+             tail: int = 20) -> SelDiff:
+    """Which of *entries* were not in *baseline*.
+
+    New means the record id is absent from the baseline, or present with a
+    different fingerprint. Identity is the record id, never the position in
+    the tail and never a timestamp: with a full log both readings are *tail*
+    rows long, and rotation moves every position while ids stay put.
+    """
+    new: List[SelEntry] = []
+    reused: List[str] = []
+    for entry in entries:
+        seen = baseline.get(entry.record_id)
+        if seen is None:
+            new.append(entry)
+        elif seen != entry.fingerprint:
+            new.append(entry)
+            reused.append(entry.record_id)
+    cleared = bool(reused) or any(e.is_clear for e in new)
+    truncated = bool(entries) and len(new) == len(entries) and len(entries) >= tail
+    return SelDiff(new=new, reused=reused, cleared=cleared,
+                   possibly_truncated=truncated)
+
+
+# ---------------------------------------------------------------------------
 # misc
 # ---------------------------------------------------------------------------
+
+
+def smart_unreadable(text: str) -> bool:
+    """smartctl answered but could not read the verdict (``result: UNKNOWN!``).
+
+    Live on trk-11: "SMART Status command failed: scsi error aborted command".
+    That is "we could not look", not a SMART failure.
+    """
+    return bool(re.search(r"self-assessment test result:\s*UNKNOWN", text or "", re.I))
+
+
+def parse_proc_mounts(text: str) -> Dict[str, Tuple[str, str]]:
+    """``{mountpoint: (source, fstype)}`` from /proc/mounts.
+
+    Read instead of ``df`` for network mounts: ``df -l`` omits them by
+    definition, and plain ``df`` stats every mount, which hangs on a stale
+    NFS handle -- the failure the NFS check exists to find. Octal escapes
+    (``\\040`` for a space) are decoded.
+    """
+    out: Dict[str, Tuple[str, str]] = {}
+    for line in (text or "").splitlines():
+        fields = line.split()
+        if len(fields) < 3:
+            continue
+        unescape = lambda f: re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), f)  # noqa: E731
+        out[unescape(fields[1])] = (unescape(fields[0]), fields[2])
+    return out
 
 
 def parse_smart_health(text: str) -> Optional[bool]:

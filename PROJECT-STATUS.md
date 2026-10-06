@@ -1,9 +1,10 @@
 # Project status — mu2edaq-power-recovery
 
-**Version** 0.1.0 (tagged) · **Status** feature-complete; credentials, Vault
-and BMC access verified live, no power-on yet (§6.3) · **Repository**
+**Version** 0.2.0 (untagged until the fix branches are merged; 0.1.0 is the
+last tag) · **Status** feature-complete; credentials, Vault and BMC access
+verified live, no power-on yet (§6.3) · **Repository**
 <https://github.com/Mu2e/mu2edaq-power-recovery> (public, per the Mu2e-org
-convention) · **Last updated** 2026-09-18
+convention) · **Last updated** 2026-09-29
 
 ---
 
@@ -14,8 +15,8 @@ with the phase-0 self-update, the static report site, the logbook integration,
 the diagnostics utilities, the optional C/C++ probe library and its Python
 bindings, and the documentation set.
 
-309 automated tests pass, plus 7 C++ test groups and an end-to-end simulated
-four-phase run. The suite's "contacts nothing" claim is now *enforced* by a
+651 automated tests pass (Linux x86_64, Python 3.9.25), plus 7 C++ test groups
+and an end-to-end simulated four-phase run. The suite's "contacts nothing" claim is now *enforced* by a
 test-collection guard rather than merely asserted (§6.4).
 
 **The four phases have not yet been run end to end against the real cluster**,
@@ -24,7 +25,8 @@ the logic rather than the environment. Individual pieces *have* now been
 exercised live, and that is where most of §6.4 came from: Vault reads, the IPMI
 credentials and cipher suite, SSH through a real gateway, and the Kerberos
 credential chain on macOS. Two items remain open (§6): the MC-1 node list, and
-an actual power-on.
+an actual power-on. v0.2.0 is the issue-review release: §6.6 lists what changed
+and the operator questions it leaves open.
 
 ---
 
@@ -39,13 +41,13 @@ Every requirement from `Project-Description.md`, and where it is met.
 | 3 | Uses a Vault token for secrets | ✅ | `creds/vault.py` |
 | 4 | Report hosting local or remote upload | ✅ | `report/publish.py` (rsync / scp / copy) |
 | 5 | Secrets from `td/scd/experiments/mu2e/`, IPMI at `.../ipmi/config` | ✅ | `config/power-recovery.yaml` `vault:`; path and fields confirmed |
-| 6 | Three computing centres: MC-1, MC-2, Teststand | ⚠️ | `config/topology.yaml`; **MC-1 node list empty** (§6.1) |
+| 6 | Three computing centres: MC-1, MC-2, Teststand | ⚠️ | `config/topology.yaml`; **MC-1 node list empty** (§6.1); scaffolding and `mu2e-node-inventory --validate` in place |
 | 7 | Node names from `mu2edaq-operations` `node_list.py` | ✅ | `topology.py` uses the identical entry syntax |
 | 8 | Per-site network segments and CIDRs | ✅ | `topology.yaml` `subnets:` |
 | 9 | Current-state tool, on-screen report | ✅ | `console.py`, `mu2e-power-state` |
 | 10 | Webpage with tables by area and by class | ✅ | `report/templates/assess.html` |
-| 11 | Re-running updates the webpage | ✅ | `ReportWriter.write_phase` rewrites in place |
-| 12 | Check for GitHub updates and rebuild first | ✅ | `selfupdate.py` |
+| 11 | Re-running updates the webpage | ✅ | `ReportWriter.render_run`: each run's bundle under `runs/<id>/`, the top level shows the newest run |
+| 12 | Check for GitHub updates and rebuild first | ✅ | `selfupdate.py`; a failed required rebuild rolls the update back (#21) |
 | 13 | Print version information | ✅ | `version.py` banner |
 | 14 | Phase 1 takes no corrective action | ✅ | Read-only checks; asserted by test |
 | 15 | Gateways responding | ✅ | `ping.lab` |
@@ -83,57 +85,68 @@ Every requirement from `Project-Description.md`, and where it is met.
 
 | Component | Status | Tests | Notes |
 |---|---|---|---|
-| Configuration layering | ✅ Complete | 23 | 5 layers, provenance retained, redaction |
-| Topology / inventory | ✅ Complete | 14 | Upstream-compatible entry syntax |
+| Configuration layering | ✅ Complete | 25 | 5 layers, provenance retained, redaction |
+| Topology / inventory | ✅ Complete | 74 + 12 | Upstream-compatible entry syntax; hostname validation at load; `validate()` findings (#25) |
 | SSH transport | ✅ Complete | via checks | ProxyJump, GSSAPI, no ControlMaster; gateway resolution serialised |
 | IPMI client | ✅ Complete | 43 | Runs on the gateway; secrets on stdin; upstream-matching invocation |
 | Kerberos | ✅ Complete | 68 | Credential chains; Heimdal collection caches; displacement guard |
 | Service identities | ✅ Complete | 68 | Via `mu2edaq-kerberos`; no keytab handled here |
-| Vault | ✅ Complete | 11 | Path and fields confirmed against the live Vault |
+| Vault | ✅ Complete | 12 | Path and fields confirmed against the live Vault |
 | Check framework | ✅ Complete | 39 | 25 checks; registry; failure containment; ping dialects |
 | Output parsers | ✅ Complete | 20 | Real command output as fixtures; iputils/BSD/Windows |
 | Phase 1 assess | ✅ Complete | 7 | Read-only asserted by test; simulation hermeticity |
 | Phase 2 power on | ✅ Complete | 8 | Stage order, requirements, dry run |
-| Phase 3 network | ✅ Complete | 4 | Full mesh + MTU probe |
+| Phase 3 network | ✅ Complete | 7 + 24 mesh tests | Full mesh + MTU probe; IPMI from gateways; UNKNOWN vs FAIL per path |
 | Phase 4 report | ✅ Complete | 4 | Narrative derived from the store |
 | Run store | ✅ Complete | 8 | SQLite; Postgres by URL |
 | Report site | ✅ Complete | 20 | 9 pages + JSON companions |
 | Publication | ✅ Complete | in report suite | rsync / scp / copy; refuses to publish under `--simulate` |
 | ECL posting | ⚠️ Untested | in report suite | Body and subject tested; posting needs the package (§6.5) |
-| Self-update | ✅ Complete | 13 | Against real throwaway git repos |
+| Self-update | ✅ Complete | 24 | Against real throwaway git repos; rollback on a failed rebuild, provenance |
+| Run lock | ✅ Complete | 21 | `runlock.py`; stop script tested against stale and reused pids |
 | `libmu2eprobe` (C++) | ✅ Complete | 7 groups | C++ / C / Python surfaces |
 | ssh credential chain | ✅ Complete | 68 | Per-host memo, promotion, auth-vs-unreachable-vs-hostkey |
 | Host-key handling | ✅ Complete | in credentials suite | Own classification; stops the chain; verified against a live reimaged node |
 | Python sweep fallback | ✅ Complete | 8 | Semantics identical to the native path |
-| CLI | ✅ Complete | 14 | Driver + 4 single-phase entry points |
-| Test network guard | ✅ Complete | 2 | Autouse fixture + its meta-test |
+| CLI | ✅ Complete | 26 + 21 | Driver + 4 single-phase entry points; live-run authorisation |
+| Test network guard | ✅ Complete | 18 | Autouse fixture + its meta-tests |
 | Diagnostics (4 tools) | ✅ Complete | — | Exercised live; `mu2e-ssh-probe` now builds the real credential chain |
-| Man pages | ✅ Complete | — | 18 pages, all render warning-free; the single-phase drivers cross-reference the driver page rather than listing flags (§6.5) |
+| Man pages | ✅ Complete | — | 19 pages, all render warning-free; the single-phase drivers cross-reference the driver page rather than listing flags (§6.5) |
 | Documentation | ✅ Complete | — | README, CLAUDE, INSTALL, DESIGN, OPERATIONS, this file |
 
 ---
 
 ## 4. Test matrix
 
-`pytest` — **309 passed** in ~29 s, no cluster, no credentials, no network.
+`pytest` — **651 passed** in ~50 s on Linux x86_64, Python 3.9.25 (v0.2.0
+stack), no cluster, no credentials, no network.
 
 | Suite | Tests | Covers |
 |---|---|---|
-| `unit/test_topology.py` | 14 | NodeRange expansion, aliases, classes, protection, MC-1 emptiness |
-| `unit/test_settings.py` | 23 | All five precedence layers, coercion, redaction, malformed YAML |
-| `unit/test_parsers.py` | 20 | `df`, `ip`, `ping` (iputils + BSD + Windows), `mdstat`, SMART, kernel errors |
-| `unit/test_checks.py` | 39 | Every check's pass and fail path; framework containment; ping dialects |
-| `unit/test_ipmi.py` | 43 | **Safety gates**, credentials, invocation shape, failure diagnosis, credential stop |
-| `unit/test_state.py` | 8 | Round-trip, refusal auditing, append-not-overwrite |
-| `unit/test_vault.py` | 11 | KV path resolution, folder-vs-secret, synonyms, file fallback |
-| `unit/test_credentials.py` | 68 | Primary-first chains, root fallback, ssh-failure classification, KRB5CCNAME, collection caches, host keys, cleanup, password prompting |
-| `unit/test_network_guard.py` | 2 | The suite's "contacts nothing" claim is enforced, not just asserted |
-| `unit/test_docs.py` | 3 | `tools/generate-docs.py --check`: the man pages still match the code, and `--check` writes nothing |
+| `unit/test_topology.py` | 74 | NodeRange expansion, aliases, classes, protection, MC-1 emptiness, hostname validation at load and in `resolve()` |
+| `unit/test_topology_validate.py` | 12 | `Topology.validate()` findings on the shipped config (exactly 4 warnings + 1 info), synthetic orphan BMC / overlap / stage cases, `mu2e-node-inventory --validate` exit status and JSON, a populated synthetic MC-1 through `--list-nodes` and a simulated assess, the per-location "no nodes configured" note |
+| `unit/test_settings.py` | 25 | All five precedence layers, coercion, redaction, malformed YAML |
+| `unit/test_parsers.py` | 35 | `df`, `ip`, `ping` (iputils + BSD + Windows), `mdstat`, SMART, kernel errors, `sel list` and the SEL diff |
+| `unit/test_checks.py` | 50 | Every check's pass and fail path; framework containment; ping dialects; SEL empty/short/rotated/cleared/identical/unread; refused credential is UNKNOWN |
+| `unit/test_mesh.py` | 24 | Phase-3 mesh: quoting, origin/targets, gateway-sourced IPMI, UNKNOWN for untested paths |
+| `unit/test_ipmi.py` | 54 | **Safety gates**, credentials, invocation shape, failure diagnosis, credential stop, breaker under barrier-forced concurrency |
+| `unit/test_ipmi_tool.py` | 8 | `mu2e-ipmi-tool` target selection: no un-filtering, skipped-node reasons, exit 2 before Vault, confirmation lists hostnames |
+| `unit/test_state.py` | 10 | Round-trip, refusal auditing, append-not-overwrite, `attach` without a new row, writes that name their run |
+| `unit/test_vault.py` | 12 | KV path resolution, folder-vs-secret, synonyms, file fallback, `vault login` stdout sent to stderr |
+| `unit/test_credentials.py` | 86 | Primary-first chains, root fallback, ssh-failure classification, KRB5CCNAME, collection caches, host keys, cleanup, password prompting; typed default-cache guard errors, the guard's precondition, barrier-forced concurrent mints |
+| `unit/test_credential_bootstrap.py` | 16 | The shared credential bootstrap: login/ticket pairs attempted by `mu2e-ssh-probe` and `mu2e-ipmi-tool`, show-only mints nothing, cleanup on success/exception/interrupt, the disabled-fallbacks note and event |
+| `unit/test_authorize_live.py` | 21 | `--execute`, the ARM token, config-only `run.dry_run: false` refused, `--simulate` always wins |
+| `unit/test_sequence_plan.py` | 38 | Phase-2 planning: `--location`/`--node` scope, verify-only predecessors, unknown/reversed stage names |
+| `unit/test_network_guard.py` | 18 | The suite's "contacts nothing" claim is enforced (subprocess, sockets, sweep), not just asserted |
+| `unit/test_docs.py` | 4 | `tools/generate-docs.py --check`: the man pages still match the code, `--check` writes nothing, SIGTERM reaches the clean path |
 | `unit/test_sweep.py` | 8 | Both backends, identical semantics |
-| `unit/test_selfupdate.py` | 13 | Dirty tree, divergence, fast-forward, re-exec guard |
-| `integration/test_phases.py` | 23 | All four phases end to end; simulation hermeticity |
-| `integration/test_report.py` | 20 | Page rendering, archiving, publication, ECL body |
-| `integration/test_cli.py` | 14 | Driver, flags, exit codes, JSON output |
+| `unit/test_selfupdate.py` | 24 | Dirty tree, divergence, fast-forward, re-exec guard; full pre-update SHA; a failed rebuild after pyproject/requirements/C++ changes, a bootstrap exiting 1 and a missing bootstrap all roll back with no re-exec; `--keep` preserves a dirty edit; a failed reset exits 2; the result is in the run's provenance |
+| `unit/test_runlock.py` | 21 | Busy lock names the holder (child-process holder); stale record naming a live unrelated pid is "not running" and `pid` exits 1; release/reacquire; only phases 1-3 non-simulated lock; busy -> exit 2; released before re-exec; stop script never signals a stale record, refuses a holder that is not the driver, and TERMs the real holder |
+| `integration/test_phases.py` | 28 | All four phases end to end; simulation hermeticity |
+| `integration/test_poweron_scope.py` | 15 | Scoped live power-on in simulation: only the named nodes are powered |
+| `integration/test_report.py` | 21 | Page rendering, per-run bundles, publication, ECL body |
+| `integration/test_report_lifecycle.py` | 21 | `--run-id` regeneration on the selected run with no credentials; missing run exits 2; final status in every artefact, also after error/interrupt; reconciliation (resolved, unrechecked, subset re-check); two runs in one output dir; ECL attachments = the run's bundle; `--json` parses as a whole, no ANSI |
+| `integration/test_cli.py` | 26 | Driver, flags, exit codes, JSON output |
 
 **C++** — `ctest`, 7 test groups: version/OpenMP agreement, unresolvable names,
 loopback, timeout bounding, input-order preservation, the reachable filter, and
@@ -160,7 +173,29 @@ JSON files, and is wired into `ctest` as `simulated-run`.
 | Phase 1 takes no corrective action | `test_assess_takes_no_corrective_action` |
 | The gateway stage never issues a power command | `test_the_gateway_stage_never_issues_a_power_command` |
 | Refusals are recorded, not just successes | `test_actions_record_refusals_as_well_as_successes` |
+| A rejected credential reaches one BMC under a concurrent start | `test_a_concurrent_start_puts_a_rejected_credential_to_one_bmc_only` |
+| Waiters get the shared diagnosis without invoking ipmitool | `test_waiting_callers_get_the_shared_diagnosis_without_invoking_ipmitool` |
+| A BMC-less selection contacts neither Vault nor a gateway | `test_a_lone_bmc_less_node_contacts_nothing_and_exits_2` |
 | Re-running a phase does not erase earlier evidence | `test_rerunning_a_phase_appends_rather_than_overwrites` |
+| A default-cache guard failure stops every further mint, whatever its wording | `test_a_guard_failure_disables_service_identities_for_the_run` |
+| No mint runs when the default cache cannot be read first | `test_an_unreadable_default_refuses_before_any_mint` |
+| Concurrent cold chains mint each identity exactly once | `test_concurrent_cold_chains_mint_each_identity_exactly_once` |
+| A show-only diagnostic acquires and mints nothing | `test_show_only_mints_nothing_and_says_so` |
+| Config `run.dry_run: false` alone does not arm a run (YAML, `.env`, env) | `test_config_live_alone_is_refused` |
+| The ARM token arms only with a matching configured label | `test_an_arm_token_that_does_not_hold_is_refused` |
+| The ARM token is refused in `config/.env` | `test_arm_in_dotenv_is_a_config_error` |
+| A second hardware-facing run cannot start while one holds the lock | `test_a_second_acquire_is_busy_and_names_the_holder`, `test_a_busy_lock_stops_the_driver_with_exit_2` |
+| A stale record's pid (alive, reused) is never signalled | `test_stop_never_signals_a_stale_record`, `test_a_stale_record_naming_a_live_unrelated_pid_is_not_reported` |
+| A lock holder that is not the driver is not signalled | `test_stop_refuses_a_holder_that_is_not_the_driver` |
+| A failed required rebuild never re-execs the updated code | `test_a_failed_rebuild_rolls_the_checkout_back` |
+| `--simulate` beats `--execute` and the ARM token | `test_simulate_always_wins` |
+| A `--node` live run powers only the named node, never a predecessor | `test_a_scoped_live_run_powers_only_the_named_node` |
+| An off predecessor stops the run before the target stage | `test_an_off_predecessor_stops_before_the_target` |
+| `_power_stage` refuses a host outside the plan | `test_power_stage_refuses_a_host_outside_the_plan` |
+| Each BMC is driven through its own location's gateway | `test_each_bmc_is_driven_through_its_own_locations_gateway` |
+| A bad stage/node selection exits 2 before credentials, no run row | `test_bad_phase2_selection_exits_2_before_credentials` |
+| 28 dead nodes cost one `boot_timeout`, not 28 | `test_28_dead_nodes_cost_one_boot_timeout_not_28` |
+| Stages past `run.phase_timeout` are UNKNOWN, not FAIL | `test_phase_timeout_marks_the_stages_it_never_reached` |
 
 ---
 
@@ -171,7 +206,8 @@ JSON files, and is wired into `ctest` as `simulated-run`.
 | Alma/Rocky/RHEL 9 | 3.9 (system) | ✅ | ✅ GCC + OpenMP | Target deployment |
 | Alma/Rocky/RHEL 8 | 3.9 | ✅ | ✅ | Expected to work; untested |
 | Ubuntu 22.04 / 24.04 | 3.10–3.12 | ✅ | ✅ | Expected to work; untested |
-| macOS 14+ (arm64) | 3.12 | ✅ Verified | ✅ Built and tested, no OpenMP by default | **Development platform** |
+| Linux x86_64 (Amazon Linux 2023, kernel 6.18) | 3.9.25 | ✅ Verified at v0.2.0 | ✅ Built and tested with ctest | Verification host for the v0.2.0 stack |
+| macOS 14+ (arm64) | 3.12 | ✅ Verified at v0.1.0 | ✅ Built and tested, no OpenMP by default | **Development platform** |
 | Windows 11 | 3.9+ | ✅ `bootstrap.ps1` | ⚠️ MSYS2/MinGW only | Needs OpenSSH + MIT Kerberos |
 
 | Dependency | Version | Required? | Without it |
@@ -189,9 +225,15 @@ JSON files, and is wired into `ctest` as `simulated-run`.
 | psycopg2 | — | No | SQLite |
 | `ipmitool` | on the gateway | Yes for phase 2 | No power control |
 
-**Verified on this machine:** macOS 14 (arm64), Python 3.12.1 — 309 pytest
-tests, 7 C++ test groups, the simulated four-phase run, all 18 man pages, and
-`bootstrap.sh` from scratch.
+**Verified for v0.2.0:** Linux x86_64, Python 3.9.25 — 651 pytest tests, the
+C++ build and ctest, the simulated four-phase run, `tools/generate-docs.py
+--check` over all 19 man pages.
+
+**Previously verified at v0.1.0:** macOS 14 (arm64), Python 3.12.1 — the then
+309 pytest tests, 7 C++ test groups, the simulated four-phase run, all 18 man
+pages, and `bootstrap.sh` from scratch. The v0.2.0 stack has not been re-run on
+macOS; the Heimdal-specific paths below are the reason to do so before relying
+on it there.
 
 macOS deserves its own line rather than a tick. It is the development platform
 *and* a realistic platform to drive a recovery from, and it is the one that
@@ -212,6 +254,16 @@ carried in `mu2edaq-operations/scripts/nodes_config.yaml`, the authoritative
 upstream inventory, so nothing could be imported. Adding the hostnames is a
 config edit; no code change is needed. Until then the tools report MC-1 as
 "no nodes configured" rather than as healthy.
+
+v0.2.0 adds the scaffolding (#25, still open for the data): `mc1` carries
+`inventory_source` / `owner` / `status: pending` metadata and commented network
+templates, `config/power-sequence.yaml` a commented `location: mc1` stage,
+phases 1–3 note "no nodes configured for mc1 (inventory status: pending)" when
+it is requested, and `mu2e-node-inventory --validate` checks a filled-in
+inventory. mc1 stays out of the default `topology.locations` until a read-only
+`mu2e-power-state --location mc1` has been run against it. Still needed from
+operations: the host list and its source of truth, owner, gateways, BMC
+mapping, protected hosts, and where MC-1 goes in the power order.
 
 ### 6.2 Vault IPMI secret — ✅ **resolved 2026-09-17**
 Both parts confirmed against the live Vault:
@@ -451,19 +503,30 @@ The nine items immediately below were found in a documentation audit on
 what the code does; the code behaviour is left for the author. They are ordered
 by how much an operator would care.
 
-- **`--execute` is not a second gate, although four documents said it was.**
-  `cli.py:184-185` does `if args.execute: overrides["run.dry_run"] = False`, and
-  `orchestrator.py:308` passes `run.dry_run` straight to `IPMIClient`. Nothing
-  re-checks the flag, so `run: {dry_run: false}` in the config file, `.env` or
-  `MU2E_POWER_RECOVERY_RUN_DRY_RUN=false` arms live power commands with no flag
-  on the command line — verified by resolving the shipped parser against such a
-  config. Only `--simulate` is genuinely independent. The docs now say so. If
-  the two-gate behaviour was the intent, it is a two-line change in
-  `run_phases`/`_make_ipmi_client` (require `args.execute` *and* `not
-  run.dry_run`), but it would break any operator who arms a run from the config
-  file today, so it is the author's call. **Highest-value item in this group.**
-- **Nothing installs a SIGTERM handler, so `stop-…-recovery.sh` is not a clean
-  stop.** No module under `src/` imports `signal`; `cli.py:483` catches only
+- ~~**`--execute` is not a second gate, although four documents said it
+  was.**~~ **Fixed (#11, fix/poweron-safety).** `--execute` no longer writes
+  `run.dry_run`; `cli.authorize_live()` decides per invocation, before phase 0
+  and credentials: `--simulate` is never live; `--execute` alone arms;
+  `run.dry_run: false` from YAML, `.env` or the environment *alone* exits 2
+  with both ways to authorise; with it, `MU2E_POWER_RECOVERY_ARM` equal to a
+  non-empty configured `run.label` arms an unattended run. A token with a null
+  or mismatched label, or with `dry_run: true`, exits 2. The token is read
+  from the process environment only — `settings._apply_env` skips it and its
+  presence in `config/.env` is a `ConfigError`. The decision is written back
+  as `run.dry_run` (source recorded), so the IPMI clients are unchanged
+  downstream; a live run logs a WARNING and records a store event naming what
+  armed it. Assumed interpretation, flagged for confirmation: `--execute` alone
+  still arms (the shipped config is `dry_run: true` and every documented
+  example uses the bare flag).
+- ~~**Nothing installs a SIGTERM handler, so `stop-…-recovery.sh` is not a clean
+  stop.**~~ **Fixed (fix/credentials).** `cli.install_sigterm_handler()` raises
+  KeyboardInterrupt, and `assess_nodes` / `MeshProbe.run` replace their `with
+  ThreadPoolExecutor` (whose `__exit__` waited for every queued node) with
+  `shutdown(wait=False, cancel_futures=True)` on any BaseException before
+  re-raising, so the interruption is recorded and `cleanup()` runs at once;
+  queued nodes are never started (tested with a real SIGTERM to the main
+  thread). Running workers still finish their current command before the
+  interpreter exits. Original finding: No module under `src/` imports `signal`; `cli.py:483` catches only
   `KeyboardInterrupt` (SIGINT). Under the default disposition SIGTERM kills the
   process, so `record_event("run interrupted by the operator")`,
   `finish_run("interrupted")` and the `finally: orch.close()` never run. The run
@@ -482,33 +545,101 @@ by how much an operator would care.
   — a service identity holding the default cache (every login will be refused)
   versus the benign case where the ambient principal merely differs from
   `kerberos.principal`. Separating them, then exiting on the first, is the fix.
-- **An unmatched `--from`/`--until` stage name is silently ignored.**
-  `phase2_poweron.py:289-295`: `start = names.index(from_stage) if from_stage in
-  names else 0`. So `mu2e-power-on --execute --from manger` runs the *whole*
-  sequence, readout included, with no error and no note. For a flag whose
-  purpose is to bound what gets powered on, this should arguably be an error.
-  Documented as a caveat in `man 1 mu2e-power-on` and the runbook for now.
-- **`mu2e-ipmi-tool` reaches the gateway with the ambient ticket only.**
-  `ipmi_tool.py:126` builds `SSHFactory(settings, topology, local=local)` with no
+- ~~**An unmatched `--from`/`--until` stage name is silently ignored.**~~
+  **Fixed (#2, fix/poweron-safety).** `_slice_bounds()` raises
+  `SequenceSelectionError` (a `ValueError`) for an unknown name, a reversed
+  range, a stage with no name or duplicate stage names, listing the valid
+  names; the same applies to `run.from_stage`/`run.until_stage`. The CLI plans
+  the sequence before `prepare_credentials()` and `start_run()`, so a typo exits
+  2 with no password prompt and no run row.
+- ~~**Phase 2 ignored `--node` and `--location`.**~~ **Fixed (#1,
+  fix/poweron-safety).** `plan_sequence()` builds a `SequencePlan` before
+  credentials: stages outside `--location` are dropped with a notice (none left
+  is an error); with `--node`, target stages are cut to the named nodes,
+  predecessor stages (from the range start to the last target) are
+  **verify-only** — power status, ssh wait, checks, never `chassis power on` —
+  and a predecessor stage that is not up stops the run before the target, even
+  with `--continue-on-error`, naming the stage to run explicitly; later stages
+  are SKIP "outside requested scope". A named node in no usable stage is an
+  error naming its stage(s). `_power_stage` refuses any host outside
+  `plan.allowed_power` (action `out_of_scope`). Every stage's node names are
+  validated at plan time, so a bad name cannot fail mid-sequence. `--node`
+  resolution moved ahead of credentials too, and `--list-nodes` handles
+  `TopologyError` (exit 2, no traceback). IPMI is now one client per location
+  (`Orchestrator.ipmi_for`), each on a gateway of its own location, all sharing
+  the run's `CredentialBreaker`. Deviation from the literal plan text: a
+  predecessor blocks by its stage's `require:` rule with off/silent nodes
+  counted as bad, so one dark gateway of two (`require: any`) does not stop a
+  run that the full sequence would also have continued.
+- ~~**`mu2e-ipmi-tool` reaches the gateway with the ambient ticket only.**~~
+  **Fixed (#14, fix/credentials).** Both diagnostics and
+  `Orchestrator.prepare_credentials` now open credentials through
+  `creds/bootstrap.py:credential_session`, which runs `ambient_warning()`,
+  `prepare()`, the fallback warm-up and builds the `SSHFactory` with the
+  manager, and destroys the private caches in a `finally`. `--show-command`
+  acquires nothing. Tests assert the login/ticket pair of every attempt.
+  Original finding: `ipmi_tool.py:126` builds `SSHFactory(settings, topology, local=local)` with no
   `KerberosManager`, so `credentials_for` returns `[]` and `SSHTransport.run`
   falls to `chain = [None]`; it never calls `ambient_warning()` either. This is
   the same defect §6.4 records as fixed for `mu2e-ssh-probe`, still present here:
   the helper can fail against a gateway a real run would open with a service
   identity, or succeed under a displaced default cache. Its man page and the
   runbook now say the tool does not test the run's SSH access.
-- **`mu2e-ssh-probe` builds the chain's credential *list* but not its
-  tickets.** It never calls `KerberosManager.prepare()`, so `operator_credential()`
+- ~~**`mu2e-ssh-probe` builds the chain's credential *list* but not its
+  tickets.**~~ **Fixed (#15, fix/credentials).** `--run` prepares the
+  designated principals through the shared bootstrap, so ssh gets the private
+  `KRB5CCNAME` the description names; show-only acquires and mints nothing and
+  marks every unacquired credential `would try (not acquired)` instead of
+  `[ambient cache]`; `--principal`/`--root-principal` exist on both helpers
+  (`tools/_common.py`). A related mismatch was fixed on the way: with
+  `root_principal == principal`, root sessions named that principal but were
+  given the ambient cache. Original finding: It never calls `KerberosManager.prepare()`, so `operator_credential()`
   returns a `Credential` whose `cache` is `None` — the ambient cache — while its
   `principal` comes from `kerberos.principal`. Since `docs/INSTALL.md` recommends
   setting that principal in `config/.env`, this divergence is the normal case,
   and `describe()` prints `ticket you@FNAL.GOV [ambient cache]` even when the
   ambient cache holds someone else. There is no `--principal` flag to compensate.
   Documented in `man 1 mu2e-ssh-probe`.
-- **`mu2e-ipmi-tool` silently un-filters when every named host lacks a BMC.**
+- ~~**`mu2e-ipmi-tool` silently un-filters when every named host lacks a BMC.**
   `ipmi_tool.py:97`: `nodes = [n for n in nodes if n.ipmi_host] or nodes`. So
   `-n mu2e-dcs-03` (on the lab network, no `ipmi:` interface) proceeds and builds
-  `ipmitool -H None …` on the gateway. The `--diagnose` path handles this
-  correctly (`ipmi_tool.py:253-255`). Documented in the man page.
+  `ipmitool -H None …` on the gateway.~~ **Fixed (#16, fix/ipmi).**
+  `select_targets()` returns the valid targets and the skipped ones with a
+  reason ("unknown host" vs "no BMC"), printed on stderr; there is no fallback,
+  and an empty selection exits 2 before Vault or `SSHFactory` is constructed. A
+  state-changing verb lists every target by hostname (the old prompt stopped at
+  ten and gave a count).
+- ~~**The IPMI credential stop was not thread-safe.**~~ **Fixed (#8,
+  fix/ipmi).** `credentials_refused` was read and set without a lock while
+  sixteen workers shared one client, so a wrong credential could reach many
+  BMCs before the first rejection landed. `CredentialBreaker` now serialises
+  invocations until a first success proves the credential, re-reads the refusal
+  after taking the gate and before every retry, and is shared by every client of
+  a location (originally of the run; made per location after the 2026-10-01
+  live test showed the teststand's BMCs refuse the account MC-2's accept —
+  PR #27 review). A refusal is `PowerState.REFUSED` -> UNKNOWN, not FAIL "BMC does not
+  answer". The serial-while-dark trade-off is gone: each unproven call is
+  preceded by a gate-free `ping -c 3 -i 0.2 -W 1` (any reply counts; it was
+  one echo until PR #27 review, which a cold ARP entry could lose) of the BMC from the gateway
+  (`ipmi.reachability_precheck`, default true), so dark BMCs are reported
+  UNREACHABLE concurrently without ipmitool, and phase 1 reports their
+  `power.sensors`/`power.sel` UNKNOWN without asking again. Two distinct BMCs
+  that answer the ping and fail "Unable to establish" while unproven trip the
+  breaker (likely wrong username); RAKP/"unauthorized name" still trip on the
+  first. `mu2e-ipmi-tool` honours the pre-check and, as the run does,
+  `ipmi.stop_on_auth_failure` (it previously ignored the key and got a
+  private breaker's default). An invalid `-n`
+  hostname (`TopologyError` from `select_targets`) exits 2 with a clean error
+  instead of a traceback.
+- ~~**SEL baselines compared the length of a 20-entry tail.**~~ **Fixed (#10,
+  fix/ipmi).** Once a log was full, phase 1 and phase 2 both read 20 rows and
+  new events were never reported. The baseline is now `{record_id:
+  fingerprint}` from `parse_sel_list`; a reused id or a new "Log area
+  reset/cleared" gives WARN "SEL cleared since survey", an all-new full tail is
+  noted as possibly truncated, and a failed read is UNKNOWN with no baseline.
+  The optional cross-process baseline (loading phase 1's from the run store for
+  a standalone `mu2e-power-on`) was cut: a separate process still starts
+  without one.
 - ~~**The test suite's network guard covers one method.**~~ **Fixed (#22,
   fix/test-guard).** The guard now patches `subprocess.Popen`, `socket.connect`
   and `sweep.sweep`, and raises a BaseException so production
@@ -516,8 +647,60 @@ by how much an operator would care.
   made here was wrong: on first run the extended guard caught
   `test_no_kerberos_package_means_no_service_identities` running the real
   `klist` via `operator_credential()` -> `ambient_principal()`.
-- **The displacement guard around a mint is best-effort, not a precondition.**
-  `ticketsource.py:256-259` reads `before = self.default_principal()` and, when
+- ~~**Hostnames were interpolated unquoted into shell scripts.**~~ **Fixed (#9,
+  fix/network-checks).** `_ping_command()` and the phase-3 mesh script built
+  shell source from host names, and `Topology.resolve()` turned any `--node`
+  text into a Node, so `--node 'host; cmd'` reached a shell. Now
+  `topology.valid_hostname()` (DNS labels or an IPv4/IPv6 literal; no leading
+  `-`, whitespace, quotes or metacharacters) is enforced on every expanded name
+  at load and on every `resolve()` name (`TopologyError`); every target and
+  marker string is `shlex.quote`d as well; and the ssh argv puts `--` before the
+  destination. A valid name is unchanged by quoting, so the `===BEGIN <name>===`
+  markers still parse. On the phase path a bad `--node` exits 2 through
+  `main()`'s generic handler, after credentials are prepared and a run row is
+  opened; under `--list-nodes` it is an uncaught traceback (exit 1). Moving
+  `--node` resolution ahead of credentials is B5's (`cli.py`).
+- ~~**Phase 3 pinged BMCs from node operating systems.**~~ **Fixed (#19,
+  fix/network-checks).** Sources for the `ipmi` network were every node with
+  an `ipmi:` entry, but that entry names the BMC, on a subnet only the gateways
+  route to; a healthy IPMI network would have been reported broadly failed.
+  Mesh entries now take `origin: nodes|gateways` and `targets: all|anchors`
+  (defaults preserve the other networks); `ipmi` is `origin: gateways,
+  targets: all`, probed from each of `topology.gateways(location)` over a
+  direct session, with the gateway named as the edge source. `anchors:` may be
+  keyed by location. Tests use a fake that models routing (node OS -> BMC is
+  "Network is unreachable").
+- ~~**An unreachable mesh source was reported as failed paths.**~~ **Fixed (#20,
+  fix/network-checks).** `MeshEdge` had no unknown state, so an ssh failure on
+  one source made every edge from it FAIL and fed the isolation diagnosis.
+  Edges now carry `tested`; a source transport error, a raised probe, or
+  output without the target's BEGIN/END markers is UNKNOWN. A network is FAIL
+  only on a tested failure, else UNKNOWN if anything is untested -- except
+  that for `origin: gateways` coverage is per target: a BMC tested by either
+  gateway of its location is tested, so one dark gateway whose partner covered
+  every BMC gives the partner's verdict (OK/FAIL) with the dark one in
+  `unreachable_sources` and a note, and a location with BMC targets but no
+  gateway yields untested edges from `(no gateway: <loc>)` and a note, never a
+  silent OK (`uncovered_targets` in `counts`); isolated
+  nodes and unreachable targets use tested edges only; results carry
+  `counts` (tested/ok/failed/unknown/unreachable_sources) and
+  `unreachable_sources`, which the phase summary, notes and `network.html`
+  show.
+- ~~**The displacement guard around a mint is best-effort, not a precondition.**~~
+  **Fixed (#23, fix/credentials).** `TicketSource.ticket()` now raises
+  `DefaultCacheUnverifiable` *before* `get-kerberos-ticket` runs when
+  `default_principal_status()` cannot name the default principal, with a reason
+  distinguishing klist missing / no default cache / unparsable output. The run
+  continues on the operator credential and the note says to `kinit`. On Linux
+  with no ambient cache at all this now disables the fallbacks where it used to
+  mint unguarded; that is intended -- unless both `--principal` and
+  `--root-principal` are designated: then the run uses no default cache, a
+  mint from `NoDefaultCache` (klist ran, no default; typed, not a message)
+  proceeds, and a default it leaves naming the identity is destroyed by name,
+  or `DefaultCacheDisplaced(None, after)`. This fixes the fresh-macOS-login
+  case where the fallbacks were disabled for nothing. `_kinit` proceeds on a
+  fresh login (it mints the operator's own principal) and refuses, before the
+  prompt, only a default that exists but cannot be read. Original finding: `ticketsource.py:256-259` reads `before = self.default_principal()` and, when
   that returns `None`, logs a debug line and mints anyway;
   `_restore_default_if_displaced` then returns immediately at `:327-328` because
   `before` is falsy. So a mint with no readable default principal runs
@@ -525,25 +708,56 @@ by how much an operator would care.
   whose guard cannot be taken is refused"), and the case the guard exists for.
   The page now describes the real behaviour.
 
-- **Abandoning the service identities for a whole run is decided by a
-  substring.** `KerberosManager.service_credential` (`kerberos.py:425`) tests
+- ~~**Abandoning the service identities for a whole run is decided by a
+  substring.**~~ **Fixed (#17, fix/credentials).** `DefaultCacheGuardError`
+  (subclasses `DefaultCacheDisplaced(before, after)` and
+  `DefaultCacheUnverifiable(reason)`) is caught by type; the resulting
+  `KerberosManager.fallbacks_disabled` records kind, identity and operator
+  guidance, and the orchestrator surfaces it as a phase note and an `error`
+  event in the run store. Tests reword the message and check both directions.
+  Original finding: `KerberosManager.service_credential` (`kerberos.py:425`) tests
   `"default credential cache" in str(exc)` to tell an unrecoverable
   displacement from an ordinary "no keytab for this identity". Reword the
   message in `ticketsource.py` and the first silently downgrades to the second,
   and the run carries on minting under a displaced default — the exact failure
   the check exists to stop. Carrying the decision on the exception *type* would
   fix it. Left alone because the wording is fresh and the author may want a view
-  on the shape. **This is the highest-value item in this section.**
-- **Phase 2 waits for nodes one at a time.** `_wait_for_nodes` walks the stage's
-  nodes in sequence, so a node that never comes back costs the whole
-  `boot_timeout` (600 s by default) before the next one is even tried. The
-  `readout` stage has 28 nodes: three dead ones are half an hour of an outage
-  spent waiting in series, during which nothing else happens. Parallelising it
-  is straightforward — the probes are read-only `ssh true`, and `assess_nodes`
-  immediately afterwards already runs the same nodes concurrently — but it
-  changes the connection profile against machines that have just booted, in the
-  most safety-critical phase, so it wants the author's eye rather than a
-  drive-by fix.
+  on the shape.
+- ~~**Service tickets were minted lazily from worker threads with no lock.**~~
+  **Fixed (#7, fix/credentials).** `service_credential()` checked
+  `self._service` and then minted, unguarded, from up to `ssh.max_sessions`
+  threads, so two workers could mint the same identity into the same cache and
+  interleave their default-cache restores. Now: an `RLock` serialises every
+  mint (service and `_kinit`) as one read/mint/lookup/restore transaction with a
+  double-checked fast path, results are published to `_service` last,
+  `note_success`/`order_chain` share a separate small lock, `cleanup()` takes
+  the mint lock and refuses later mints, and `warm_fallbacks()` mints every
+  fallback once before workers start (only with `use_service_keytabs` on; never
+  under `--simulate` or a show-only diagnostic). A barrier test forces twelve
+  simultaneous cold `chain()` calls and fails without the lock.
+  `available_identities()` memoises the `vault-client identities` discovery
+  per manager (it ran once per `chain()`, i.e. per node); the
+  `use_service_keytabs` switch is still read live. An interrupted
+  mint is covered too: `TicketSource.ticket()` restores the default on any
+  `BaseException` (KeyboardInterrupt from Ctrl-C or the SIGTERM handler)
+  before re-raising -- a failed restore is logged, never allowed to replace
+  the interrupt -- and `service_credential()` records the cache path in the
+  cleanup set *before* the mint, so `cleanup()` destroys a half-written cache
+  (and tolerates one that was never created). Not covered: a ticket an
+  interrupted mint put into the macOS API: collection has no name we know, so
+  only the pre-recorded FILE: path is destroyed.
+- ~~**Phase 2 waits for nodes one at a time.**~~ ~~**`run.phase_timeout` is
+  never enforced.**~~ **Fixed (#13, fix/poweron-safety).** `_wait_for_nodes`
+  waits for every node of a stage at once under one stage deadline, `now +
+  min(boot_timeout, phase time left)`, with ssh attempts bounded by a semaphore
+  of `ssh.max_sessions` and starts staggered 0.5 s; 28 never-answering nodes
+  finish within about one `boot_timeout` (fake-clock test). `run.phase_timeout`
+  is a `Deadline` (phases/base.py) on the orchestrator's injectable clock,
+  installed by `Orchestrator.budget()` for phases 1–3: checked before each
+  stage, node, check and power command; every factory-built `SSHTransport` caps
+  each call at `min(configured, remaining)`; the mesh probe skips sources once
+  it has expired. Unreached work is UNKNOWN `not run: phase_timeout expired`.
+  Overrun bound: the one call in flight at expiry. Power commands stay serial.
 - **The single-phase drivers cross-reference rather than list their flags.**
   `man 1 mu2e-power-recovery` is complete; the four single-phase pages point at
   it instead of repeating the options they accept. `build_parser()` exposes 31
@@ -576,7 +790,7 @@ by how much an operator would care.
 - Phase 3's full mesh on the data network is O(N²) SSH-bundled probes; at the
   present 49 data-network nodes that is 2352 ordered pairs, bundled into one
   session per source (49 sessions) — measured, not estimated: a simulated run
-  prints `data: 2352/2352 paths ok`. If the cluster grows substantially,
+  prints `data: 2352/2352 tested paths ok`. If the cluster grows substantially,
   consider anchoring it too.
 - `pytest` takes ~30 s, dominated by deliberate sweep timeouts. It was ~70 s
   until the simulated run stopped issuing real pings (§6.4).
@@ -586,6 +800,153 @@ by how much an operator would care.
   bounded, and since a refused `ssh.login` now skips the node's remaining
   checks it happens once per node rather than thirteen times. Worth knowing
   before pointing a run at a cluster whose sshd is rate-limiting.
+
+The six items below were found in the 2026-09 issue review of the report
+path and are fixed together, as one restructuring of `cli.main`, `run_phases`,
+`write_report` and phase 4 (docs/DESIGN.md, "Report data flow").
+
+- ~~**`--run-id` regeneration mixed two runs.**~~ **Fixed (#3,
+  fix/report-lifecycle).** A report-only invocation always started a new run,
+  attached the `report` phase to it (via the mutable `store.run_id`) while
+  exporting the selected one, so `summary.json` named run 2, `report.json` run
+  1; and it called `prepare_credentials()` first. Now `--run-id` is valid only
+  with `--phase report` and is checked before anything touches credentials (a
+  missing id exits 2, no row, no traceback); report-only runs skip
+  `prepare_credentials` and `RunStore.attach(N)` the run without inserting a
+  row; `start_phase`/`record_event`/`finish_phase`/`finish_run` take an
+  explicit run or phase id, so phase 4's row and events land on run N, and its
+  status and `finished_at` are never changed by regenerating it.
+- ~~**The report was rendered and posted before the run was finished.**~~
+  **Fixed (#4, fix/report-lifecycle).** Every report said `running`,
+  `finished_at: null`, "Finished: in progress", "(still running)".
+  `run_phases` now runs phases 1-3 only; `main` computes the final status and
+  calls `finish_run` (also on the error and interrupt paths) before phase 4
+  `assemble()`s from the final export. The error/interrupt paths render the
+  bundle with the terminal status (never posting or publishing).
+- ~~**Superseded failures were listed as outstanding.**~~ **Fixed (#5,
+  fix/report-lifecycle).** `phase4_report.reconcile()` takes the newest result
+  per `(hostname, check_id)`; superseded failures with a good current result
+  are `resolved` (still in the evidence and timeline); node status is the
+  roll-up of current checks (UNKNOWN if its latest assessment was
+  unreachable). Headline, counts, verdict, next steps, ECL text and the exit
+  status all come from that table plus the latest phase-3 verdict. Phase-2
+  profiles re-check subsets, so an unrechecked phase-1 failure stays
+  outstanding. A phase-1 fail / phase-2 pass run now exits 0.
+- ~~**Per-run archives copied other runs' pages and JSON.**~~ **Fixed (#6,
+  fix/report-lifecycle).** `archive_run` copied every top-level page and all of
+  `data/` into `runs/<id>/`. Replaced by `ReportWriter.render_run(export,
+  narrative, version) -> Bundle`, which empties and renders `runs/<id>/` from
+  that run's stored rows only, with pages only for phases present and a nav
+  that links only those. Each phase's returned verdict/notes/duration is
+  persisted in its row (`data._result`) so pages rebuild from the store. The
+  top level is a latest view: the newest run's bundle, rendered again (its
+  run-history link differs), with absent phases' pages and data removed.
+- ~~**ECL attachments were missing or stale.**~~ **Fixed (#18,
+  fix/report-lifecycle).** Report-only posting attached nothing (pages were
+  rendered after the post), and a full run attached a pre-render of the shared
+  directory. Now: assemble, render the bundle, post with `bundle.paths` (the
+  bundle's HTML pages, `detail.html` included), record the outcome as an event
+  on the run and in the bundle's `report.json`, then publish once. Vault is
+  created lazily only for the post (`phase4_report.make_vault`); `--simulate`
+  never posts; a failed post leaves the local report complete.
+- ~~**`--json` output was not JSON.**~~ **Fixed (#24, fix/report-lifecycle).**
+  Banners, mode notices, tables, report and self-update lines went to stdout
+  before the document; the test sliced from the first `[`. Now stdout carries
+  exactly one document: `{version, run_id, status, exit_code, phases, report}`
+  (with `error` on the failure paths), or the listing for `--list-checks` /
+  `--list-nodes`. Human output goes to stderr, `sys.stdout` is redirected to
+  stderr while the run executes, and the self-update rebuild's output is sent
+  to stderr. The one remaining gap, an interactive `vault login` child
+  inheriting file descriptor 1, was closed in fix/ops: `_interactive_login`
+  now gives the child our stderr as its stdout (stdin and stderr stay
+  inherited so it can prompt), with a test on the stubbed subprocess.
+
+The three items below were fixed in fix/ops, the last branch of the v0.2.0
+stack.
+
+- ~~**The start script's PID file outlived every run, and stop trusted it.**~~
+  **Fixed (#12, fix/ops).** `exec` discarded the shell trap meant to remove
+  `logs/power-recovery.pid`, and start/stop then trusted the integer, which
+  after pid reuse could name an unrelated process for `stop` to TERM and KILL;
+  the PowerShell wrapper recorded its own `$PID`, so `Stop-Process` orphaned the
+  Python driver. The driver now owns an OS lock (`runlock.py`): `os.open`
+  O_CREAT|O_RDWR plus `fcntl.flock(LOCK_EX|LOCK_NB)` on POSIX,
+  `msvcrt.locking(LK_NBLCK)` (at a far offset, so the record stays readable) on
+  Windows, then a `{pid, started_at, cmdline, host}` record written with
+  truncate+write+fsync. `run.lock_file` (default `logs/power-recovery.lock`,
+  resolved like `logging.file`). Taken in `cli._main` after authorisation and
+  before phase 0, only by phases 1–3 without `--simulate` (a rehearsal,
+  `--list-*` and report-only never lock); busy is exit 2 naming the holder;
+  released immediately before the phase-0 re-exec and re-taken by the child;
+  released in `finally`; the file stays. `python -m
+  mu2edaq_power_recovery.runlock status|pid` reports; `pid` prints only while
+  the lock is held. The start scripts just exec; the stop scripts take the pid
+  from the helper and re-check `ps -o args=` (`Get-CimInstance Win32_Process`
+  on Windows) for `mu2edaq_power_recovery`/`mu2e-power` before every signal.
+  Tests use a child-process holder, a live `sleep` as the reused pid, and run
+  the real stop script against a stub venv. Accepted window: the helper's
+  probe holds a free lock for an instant, so a start in that instant sees
+  "busy".
+- ~~**A failed required rebuild still re-executed the updated code.**~~
+  **Fixed (#21, fix/ops).** `SelfUpdater.run()` set `needs_reexec` whatever
+  `rebuild()` returned. Now the full pre-update SHA is recorded; when a pull
+  touched a rebuild glob and the rebuild returns False (bootstrap failed,
+  missing or failed to start), the checkout is reset (`--hard`, or `--keep`
+  when a dirty tree was allowed) to that SHA, `update_failed`/`rolled_back`/
+  `attempted` are set, `after` is the SHA actually running, there is no
+  re-exec, and the message says to run `./bootstrap.sh` and that a partly run
+  bootstrap may have changed the venv. A failed reset sets `reset_failed` and
+  the driver exits 2, because the old process still imports modules lazily
+  from a tree that has moved. `do_self_update` returns the result and
+  `start_run` records it as `version.selfupdate`. Not done: a re-executed
+  child records its own phase-0 result ("already updated"), not the parent's;
+  its `version` still names the revision that ran.
+- **MC-1 inventory scaffolding (#25, fix/ops; the inventory data is still
+  required).** `Topology.validate()` returns `Finding(level, message)`s and is
+  called only by `mu2e-node-inventory --validate` (exit 1 on errors, 0 with
+  warnings, `--json`), never at load. It reuses `valid_hostname`. On the
+  shipped config it reports four warnings — mc1 empty (with its metadata),
+  mc1 ipmi == mc2 ipmi 192.168.157.0/24, teststand data == mc2 data
+  10.226.9.0/24, twelve mc2 nodes in no stage — and one info (the teststand has
+  no stage). See §6.1 for the rest.
+
+### 6.6 v0.2.0 changes and open operator questions
+
+The 2026-09 issue review (#1–#25) was fixed on seven stacked branches, merged
+in this order:
+
+| Branch | Issues | In short |
+|---|---|---|
+| fix/test-guard | #22 | Network guard covers subprocess, sockets and the sweep; raises a BaseException |
+| fix/ipmi | #8 #10 #16 | Thread-safe credential breaker; SEL diffed by record id; `mu2e-ipmi-tool` no longer un-filters |
+| fix/network-checks | #9 #19 #20 | Hostnames validated and quoted; IPMI probed from gateways; untested mesh paths UNKNOWN |
+| fix/credentials | #7 #14 #15 #17 #23 | Serialised, typed credential guard; one credential bootstrap for driver and diagnostics |
+| fix/poweron-safety | #1 #2 #11 #13 | Scoped phase 2 with verify-only predecessors; stage-name errors; per-invocation live authorisation; `phase_timeout` enforced |
+| fix/report-lifecycle | #3 #4 #5 #6 #18 #24 | Run finished before reporting; per-run bundles from the store; reconciled current state; pure `--json` |
+| fix/ops | #12 #21 (#25 partly) | Run lock and identity-checked stop scripts; rollback on a failed rebuild; MC-1 scaffolding and `--validate`; `vault login` stdout to stderr; version 0.2.0 |
+
+Open questions for operations (none blocks the merge):
+
+1. **mu2e-trk-15..18 are in the MC-2 inventory but in no power-sequence
+   stage** (the `readout` stage lists trk-01..14, as the specification does),
+   and so are calo-12..14, dcs-03, extmon-01 and worker-01..03. Phase 2 never
+   powers them. Deliberate, or should `readout` (or a new stage) include them?
+   `--validate` reports them as a warning; the sequence is unchanged.
+2. **Duplicate subnets.** mc1's IPMI subnet is the same as mc2's
+   (192.168.157.0/24), and the teststand's data subnet is the same as mc2's
+   (10.226.9.0/24). If they really are shared, `net.interfaces` cannot tell the
+   sites apart by address; if not, the topology is wrong. Confirm with the
+   network owner.
+3. **The SEL parser's sample output** (`checks/parsers.py`, `ipmitool sel
+   list`) should be replaced by a capture from a live BMC, per the project's
+   parsers-against-real-output rule.
+4. **Assumed decisions to confirm** (taken as the recommended options while
+   the author was away): #1 predecessor stages are verify-only and stop the run
+   if not up; #7 service keytabs are warmed before workers start only when
+   `use_service_keytabs` is on, never in `--simulate` or show-only
+   diagnostics; #11 `--execute` alone arms, and config `run.dry_run: false`
+   alone exits 2 (it only enables the ARM-token path).
+5. **MC-1**: the inventory itself (§6.1).
 
 ---
 
@@ -614,8 +975,14 @@ Recorded here in brief; the reasoning is in [docs/DESIGN.md](docs/DESIGN.md).
 | Static HTML report | A Flask/Litestar service | Must be readable from a laptop, copyable to a web area, attachable to a logbook entry |
 | Re-running a phase appends to the store | Overwrite | A second assessment must not erase the evidence that a repair was needed |
 | Phase 4 re-reads the store | Keep results in memory | Makes the report regenerable hours later without touching the cluster |
+| Finish the run, then assemble, render, post, publish | Render during the run | The report is the record; it must carry the final status, and the logbook must get the finished bundle (#4, #18) |
+| Per-run bundles rendered from the store | Copy the shared top level into `runs/<id>/` | A copy inherits other runs' pages; a render from stored rows cannot (#6) |
+| Current state = newest result per node and check | Every historical failure is outstanding | A failure a later phase re-checked and passed is resolved, not a to-do (#5) |
 | C++ only for the reachability sweep | C++ throughout, or none | It is the one place where process/GIL overhead dominates; everything else is I/O-bound |
 | Protected-host refusal is not overridable | A `--force` flag | Powering down a gateway from a remote recovery session is never the intent |
+| The driver owns an OS lock; the record is believed only while it is held | A PID file written by the start script | A trap does not survive `exec`, and a bare integer can be reused; the kernel releases a lock however the process ends (#12) |
+| A failed required rebuild rolls the checkout back and does not re-exec | Re-exec anyway, or leave the tree updated | New code against the old venv/extension can fail at startup just before a recovery (#21) |
+| `validate()` only on request | Validate at load | An incomplete inventory (MC-1) is normal and must not stop a run; the load-time hostname rule already refuses what cannot run (#25) |
 | No automatic remediation | Restart services, remount | An outage is not the moment to discover what an automatic fix does when its assumptions fail |
 
 ---
@@ -624,14 +991,15 @@ Recorded here in brief; the reasoning is in [docs/DESIGN.md](docs/DESIGN.md).
 
 | Phase | Implementation | Tests | Docs | Live |
 |---|---|---|---|---|
-| 0 — self-update | ✅ | ✅ 13 | ✅ | ✅ fetch/up-to-date verified against origin |
+| 0 — self-update | ✅ | ✅ 24 | ✅ | ✅ fetch/up-to-date verified against origin |
 | 1 — assess | ✅ | ✅ 7 + 39 check tests | ✅ | ◐ SSH, Kerberos and BMC reads verified; no full phase run |
 | 2 — power on | ✅ | ✅ 8 + 43 IPMI tests | ✅ | ⬜ nothing has been switched on |
-| 3 — network | ✅ | ✅ 4 | ✅ | ⬜ |
+| 3 — network | ✅ | ✅ 7 + 24 mesh tests | ✅ | ⬜ |
 | 4 — report | ✅ | ✅ 4 + 20 report tests | ✅ | ⬜ |
 | Report site | ✅ | ✅ 20 | ✅ | ⬜ |
 | Diagnostics | ✅ | manual | ✅ | ✅ all four run against the live cluster |
 | C/C++ library | ✅ | ✅ 7 groups | ✅ | n/a |
-| Credentials (Kerberos, Vault) | ✅ | ✅ 68 + 11 | ✅ | ✅ chain, collection caches and Vault reads verified |
+| Run lock / start-stop | ✅ | ✅ 21 | ✅ | ⬜ |
+| Credentials (Kerberos, Vault) | ✅ | ✅ 86 + 16 + 12 | ✅ | ✅ chain, collection caches and Vault reads verified |
 
 ✅ done · ◐ partly · ⬜ pending live-cluster verification (§6.3)

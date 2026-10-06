@@ -120,3 +120,20 @@ def test_provenance_records_where_a_value_came_from(config_dir):
                environ={"MU2E_POWER_RECOVERY_SSH_CONNECT_TIMEOUT": "42"})
     sources = {entry["path"]: entry["source"] for entry in s.provenance()}
     assert sources["ssh.connect_timeout"] == "environment"
+
+
+def test_the_arm_token_is_not_a_configuration_key(config_dir):
+    # MU2E_POWER_RECOVERY_ARM is the per-invocation live-run token (#11): it
+    # would otherwise be ingested as an unknown key 'arm'.
+    s = S.load(config_file=config_dir / "power-recovery.yaml",
+               env_file=Path("/nonexistent"), environ={S.ARM_ENV: "x"})
+    assert s.get("arm") is None
+    assert all(entry["path"] != "arm" for entry in s.provenance())
+
+
+def test_the_arm_token_in_dotenv_is_an_error(tmp_path, config_dir):
+    env = tmp_path / ".env"
+    env.write_text(f"{S.ARM_ENV}=label\n")
+    with pytest.raises(S.ConfigError, match="per invocation"):
+        S.load(config_file=config_dir / "power-recovery.yaml", env_file=env,
+               environ={})

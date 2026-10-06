@@ -1,4 +1,4 @@
-.TH MU2EDAQ-POWER-SEQUENCE.YAML 5 "2026-09-18" "mu2edaq-power-recovery 0.1.0" "File Formats"
+.TH MU2EDAQ-POWER-SEQUENCE.YAML 5 "2026-09-29" "mu2edaq-power-recovery 0.2.0" "File Formats"
 .SH NAME
 power-sequence.yaml \- phase 2 power-on stage order for the Mu2e DAQ
 .SH SYNOPSIS
@@ -37,22 +37,13 @@ Short identifier, used in the report and by
 .BR \-\-from / \-\-until
 (and by
 .IR run.from_stage / run.until_stage ,
-which they override). Matching is exact and a name that matches nothing is
-.I not
-an error:
-.B \-\-from
-falls back to the first stage and
-.B \-\-until
-to the last, so a typo runs more of the sequence than intended, not less.
-Check the stage list with
-.B \-\-until
-naming the last stage you want and no
-.BR \-\-execute .
-A stage with no
-.I name
-is reported as
-.B unnamed
-and cannot be selected.
+which they override). Matching is exact, and a name that matches nothing, a
+reversed range, a stage with no
+.IR name ,
+or two stages with the same name are errors: the run exits 2 before any
+credential is acquired and lists the valid names. Every stage's node list is
+validated when the plan is made, so a bad hostname anywhere in this file stops
+the run before the first stage rather than part-way through.
 .TP
 .I title
 Human label for the report tables.
@@ -113,6 +104,13 @@ checklist.
 .I boot_timeout
 Seconds to wait for SSH to answer after
 .BR "chassis power on" .
+Every node of the stage is waited for at once under one deadline of now +
+.RI min( boot_timeout ", " run.phase_timeout " time left),"
+with at most
+.I ssh.max_sessions
+ssh attempts in flight, so a stage of nodes that never answer costs one
+.IR boot_timeout ,
+not one per node.
 .TP
 .I settle
 Seconds to wait after SSH answers before running checks, so that late-starting
