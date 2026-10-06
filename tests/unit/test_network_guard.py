@@ -132,3 +132,14 @@ def test_a_swallowed_block_still_fails_the_test(no_real_network):
 def test_the_opt_out_marker_disables_the_guard():
     # Nothing blocked is run here; the point is that the guard is not armed.
     assert subprocess.Popen.__init__.__name__ != "guarded_popen"
+
+
+@pytest.mark.parametrize("argv", [
+    ["/usr/bin/env", "ssh", "h"], ["env", "-i", "klist"], ["timeout", "5", "ping", "h"],
+    ["sudo", "ipmitool"], ["nice", "ssh"], ["xargs", "ssh"],
+    ["bash", "-lc", "ssh h"], ["sh", "-ec", "exec ssh h"], ["sh", "-c", "command klist"],
+])
+def test_wrappers_do_not_hide_a_blocked_command(argv):
+    """PR #26 review: each of these returned only the wrapper's name."""
+    from tests.conftest import BLOCKED_COMMANDS, _command_words
+    assert BLOCKED_COMMANDS & set(_command_words(argv, shell=False)), argv

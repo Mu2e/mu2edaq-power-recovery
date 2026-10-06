@@ -115,8 +115,9 @@ def _command_words(args, shell: bool) -> list:
 
     A list whose head is a shell with ``-c`` is looked into, as is a string
     run with ``shell=True``: ``["/bin/sh", "-c", "ping host"]`` is a ping.
-    Each ``;``/``&&``/``||``/``|`` segment contributes its first word, after
-    any ``env`` and ``VAR=value`` prefixes.
+    Every token counts, not only each segment's first word, so a wrapper
+    (``env``, ``timeout``, ``sudo``, ``exec``, ...) cannot hide the command
+    it runs (PR #26 review).
     """
     import re
     import shlex
@@ -131,8 +132,9 @@ def _command_words(args, shell: bool) -> list:
             while tokens and (tokens[0] == "env" or
                               re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tokens[0])):
                 tokens.pop(0)
-            if tokens:
-                words.append(tokens[0].rsplit("/", 1)[-1])
+            # Every token of the segment, for the same reason as below:
+            # "command klist", "exec ssh h", "timeout 5 ping gw".
+            words.extend(t.rsplit("/", 1)[-1] for t in tokens)
         return words
 
     if isinstance(args, (str, bytes)):
@@ -144,11 +146,19 @@ def _command_words(args, shell: bool) -> list:
     head = argv[0].rsplit("/", 1)[-1]
     if shell:
         return segments(" ".join(argv))
-    if head in _SHELLS and "-c" in argv[1:]:
-        index = argv.index("-c", 1)
-        if index + 1 < len(argv):
-            return [head] + segments(argv[index + 1])
-    return segments(" ".join(shlex.quote(a) for a in argv))[:1] or [head]
+    words = [head]
+    # A shell flag cluster containing c (-c, -lc, -ec) introduces a script.
+    for index, arg in enumerate(argv[1:], start=1):
+        if head in _SHELLS and re.match(r"^-[a-zA-Z]*c[a-zA-Z]*$", arg) \
+                and index + 1 < len(argv):
+            words += segments(argv[index + 1])
+            break
+    # Every token, not just the first: a wrapper (env, /usr/bin/env, timeout,
+    # sudo, nice, nohup, xargs, exec, command) runs its argument as the
+    # command, and naming each wrapper would be a list that is never complete.
+    # A test that passes a blocked name as a plain argument is told so.
+    words += [a.rsplit("/", 1)[-1] for a in argv[1:]]
+    return words
 
 
 def _offline_address(host) -> bool:
