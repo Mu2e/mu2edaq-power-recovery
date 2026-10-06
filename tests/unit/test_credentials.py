@@ -316,6 +316,9 @@ def test_no_kerberos_package_means_no_service_identities(settings, tmp_path):
     m = KerberosManager(settings, cache_dir=tmp_path / "caches")
     m.tickets.resolve = lambda command: None
     m.tickets._available = False
+    # operator_credential() reads the ambient default; without this stub the
+    # test ran the developer's real klist (caught by the #22 Popen guard).
+    m.tickets.default_principal = lambda *args, **kwargs: None
     assert m.available_identities() == ["mu2edaq", "mu2eshift"]   # configured
     assert [c.name for c in m.chain()] == ["general"]             # but unusable
 

@@ -13,12 +13,28 @@ import pytest
 from mu2edaq_power_recovery.selfupdate import REEXEC_GUARD, SelfUpdater
 
 
+@pytest.fixture(autouse=True)
+def hermetic_git(monkeypatch):
+    """Keep the developer's git configuration out of these repositories.
+
+    ``init.defaultBranch`` in particular decides what a bare origin's HEAD
+    names; on a host where it is unset (git's default is still ``master``)
+    the clones below checked out an unborn branch and the pushes were refused.
+    """
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", "/dev/null")
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+
+
 @pytest.fixture
 def repo(tmp_path):
     """A small git repository with an 'origin' it can be behind."""
     origin = tmp_path / "origin"
     work = tmp_path / "work"
     subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
+    # Name the branch explicitly rather than rely on init.defaultBranch;
+    # symbolic-ref rather than ``init -b`` so git older than 2.28 works too.
+    subprocess.run(["git", "-C", str(origin), "symbolic-ref", "HEAD",
+                    "refs/heads/main"], check=True)
     subprocess.run(["git", "clone", "-q", str(origin), str(work)], check=True)
     for key, value in (("user.email", "t@example.invalid"), ("user.name", "Test")):
         subprocess.run(["git", "-C", str(work), "config", key, value], check=True)
@@ -37,8 +53,8 @@ def repo(tmp_path):
 def advance_origin(repo, message="second"):
     """Add a commit to origin that the working copy does not have."""
     clone = repo.parent / "other"
-    subprocess.run(["git", "clone", "-q", str(repo.parent / "origin"), str(clone)],
-                   check=True)
+    subprocess.run(["git", "clone", "-q", "-b", "main", str(repo.parent / "origin"),
+                    str(clone)], check=True)
     for key, value in (("user.email", "t@example.invalid"), ("user.name", "Test")):
         subprocess.run(["git", "-C", str(clone), "config", key, value], check=True)
     (clone / "NEW.md").write_text("two\n")

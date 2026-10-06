@@ -99,9 +99,106 @@ def make_context(settings, topology, factory, checks_config):
     return _make
 
 
+#: Commands that reach the DAQ network, Kerberos or Vault.  A test that runs
+#: one of these for real is contacting infrastructure, whatever it believes the
+#: transport underneath to be.
+BLOCKED_COMMANDS = frozenset((
+    "ssh", "scp", "rsync", "ping", "ping6", "ipmitool", "kinit", "klist",
+    "kdestroy", "kswitch", "vault", "get-kerberos-ticket", "vault-client",
+    "mu2e-probe", "curl", "wget", "nc"))
+
+_SHELLS = frozenset(("sh", "bash", "zsh", "dash", "ksh", "csh", "tcsh"))
+
+
+def _command_words(args, shell: bool) -> list:
+    """Every command word a Popen call would execute, as basenames.
+
+    A list whose head is a shell with ``-c`` is looked into, as is a string
+    run with ``shell=True``: ``["/bin/sh", "-c", "ping host"]`` is a ping.
+    Each ``;``/``&&``/``||``/``|`` segment contributes its first word, after
+    any ``env`` and ``VAR=value`` prefixes.
+    """
+    import re
+    import shlex
+
+    def segments(script: str) -> list:
+        words = []
+        for segment in re.split(r"\|\||&&|[;|&\n()`]|\$\(", script):
+            try:
+                tokens = shlex.split(segment)
+            except ValueError:
+                tokens = segment.split()
+            while tokens and (tokens[0] == "env" or
+                              re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tokens[0])):
+                tokens.pop(0)
+            if tokens:
+                words.append(tokens[0].rsplit("/", 1)[-1])
+        return words
+
+    if isinstance(args, (str, bytes)):
+        text = args.decode() if isinstance(args, bytes) else args
+        return segments(text) if shell else [text.rsplit("/", 1)[-1]]
+    argv = [a.decode() if isinstance(a, bytes) else str(a) for a in args]
+    if not argv:
+        return []
+    head = argv[0].rsplit("/", 1)[-1]
+    if shell:
+        return segments(" ".join(argv))
+    if head in _SHELLS and "-c" in argv[1:]:
+        index = argv.index("-c", 1)
+        if index + 1 < len(argv):
+            return [head] + segments(argv[index + 1])
+    return segments(" ".join(shlex.quote(a) for a in argv))[:1] or [head]
+
+
+def _offline_address(host) -> bool:
+    """True for addresses a test may connect to: loopback and TEST-NET-1.
+
+    192.0.2.0/24 (RFC 5737) is never routed to a live host, which is what
+    makes it useful for timeout tests; ``.invalid`` never resolves.
+    """
+    import ipaddress
+    if host in ("localhost", "") or str(host).endswith(".invalid"):
+        return True
+    try:
+        address = ipaddress.ip_address(str(host).split("%", 1)[0])
+    except ValueError:
+        return False
+    return address.is_loopback or address in ipaddress.ip_network("192.0.2.0/24")
+
+
+class NetworkGuard:
+    """What the autouse guard has blocked during one test.
+
+    A block raises :class:`pytest.fail.Exception`, which derives from
+    BaseException, so production code's ``except Exception`` -- and there is a
+    good deal of it on exactly these paths (the gateway TCP pre-filter, every
+    Vault call) -- cannot swallow it.  Each block is also recorded here and the
+    test fails at teardown, which catches a ``except BaseException`` too.
+    Meta-tests that expect a block call :meth:`expect` to consume it.
+    """
+
+    def __init__(self):
+        self.violations = []
+
+    def block(self, what: str):
+        message = (f"test tried to {what} for real\n"
+                   f"Stub it, or mark the test @pytest.mark.allow_network.")
+        self.violations.append(message)
+        pytest.fail(message, pytrace=False)
+
+    def expect(self, fragment: str) -> str:
+        """Consume the recorded block matching *fragment*; fail if there is none."""
+        for index, message in enumerate(self.violations):
+            if fragment in message:
+                return self.violations.pop(index)
+        pytest.fail(f"expected the network guard to block {fragment!r}; "
+                    f"recorded: {self.violations}")
+
+
 @pytest.fixture(autouse=True)
 def no_real_network(monkeypatch, request):
-    """Fail any test that tries to shell out to ssh, ping, ipmitool or kinit.
+    """Fail any test that reaches the DAQ network, Kerberos or Vault.
 
     The suite claims to contact nothing -- no DAQ network, no Kerberos ticket,
     no Vault -- and that claim is the reason it can be run before an outage.
@@ -117,26 +214,77 @@ def no_real_network(monkeypatch, request):
     A test that pings a DAQ host is a test that contacts the DAQ network,
     whatever the transport underneath claims to be.
 
+    Three layers, because production code reaches the outside three ways:
+
+    * ``subprocess.Popen`` -- every ``run``/``call``/``check_output`` and
+      ``LocalTransport`` goes through it, including the credential commands
+      ``creds/ticketsource.py`` and ``creds/vault.py`` run directly;
+    * ``socket.connect``/``connect_ex`` to anything but loopback or TEST-NET-1
+      -- this is what stops ``hvac`` (through requests/urllib3) and the Python
+      sweep backend;
+    * ``sweep.sweep`` -- the native backend opens its sockets in C++, where
+      the socket patch cannot see them.
+
     Mark a test with @pytest.mark.allow_network to opt out.
     """
+    guard = NetworkGuard()
     if request.node.get_closest_marker("allow_network"):
+        yield guard
         return
 
-    from mu2edaq_power_recovery.transport import local as local_module
+    import socket
+    import subprocess
 
-    blocked = ("ssh", "scp", "rsync", "ping", "ping6", "ipmitool", "kinit",
-               "klist", "kdestroy", "vault", "get-kerberos-ticket",
-               "vault-client")
-    original = local_module.LocalTransport.run
+    from mu2edaq_power_recovery import sweep as sweep_module
 
-    def guarded(self, command, *args, **kwargs):
-        rendered = command if isinstance(command, str) else " ".join(
-            str(part) for part in command)
-        first = rendered.strip().split()[0].rsplit("/", 1)[-1] if rendered.strip() else ""
-        if first in blocked:
-            raise AssertionError(
-                f"test tried to run {first!r} for real: {rendered[:120]}\n"
-                f"Stub the transport, or mark the test @pytest.mark.allow_network.")
-        return original(self, command, *args, **kwargs)
+    original_init = subprocess.Popen.__init__
 
-    monkeypatch.setattr(local_module.LocalTransport, "run", guarded)
+    def guarded_popen(self, args, *rest, **kwargs):
+        shell = bool(kwargs.get("shell", False))
+        for word in _command_words(args, shell):
+            if word in BLOCKED_COMMANDS:
+                rendered = args if isinstance(args, str) else " ".join(
+                    str(a) for a in args)
+                guard.block(f"run {word!r}: {rendered[:120]}")
+        return original_init(self, args, *rest, **kwargs)
+
+    monkeypatch.setattr(subprocess.Popen, "__init__", guarded_popen)
+
+    original_connect = socket.socket.connect
+    original_connect_ex = socket.socket.connect_ex
+
+    def _check(sock, address):
+        if sock.family == getattr(socket, "AF_UNIX", object()):
+            return
+        host = address[0] if isinstance(address, tuple) else address
+        if not _offline_address(host):
+            guard.block(f"connect to {address!r}")
+
+    def guarded_connect(self, address):
+        _check(self, address)
+        return original_connect(self, address)
+
+    def guarded_connect_ex(self, address):
+        _check(self, address)
+        return original_connect_ex(self, address)
+
+    monkeypatch.setattr(socket.socket, "connect", guarded_connect)
+    monkeypatch.setattr(socket.socket, "connect_ex", guarded_connect_ex)
+
+    original_sweep = sweep_module.sweep
+
+    def guarded_sweep(hosts, *args, **kwargs):
+        for host in hosts:
+            if not _offline_address(host):
+                guard.block(f"sweep {host!r}")
+        return original_sweep(hosts, *args, **kwargs)
+
+    monkeypatch.setattr(sweep_module, "sweep", guarded_sweep)
+
+    yield guard
+
+    if guard.violations:
+        leftover = list(guard.violations)
+        guard.violations.clear()
+        pytest.fail("network guard blocked, and the code under test swallowed "
+                    "it:\n" + "\n".join(leftover), pytrace=False)
