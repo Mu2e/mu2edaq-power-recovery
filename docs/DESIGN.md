@@ -769,7 +769,7 @@ needs an answer that does not involve reading four files.
 
 | Mechanism | What it stops |
 |---|---|
-| Live runs need per-invocation authorisation: `--execute`, or `MU2E_POWER_RECOVERY_ARM` = configured `run.label` with `run.dry_run: false`; config `dry_run: false` alone exits 2; the token is refused in `config/.env` (`cli.authorize_live`) | A power command armed by a persistent file, or issued by accident |
+| Live runs need per-invocation authorisation: `--execute`, or `MU2E_POWER_RECOVERY_ARM` = configured `run.label` with `run.dry_run: false`; config `dry_run: false` alone exits 2 for any invocation that includes phase 2 (read-only phases always run dry and are not refused); the token is refused in `config/.env` (`cli.authorize_live`) | A power command armed by a persistent file, or issued by accident |
 | `--simulate` overrides everything, including `--execute` and the token | A rehearsal that turns out not to be one |
 | Phase-2 plan (`plan_sequence`) made before credentials; unknown/reversed stage names and out-of-scope `--node` are errors | A typo or a scoped command widening a power-on |
 | `--node` predecessors verify-only; `_power_stage` refuses hosts outside `allowed_power` | Powering nodes the operator did not name |

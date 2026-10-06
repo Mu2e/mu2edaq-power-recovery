@@ -70,7 +70,9 @@ live power commands
                                  run.dry_run: false in the configuration and a
                                  run.label equal to the token.
   run.dry_run: false on its own (YAML, config/.env or environment) does not
-  arm anything: it is refused with exit 2. --simulate always wins.
+  arm anything: an invocation that includes phase 2 (poweron, all) is refused
+  with exit 2. The read-only drivers (assess, network, report) cannot issue a
+  power command and always run as a dry run. --simulate always wins.
 
 scope in phase 2
   --location drops stages in other locations. --node cuts the stages holding
@@ -278,12 +280,21 @@ def _dry_run_source(settings: Any) -> str:
 
 
 def authorize_live(settings: Any, args: argparse.Namespace,
-                   environ: Mapping[str, str]) -> Authorization:
+                   environ: Mapping[str, str],
+                   phases: Optional[Sequence[str]] = None) -> Authorization:
     """Decide whether this invocation may issue state-changing IPMI commands.
 
     Two independent conditions, one of which must be given *per invocation*:
 
     * ``--simulate``: never live, whatever else is set.
+    * *phases* given and without ``poweron`` (``mu2e-power-state``,
+      ``mu2e-power-netcheck``, ``mu2e-power-report``, or ``--phase`` assess,
+      network or report): a dry run, whatever the configuration, flag or
+      token says, with an info note when one of them asked for live mode.
+      No power command is reachable from those phases, so there is nothing to
+      authorise -- and refusing them would make every read-only driver exit 2
+      at a site that set ``run.dry_run: false`` to use the token path.
+      *phases* None means "may include power-on": the gate below applies.
     * ``--execute``: live. The shipped configuration is ``run.dry_run: true``
       and every documented example uses the bare flag, so the flag alone
       authorises; a stray ARM token beside it is ignored with a warning.
@@ -312,6 +323,16 @@ def authorize_live(settings: Any, args: argparse.Namespace,
 
     if args.simulate:
         decision = Authorization(False, "--simulate")
+    elif phases is not None and "poweron" not in phases:
+        decision = Authorization(False, "read-only invocation (no power-on "
+                                        "phase)")
+        asked = [what for what, on in (("--execute", args.execute),
+                                       (ARM_ENV, token is not None),
+                                       ("run.dry_run: false", config_live)) if on]
+        if asked:
+            log.info("%s ignored: this invocation (phase %s) cannot issue a "
+                     "power command, so it runs as a dry run",
+                     ", ".join(asked), ", ".join(phases))
     elif args.execute:
         if token is not None:
             log.warning("%s is set but ignored: --execute already authorises "
@@ -721,7 +742,8 @@ def _main(args: argparse.Namespace, out: Any, data_out: Any,
     authorization: Optional[Authorization] = None
     if not args.list_nodes:
         try:
-            authorization = authorize_live(settings, args, os.environ)
+            authorization = authorize_live(settings, args, os.environ,
+                                           phases=phase_names)
         except LiveAuthorizationError as exc:
             return fail(str(exc))
 

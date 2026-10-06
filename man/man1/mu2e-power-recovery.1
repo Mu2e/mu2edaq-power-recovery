@@ -609,7 +609,27 @@ From the YAML file,
 or
 .BR MU2E_POWER_RECOVERY_RUN_DRY_RUN=false ,
 with neither of the above: exit 2, with a message naming where the setting came
-from and both ways to authorise.
+from and both ways to authorise \(em for an invocation that includes phase 2
+.RB ( "\-\-phase poweron" ,
+.BR "\-\-phase all" ,
+.BR mu2e-power-on ).
+.TP
+.B Read-only invocations
+.BR "\-\-phase assess" ,
+.BR network ,
+.B report
+and their drivers
+.RB ( mu2e-power-state ,
+.BR mu2e-power-netcheck ,
+.BR mu2e-power-report )
+cannot issue a power command, so nothing is authorised and nothing is
+refused: they always run as a dry run, whatever
+.IR run.dry_run ,
+.B \-\-execute
+or the token say, and log an info line naming what was ignored. Refusing them
+would stop every read-only driver at a site that set
+.I run.dry_run: false
+for the token path.
 .PP
 The decision is made before phase 0 and before any credential. A live run
 prints

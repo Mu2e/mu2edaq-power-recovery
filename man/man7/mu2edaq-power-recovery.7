@@ -149,7 +149,9 @@ or
 equal to the configured
 .IR run.label );
 .I run.dry_run: false
-in configuration alone is refused. A simulated run cannot be armed at all.
+in configuration alone is refused for any invocation that includes phase 2;
+the read-only phases always run as a dry run. A simulated run cannot be armed
+at all.
 .IP \(bu 2
 Phase 2 powers only what
 .BR \-\-node / \-\-location / \-\-from / \-\-until

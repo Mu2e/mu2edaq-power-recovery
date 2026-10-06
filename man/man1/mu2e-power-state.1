@@ -197,16 +197,15 @@ At least one node failed a check or could not be reached.
 .B 2
 The survey could not start, or no gateway could be logged in to.
 .I run.dry_run: false
-set only in configuration (YAML,
-.I config/.env
-or
-.BR MU2E_POWER_RECOVERY_RUN_DRY_RUN )
-without
+in configuration does
+.I not
+exit 2 here: this command cannot issue a power command, so it always runs as
+a dry run, whatever the configuration,
 .B \-\-execute
-or the
+or
 .B MU2E_POWER_RECOVERY_ARM
-token also exits 2 here, although this command issues no power command: the
-authorisation check is the same for every entry point
+say (an info line in the log notes what was ignored). The live-run gate
+applies to invocations that include phase 2
 (see
 .BR mu2e-power-recovery (1),
 .BR "LIVE RUNS" ).

@@ -127,8 +127,9 @@ or when the process environment carries
 .BI MU2E_POWER_RECOVERY_ARM= label
 equal to a non-empty
 .IR run.label .
-With this key false and neither of those, the run exits 2 and says both ways to
-authorise. A token given while this key is true, with no label, or with the
+With this key false and neither of those, a run that includes phase 2 exits 2
+and says both ways to authorise; the read-only phases (assess, network,
+report) cannot issue a power command and run as a dry run regardless. A token given while this key is true, with no label, or with the
 wrong label, also exits 2.
 .B \-\-execute
 works whatever this key says. The token is never a configuration key and is a

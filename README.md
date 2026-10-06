@@ -134,8 +134,9 @@ This tool can switch machines off, so the destructive path is gated and fenced:
   unattended run, `MU2E_POWER_RECOVERY_ARM=<run.label>` in the process
   environment together with `run.dry_run: false` and a matching `run.label` in
   the configuration. `run.dry_run: false` on its own — in the YAML,
-  `config/.env` or the environment — arms nothing: the run exits 2 and says
-  how to authorise. The token is never read from `config/.env` (that is a
+  `config/.env` or the environment — arms nothing: a run that includes phase 2
+  exits 2 and says how to authorise (the read-only drivers cannot power
+  anything and always run as a dry run). The token is never read from `config/.env` (that is a
   configuration error), so no persistent file can arm a later bare invocation.
   A live run prints `LIVE RUN -- power commands WILL be issued (authorised by
   ...)` and records what armed it.

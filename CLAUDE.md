@@ -37,7 +37,9 @@ built by CMake to `build/mu2e-probe`, not a console script).
 Live power commands need this invocation's authorisation: `--execute`, or
 `MU2E_POWER_RECOVERY_ARM=<run.label>` in the process environment with
 `run.dry_run: false` and that `run.label` configured. `run.dry_run: false`
-alone exits 2 (`cli.authorize_live`), for every entry point.
+alone exits 2 (`cli.authorize_live`) for any invocation that includes phase 2;
+the read-only phases (assess, network, report) are always a dry run and are
+not refused.
 
 **Run lock.** Phases 1-3 without `--simulate` take an exclusive OS lock on
 `run.lock_file` (`logs/power-recovery.lock`, `runlock.py`) in `cli._main`

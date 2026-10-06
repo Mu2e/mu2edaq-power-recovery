@@ -193,7 +193,10 @@ line or in the configuration arms a run by itself. An unattended run that
 cannot pass the flag sets `run.dry_run: false` and `run.label: <label>` in its
 configuration and `MU2E_POWER_RECOVERY_ARM=<label>` in its own environment
 (never in `config/.env`, which is refused). `run.dry_run: false` with neither
-exits 2 with instructions.
+exits 2 with instructions. That gate applies to invocations that include phase
+2; `mu2e-power-state`, `mu2e-power-netcheck` and `mu2e-power-report` cannot
+issue a power command and always run as a dry run, so a site that sets
+`run.dry_run: false` for the token path can still use them.
 
 It will work through the stages in order and stop at the first one that does
 not meet its requirement.
@@ -574,7 +577,8 @@ Ctrl-C (SIGINT) takes the same clean path as SIGTERM.
   (`mu2e-node-inventory --protected` lists them.) Powering one *on* is allowed.
 - Any power command at all unless this invocation authorised it: `--execute`,
   or `MU2E_POWER_RECOVERY_ARM` equal to the configured `run.label` with
-  `run.dry_run: false`. `run.dry_run: false` alone is refused (exit 2), and the
+  `run.dry_run: false`. `run.dry_run: false` alone is refused (exit 2) for any
+  invocation that includes phase 2, and the
   token is refused in `config/.env`. A live run prints `LIVE RUN -- power
   commands WILL be issued (authorised by ...)`.
 - A power command to a node outside `--node`/`--location`, or to a
