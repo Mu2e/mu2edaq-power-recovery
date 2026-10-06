@@ -540,7 +540,12 @@ Where the static site is written, and its heading.
 .I keep_runs
 How many per-run report bundles to keep under
 .IR output_dir/runs/ ;
-each is rendered from that run's stored data alone.
+each is rendered from that run's stored data alone. Pruning keeps the newest
+.I keep_runs
+by run id and, in addition, the bundle just rendered, so regenerating an old
+run neither deletes its own bundle nor a newer one.
+.I 0
+keeps every bundle.
 .TP
 .I publish
 .IR enabled ", " method

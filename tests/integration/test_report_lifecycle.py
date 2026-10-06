@@ -421,6 +421,33 @@ def test_report_only_post_attaches_the_run_bundle(tmp_path, ecl_stub, monkeypatc
     assert _run_count(tmp_path) == 2
 
 
+def test_regenerating_an_old_run_keeps_its_bundle_and_newer_ones(
+        tmp_path, ecl_stub, monkeypatch):
+    # keep_runs=1: rendering run 2 prunes runs/1. Regenerating run 1 used to
+    # render runs/1 and then prune it as the oldest, leaving only runs/2, so
+    # --post-ecl attached files that had just been deleted.
+    _module, posted = ecl_stub
+    monkeypatch.setenv("MU2E_POWER_RECOVERY_REPORT_KEEP_RUNS", "1")
+    assert run_cli(tmp_path, "--phase", "assess", "--node", "mu2e-trk-01") == 0
+    assert run_cli(tmp_path, "--phase", "assess", "--node", "mu2e-trk-02") == 0
+    runs_dir = tmp_path / "html" / "runs"
+    assert sorted(d.name for d in runs_dir.iterdir()) == ["2"]
+    _as_real_runs(tmp_path)
+    _no_credentials_from_here(monkeypatch)
+
+    assert run_cli(tmp_path, "--phase", "report", "--run-id", "1", "--post-ecl",
+                   simulate=False) == 0
+    assert sorted(d.name for d in runs_dir.iterdir()) == ["1", "2"]
+    files = posted[0]["files"]
+    assert files and all(Path(f).exists() for f in files)
+    assert all(f.startswith(str(runs_dir / "1")) for f in files)
+
+    # The next render of a newer run applies keep_runs again.
+    assert run_cli(tmp_path, "--phase", "report", "--run-id", "2",
+                   simulate=False) == 0
+    assert sorted(d.name for d in runs_dir.iterdir()) == ["2"]
+
+
 def test_a_failed_post_leaves_the_complete_local_report(tmp_path, ecl_stub):
     module, _posted = ecl_stub
     module.fail = True

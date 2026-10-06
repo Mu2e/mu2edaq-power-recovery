@@ -171,7 +171,8 @@ class ReportWriter:
         the top level is left as it is. *report* is the phase-4 result as a
         dict (for data/report.json); without it one is built from the stored
         report phase. ``runs.html`` is refreshed from *runs* either way, and
-        ``report.keep_runs`` is applied.
+        ``report.keep_runs`` is applied -- never to the bundle just rendered,
+        which the caller is about to attach to a logbook entry.
         """
         run = export.get("run") or {}
         rid = int(run["id"])
@@ -195,7 +196,7 @@ class ReportWriter:
             bundle.latest, bundle.latest_dir = True, self.output_dir
         if runs is not None:
             self.write_runs(runs)
-        self._prune_runs()
+        self._prune_runs(protect=rid)
         return bundle
 
     def _render_set(self, directory: Path, root: str, export: Dict[str, Any],
@@ -333,7 +334,16 @@ class ReportWriter:
             self._write("sitemap", {"version": version}),
         ]
 
-    def _prune_runs(self) -> None:
+    def _prune_runs(self, protect: Optional[int] = None) -> None:
+        """Keep the newest ``report.keep_runs`` bundles, and *protect*.
+
+        *protect* is the run just rendered. Regenerating an old run used to
+        render its bundle and then prune it straight away as one of the
+        oldest, so ``--post-ecl`` attached files that no longer existed. It
+        is kept in addition to the newest *keep*, so regenerating an old run
+        never costs a newer one its bundle either; the extra one goes at the
+        next render of a newer run.
+        """
         keep = int(self.settings.get("report.keep_runs", 30))
         runs_dir = self.output_dir / "runs"
         if keep <= 0 or not runs_dir.exists():
@@ -342,6 +352,8 @@ class ReportWriter:
         existing = sorted((d for d in runs_dir.iterdir() if d.is_dir()),
                           key=lambda d: int(d.name) if d.name.isdigit() else -1)
         for stale in existing[:-keep]:
+            if protect is not None and stale.name == str(protect):
+                continue
             shutil.rmtree(stale, ignore_errors=True)
             log.info("pruned archived run %s", stale.name)
 

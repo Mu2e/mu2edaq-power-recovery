@@ -632,15 +632,16 @@ still rendered, never posted or published. Then:
    directory first; a phase absent from the run has no page, no data file and
    no nav link (`present`). When `rid` is the newest run the same set is
    rendered at the top level — the latest view — and the top-level pages and
-   data of phases it lacks are removed. It returns a `Bundle` whose `paths`
-   are the bundle's HTML pages.
+   data of phases it lacks are removed. `report.keep_runs` then prunes old
+   bundles — never the one just rendered (it is about to be attached), and
+   never a newer one because an older run was regenerated. It returns a
+   `Bundle` whose `paths` are the bundle's HTML pages.
 3. `phase4_report.post(orch, rid, narrative, bundle.paths)` posts to the ECL.
    Vault is created lazily here (`make_vault`), never by
    `prepare_credentials` for this purpose; under `--simulate` nothing is
    posted. The outcome is an event on `rid` and goes into the bundle's
    `data/report.json`; a failure leaves the local report complete (#18).
-4. `Publisher.publish()` runs once, with the bundle final; `report.keep_runs`
-   prunes old bundles.
+4. `Publisher.publish()` runs once, with the bundle final.
 
 Report-only invocations (`--phase report`, optional `--run-id N`) validate
 the run before anything else touches credentials, `RunStore.attach(N)` it

@@ -428,7 +428,10 @@ data files of phases the newest run lacks removed, plus
 (the run history). Regenerating an older run rewrites its bundle and leaves the
 top level as it is.
 .I report.keep_runs
-bounds the number of bundles kept.
+bounds the number of bundles kept: the newest that many, plus the bundle just
+rendered. Regenerating an old run therefore never deletes its own bundle
+before it can be posted, nor a newer run's; the surplus one goes at the next
+render of a newer run.
 .SH JSON OUTPUT
 With
 .BR \-\-json ,
