@@ -391,7 +391,10 @@ failures that are still current are
 .IR outstanding .
 Phase 2's profiles re-check subsets, so a phase-1 failure of a check phase 2
 did not run again stays outstanding. A node's status is the roll-up of its
-current checks, or UNREACHABLE when its latest assessment could not reach it.
+current checks. When its latest assessment could not reach it, the status is
+the worse of UNREACHABLE and that roll-up: a failure nothing has superseded
+keeps the node FAILED, since "we could not look again" does not clear "it is
+broken".
 The headline, counts, next steps, the logbook text and the exit status are all
 derived from this one reconciled table, together with the latest phase-3
 verdict.

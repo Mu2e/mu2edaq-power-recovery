@@ -180,8 +180,9 @@ def reconcile(export: Dict[str, Any]) -> Dict[str, Any]:
 
     Returns ``current`` (key -> check row plus its ``phase``), ``resolved``
     (failures a later result superseded with a good one), ``node_status``
-    (hostname -> status value: the roll-up of that node's *current* checks,
-    or UNKNOWN when its latest assessment could not reach it), ``node_class``,
+    (hostname -> status value: the roll-up of that node's *current* checks;
+    when its latest assessment could not reach it, the worse of UNKNOWN and
+    that roll-up, so a current FAIL stays FAIL), ``node_class``,
     ``network`` (the latest phase-3 verdict, or None) and ``status`` (the
     run's overall verdict).
     """
@@ -224,7 +225,12 @@ def reconcile(export: Dict[str, Any]) -> Dict[str, Any]:
     for host in sorted(set(latest_node) | set(by_host)):
         row = latest_node.get(host)
         if row is not None and _unreachable(row):
-            node_status[host] = Status.UNKNOWN.value
+            # Unreachable now says "we could not look"; it does not erase a
+            # failure that nothing has superseded.  Take the worse of the two
+            # (FAIL outranks UNKNOWN), so a node that failed a check and then
+            # stopped answering is still counted as failed.
+            node_status[host] = rollup(by_host.get(host, [])
+                                       + [Status.UNKNOWN]).value
         elif by_host.get(host):
             node_status[host] = rollup(by_host[host]).value
         else:

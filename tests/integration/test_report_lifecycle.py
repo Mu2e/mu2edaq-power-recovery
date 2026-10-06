@@ -254,6 +254,40 @@ def test_a_later_failure_supersedes_an_earlier_pass(store):
     assert [o["phase"] for o in narrative["outstanding"]] == ["poweron"]
 
 
+def test_an_unreachable_node_keeps_its_unsuperseded_failure(store):
+    # Phase 1 sees a FAIL; phase 2 then cannot reach the node and records no
+    # checks. The failure is still current: the node is FAIL, not UNKNOWN,
+    # and the run is a failure ("it is broken"), not "we could not look".
+    _phase(store, "assess", 1, [("n1", "disk.mounts", Status.FAIL),
+                                ("n1", "ping.lab", Status.OK)], {"n1": "fail"})
+    store.start_phase("poweron", 2)
+    store.record_node("n1", "mc2", "readout", "unknown",
+                      data={"unreachable": True})
+    store.finish_phase("complete")
+    export = store.export_run()
+    state = phase4_report.reconcile(export)
+    assert state["node_status"] == {"n1": "fail"}
+    assert state["status"] is Status.FAIL
+    narrative = phase4_report.build_narrative(export)
+    assert narrative["counts"]["fail"] == 1
+    assert narrative["counts"]["unknown"] == 0
+    assert narrative["failed"] == ["n1"] and narrative["unreachable"] == []
+    assert "1 failed, 0 unreachable" in narrative["headline"]
+    assert [(o["check"], o["phase"]) for o in narrative["outstanding"]] == \
+        [("disk.mounts", "assess")]
+
+
+def test_an_unreachable_node_with_only_good_checks_is_unknown(store):
+    _phase(store, "assess", 1, [("n1", "ping.lab", Status.OK)])
+    store.start_phase("poweron", 2)
+    store.record_node("n1", "mc2", "readout", "unknown",
+                      data={"unreachable": True})
+    store.finish_phase("complete")
+    state = phase4_report.reconcile(store.export_run())
+    assert state["node_status"] == {"n1": "unknown"}
+    assert state["status"] is Status.UNKNOWN
+
+
 def test_phase1_fail_then_phase2_pass_exits_0(tmp_path, monkeypatch):
     # End to end: /home is missing when phase 1 looks, back when phase 2
     # re-checks. The run is healthy; the report says the failure is resolved.
